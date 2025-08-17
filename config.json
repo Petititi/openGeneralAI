@@ -1,4 +1,4 @@
 {
-  "provider": "openhands",
-  "model": "o4-mini"
+  "provider": "mistral",
+  "model": "devstral-medium-2507"
 }
