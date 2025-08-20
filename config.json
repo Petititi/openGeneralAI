@@ -1,4 +1,4 @@
 {
-  "provider": "mistral",
-  "model": "mistral/devstral-medium-2507"
+  "model": "mistral/devstral-small-2505",
+  "provider": "mistral"
 }

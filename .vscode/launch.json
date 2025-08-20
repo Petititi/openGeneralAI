@@ -9,7 +9,8 @@
       "name": "Run server",
       "type": "debugpy",
       "request": "launch",
-      "module": "app"
+      "module": "app",
+      "justMyCode": false
     }
   ]
 }
