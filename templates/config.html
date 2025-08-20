@@ -1,6 +1,6 @@
 <!doctype html>
 <html lang="fr">
-  <head>
+<head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Configuration - Mini Agent</title>
@@ -11,8 +11,8 @@
       .card { background: #111827; border: 1px solid #1f2937; }
       select, option, label { color: #111827; }
     </style>
-  </head>
-  <body>
+</head>
+<body>
     <div class="container py-3">
       <div class="d-flex justify-content-between align-items-center mb-3">
         <a href="/" class="btn btn-outline-secondary btn-sm"><i class="bi bi-arrow-left"></i> Retour</a>
@@ -23,15 +23,28 @@
       <div class="card">
         <div class="card-body">
           <form id="configForm" class="row g-3">
+            <input id="modelFilter" class="form-control form-control-sm mb-2" placeholder="Filtrer les modèles..." />
             <div class="col-12 col-md-4">
               <label for="provider" class="form-label">Fournisseur</label>
               <select id="provider" class="form-select"></select>
             </div>
             <div class="col-12 col-md-8">
-              <label for="model" class="form-label">Modèle</label>
+              <label for="model" class="form-label d-flex justify-content-between align-items-center">
+                <span>Modèle</span>
+                <small id="modelCount" class="text-secondary"></small>
+              </label>
               <select id="model" class="form-select"></select>
             </div>
             <div class="col-12">
+              <label for="apiKey" class="form-label">Clé API</label>
+              <div class="d-flex align-items-center">
+                <input id="apiKey" class="form-control" placeholder="Entrez votre clé API..." autocomplete="off" disabled>
+                <button id="resetKey" type="button" class="btn btn-secondary position-absolute end-0 me-4" title="Change the Key" hidden>
+                  <i class="bi bi-arrow-clockwise"></i>
+                </button>
+              </div>
+            </div>
+            <div class="col-12 d-flex align-items-center gap-2">
               <button id="saveBtn" type="submit" class="btn btn-primary">
                 <i class="bi bi-save"></i> Enregistrer
               </button>
@@ -45,13 +58,16 @@
     <script>
       let providers = [];
       let modelsByProvider = {};
+      let cachedConfig = null;
 
       async function loadConfig() {
         const res = await fetch('/api/config');
         const data = await res.json();
         if (!data.ok) throw new Error('Impossible de charger la configuration');
+        cachedConfig = data.config;
         providers = data.providers;
         modelsByProvider = data.models;
+        has_key = data.has_key;
 
         const providerSel = document.getElementById('provider');
         const modelSel = document.getElementById('model');
@@ -59,30 +75,79 @@
         providerSel.innerHTML = providers.map(p => `<option value="${p}">${p}</option>`).join('');
         providerSel.value = data.config.provider;
         updateModels();
+        update_api_field(data.config.provider)
         modelSel.value = data.config.model;
+      }
+
+      function update_api_field(choosen_provider)
+      {
+        let field_api = document.getElementById('apiKey');
+        let resetKey = document.getElementById('resetKey');
+        if (has_key[choosen_provider])
+        {
+          field_api.setAttribute('disabled', 'disabled');
+          resetKey.removeAttribute('hidden');
+          field_api.classList.add('opacity-75');
+          field_api.classList.add('text-muted');
+          field_api.value = 'Clé API existante...';
+        }
+        else
+        {
+          field_api.removeAttribute('disabled');
+          resetKey.setAttribute('hidden','hidden');
+          field_api.classList.remove('opacity-75');
+          field_api.classList.remove('text-muted');
+          field_api.value = 'Entrez votre clé API...';
+        }
       }
 
       function updateModels() {
         const providerSel = document.getElementById('provider');
         const modelSel = document.getElementById('model');
-        const list = modelsByProvider[providerSel.value] || [];
-        modelSel.innerHTML = list.map(m => `<option value="${m}">${m}</option>`).join('');
+        const modelFilter = document.getElementById('modelFilter');
+        const modelCount = document.getElementById('modelCount');
+        const provider = providerSel.value;
+        const list = modelsByProvider[provider] || [];
+        const q = (modelFilter.value || '').toLowerCase();
+        const filtered = q ? list.filter(m => m.toLowerCase().includes(q)) : list;
+        modelSel.innerHTML = filtered.map(m => `<option value="${m}">${m}</option>`).join('');
+        modelCount.textContent = `${filtered.length} / ${list.length}`;
       }
 
-      document.getElementById('provider').addEventListener('change', updateModels);
+      document.getElementById('provider').addEventListener('change', () => {
+        const choosen_provider = document.getElementById('provider').value
+        updateModels();
+        update_api_field(choosen_provider);
+        const modelSel = document.getElementById('model');
+        if (cachedConfig && cachedConfig.provider === choosen_provider) {
+          modelSel.value = cachedConfig.model;
+        }
+      });
+
+      document.getElementById('resetKey').addEventListener('click', async () => {
+        const choosen_provider = document.getElementById('provider').value
+        has_key[choosen_provider] = false;
+        update_api_field(choosen_provider);
+      });
+
+      document.getElementById('modelFilter').addEventListener('input', updateModels);
 
       document.getElementById('configForm').addEventListener('submit', async (e) => {
         e.preventDefault();
         const provider = document.getElementById('provider').value;
         const model = document.getElementById('model').value;
+        const apiKey = document.getElementById('apiKey').value;
         const btn = document.getElementById('saveBtn');
         const status = document.getElementById('status');
         btn.disabled = true; status.textContent = 'Enregistrement...';
+        let body_content = { provider, model, apiKey };
+        if (has_key[provider])
+          body_content = { provider, model };
         try {
           const res = await fetch('/api/config', {
             method: 'POST',
             headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ provider, model })
+            body: JSON.stringify(body_content)
           });
           const data = await res.json();
           if (!res.ok || !data.ok) throw new Error(data.error || 'Erreur serveur');
