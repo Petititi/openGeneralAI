@@ -11,6 +11,14 @@
       "request": "launch",
       "module": "app",
       "justMyCode": false
+    },
+    {
+      "name": "Python: Debug dernier test pytest",
+      "type": "python",
+      "request": "launch",
+      "module": "pytest",
+      "args": ["--last-failed"],
+      "console": "integratedTerminal"
     }
   ]
 }

@@ -48,13 +48,17 @@ class AppConfig:
         load_dotenv(str(self.ENV_PATH))
 
         # Private storage of the loaded configuration
-        self._cfg: Dict[str, str] = self.reload_config()
+        self.reload_config()
 
         logger.debug("AppConfig initialized with config %s and env %s", self._cfg, self.ENV_PATH)
 
     # -----------------------
     # Public API / accessors
     # -----------------------
+    @property
+    def user_lang(self) -> str:
+        """Configured user language (or default user language if missing)."""
+        return self._cfg.get("user_lang", "English")
     @property
     def provider(self) -> str:
         """Configured provider name (or default provider if missing)."""
@@ -88,7 +92,7 @@ class AppConfig:
         default_provider = "mistral" if "mistral" in providers else (providers[0] if providers else "mistral")
         model_list = provider_to_models.get(default_provider, [])
         default_model = model_list[0] if model_list else "mistral/devstral-small-2505"
-        return {"provider": default_provider, "model": default_model}
+        return {"provider": default_provider, "model": default_model, "user_lang": "English"}
 
     def reload_config(self) -> Dict[str, str]:
         """
@@ -103,10 +107,10 @@ class AppConfig:
                 return default
 
             with self.CONFIG_PATH.open("r", encoding="utf-8") as f:
-                cfg = json.load(f)
+                self._cfg = json.load(f)
 
-            provider = (cfg.get("provider") or "").strip()
-            model = (cfg.get("model") or "").strip()
+            provider = (self._cfg.get("provider") or "").strip()
+            model = (self._cfg.get("model") or "").strip()
 
             providers, provider_to_models = llm_interactions.get_providers_and_models()
 
@@ -128,7 +132,7 @@ class AppConfig:
             logger.exception("Failed to load/validate config (%s). Falling back to default.", exc)
             return self.default_config()
 
-    def save_config(self, cfg: Dict[str, str]) -> None:
+    def save_config(self) -> None:
         """
         Persist the config to disk as JSON.
 
@@ -139,7 +143,7 @@ class AppConfig:
 
         # Create a secure temporary file in the same directory to allow atomic replace
         with tempfile.NamedTemporaryFile("w", dir=str(parent), delete=False, encoding="utf-8") as tmpf:
-            json.dump(cfg, tmpf, ensure_ascii=False, indent=2, sort_keys=True)
+            json.dump(self._cfg, tmpf, ensure_ascii=False, indent=2, sort_keys=True)
             tmp_name = Path(tmpf.name)
 
         try:
@@ -172,9 +176,10 @@ class AppConfig:
         if model not in allowed_models:
             return {"ok": False, "error": "Invalid model for this provider."}
 
-        self._cfg = {"provider": provider, "model": model}
+        self._cfg["provider"] = provider
+        self._cfg["model"] = model
         try:
-            self.save_config(self._cfg)
+            self.save_config()
         except Exception as exc:
             logger.exception("Failed to save config: %s", exc)
             return {"ok": False, "error": "Failed to persist configuration."}
