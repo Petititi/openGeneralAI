@@ -78,16 +78,24 @@ Readability:
         self.token_count += llm_response.usage['total_tokens']
         self.in_token += llm_response.usage['prompt_tokens']
         self.out_token += llm_response.usage['completion_tokens']
-        return self.clean_raw_response(llm_response.choices[0].message['content'])
 
-    def clean_message_history(self, scratchpad: List[dict], max_size: int = 3) -> List[dict]:
-        # Remove any system messages, and clone the list to prevent any border effects
-        filtered_list = [{"role": msg["role"], "content": msg["content"]} for msg in scratchpad if msg["role"] != "system"][-max_size:]
+        raw_response = self.clean_raw_response(llm_response.choices[0].message['content'])
+        return raw_response
+
+    def clean_message_history(self, scratchpad: List[dict], only_system: bool = False, max_size: int = 3) -> List[dict]:
+        # Remove any system/assistant messages, and clone the list to prevent any border effects
+        filtered_list = []
+        for msg in scratchpad:
+            if only_system and msg["role"] == "system":
+                continue
+            if not only_system and (msg["role"] == "system" or msg["role"] == "assistant"):
+                continue
+            filtered_list.append(msg.copy())
         # always start with the main prompt:
         return [{"role": "system", "content": self.core_prompt}] + filtered_list
 
     def process_user_message(self, question: str) -> dict:
-        # start a fresh interaction:
+
         scratchpad = [[]]  # list of list of observations + decisions
 
         reasoning_agent = reasoning.ReasoningAgent(self.cfg)

@@ -1,5 +1,5 @@
 import os
-from flask import Flask, render_template, request, jsonify, redirect, url_for
+from flask import Flask, render_template, request, jsonify, redirect, url_for, send_from_directory
 from flask_cors import CORS
 from pathlib import Path
 
@@ -104,6 +104,9 @@ def ask():
     )
     return jsonify({"ok": True, "answer": answer})
 
+@app.route("/<path:filename>")
+def static_files(filename):
+    return send_from_directory(".", filename)
 
 if __name__ == "__main__":
 

@@ -1,5 +1,5 @@
 import configurator
-import json
+import json5
 from typing import Tuple
 
 
@@ -8,28 +8,29 @@ class ReasoningAgent:
         self.cfg = cfg
 
         self.core_prompt = """Operating principles:
-* Produce a brief, checkable PLAN (no raw chain-of-thought).
+* Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a success criteria.
 * Keep outputs precise and minimal; follow formats exactly.
-* Use the status "done" only when proof exists.
+* Use the status "done" only when proof exists and ensure the last step is a validation of success.
 
 For the output, use only this JSON schemas:
 PLAN:
 {
-"plan_steps": ["descr": "...", "status": done|pending], "success_criteria": ["..."]
+"plan_steps": ["descr": "...", "status": done|todo, "success_criteria": "..."]
 }
 """
         self.continue_plan_prompt = """Operating principles:
-* From the previous interactions, whether to CONTINUE the current task, proceed to the NEXT_TASK or build a NEW_PLAN.
-* Use either "NEW_PLAN" or "NEXT_TASK" to indicate the status
+* From the previous interactions choose whether to proceed to the NEXT_TASK or build a NEW_PLAN.
 * No elaboration.
 
-CONTINUE  → {task_description}
+CURRENT → {task_description}
+SUCCESS_CRITERIA → {success_criteria}
+
 NEXT_TASK → {next_task_description}
-NEW_PLAN → Need to adjust plan according to previous interactions.
+NEW_PLAN → Current and next tasks are not working; need a new plan.
 
 OUTPUT SCHEMA:
 {
-"status": "NEXT_TASK"|"NEW_PLAN"
+"status": "NEXT_TASK|NEW_PLAN"
 }
 """
         self.last_plan_prompt = """Operating principles:
@@ -39,6 +40,8 @@ OUTPUT SCHEMA:
 * No elaboration.
 
 CUR_TASK → {task_description}
+SUCCESS_CRITERIA → {success_criteria}
+
 NEW_PLAN → Need to adjust plan according to previous interactions.
 
 OUTPUT SCHEMA:
@@ -47,17 +50,15 @@ OUTPUT SCHEMA:
 }
 """
         self.update_plan_prompt = """Operating principles:
-* From the given PLAN, add, modify or remove steps as needed.
+* Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a success criteria.
 * Keep outputs precise and minimal; follow formats exactly.
-* Use the status "done" only when proof exists.
-
-EXISTING PLAN:
-{existing_plan}
+* Use the status "done" only when proof of success exists, use "todo" otherwise.
+* Ensure the last step is a validation of success.
 
 For the output, use only this JSON schemas:
 PLAN:
 {
-"plan_steps": ["descr": "...", "status": done|pending], "success_criteria": ["..."]
+"plan_steps": ["descr": "...", "status": done|todo, "success_criteria": "..."]
 }
 """
 
@@ -81,20 +82,20 @@ PLAN:
 
         # Check if the answer is well-formed according to the expected JSON schema
         try:
-            parsed_json = json.loads(json_data)
-            return parsed_json, is_done or parsed_json.get("done", False)
-        except json.JSONDecodeError:
+            parsed_json = json5.loads(json_data)
+            return parsed_json, is_done or parsed_json.get("done", False) or all(step.get("status") == "done" for step in parsed_json.get("plan_steps", []))
+        except ValueError:
             raise ValueError("Response is not valid JSON")
 
     def get_current_step_idx(self, plan: dict) -> int:
-        first_pending_step = -1
+        first_todo_step = -1
         steps = plan.get("plan_steps", [])
         for i, step in enumerate(steps):
             if step.get("status", "").lower() == "current":
                 return i
-            elif step.get("status", "").lower() != "done" and first_pending_step < 0:
-                first_pending_step = i
-        return first_pending_step
+            elif step.get("status", "").lower() != "done" and first_todo_step < 0:
+                first_todo_step = i
+        return first_todo_step
 
     def get_step_description(self, plan: dict) -> dict:
         output = "Action plan:\n"
@@ -110,31 +111,33 @@ PLAN:
     def reevaluate_plan_message(self, plan: dict, improve_plan: bool=False) -> dict:
         todo_step_idx = self.get_current_step_idx(plan)
         if todo_step_idx < 0:
-            raise ValueError("plan doesn't have a current step:" + json.dumps(plan))
+            raise ValueError("plan doesn't have a current step:" + json5.dumps(plan))
 
         content_message = ""
         if improve_plan:
             content_message = self.update_plan_prompt.replace(
-                "{existing_plan}", json.dumps(plan))
+                "{existing_plan}", json5.dumps(plan))
         else:
-            cur_task = plan['plan_steps'][todo_step_idx].get('descr', '')
+            cur_task = plan['plan_steps'][todo_step_idx]
             if todo_step_idx + 1 < len(plan['plan_steps']):
                 next_task = plan['plan_steps'][todo_step_idx + 1].get('descr', '')
                 content_message = self.continue_plan_prompt.replace(
-                    "{task_description}", cur_task).replace(
-                    "{next_task_description}", next_task)
+                    "{task_description}", cur_task.get('descr', '')).replace(
+                    "{next_task_description}", next_task).replace(
+                    "{success_criteria}", cur_task.get('success_criteria', ''))
             else:
                 content_message = self.last_plan_prompt.replace(
-                    "{task_description}", cur_task)
+                    "{task_description}", cur_task.get('descr', '')).replace(
+                    "{success_criteria}", cur_task.get('success_criteria', ''))
         return {"role": "system", "content": content_message}
 
     def update_plan(self, plan: dict, raw_response: str) -> Tuple[dict, bool]:
         try:
-            parsed_json = json.loads(raw_response)
+            parsed_json = json5.loads(raw_response)
             if "status" not in parsed_json:
                 raise ValueError("Response JSON is missing 'status' field")
             status = parsed_json["status"].strip().upper()
-        except json.JSONDecodeError:
+        except ValueError:
             raise ValueError("Response is not valid JSON")
 
         if status == "NEXT_TASK":
@@ -142,17 +145,15 @@ PLAN:
             current_step = plan['plan_steps'][self.get_current_step_idx(plan)]
             current_step["status"] = "done"
         elif status == "NEW_PLAN":
-            # Mark the current step as pending
-            current_step = plan['plan_steps'][self.get_current_step_idx(plan)]
-            current_step["status"] = "pending"
+            current_step = self.get_current_step_idx(plan)
+            plan['plan_steps'][current_step]["status"] = "error"
+            if current_step>0:
+                plan['plan_steps'][current_step-1]["status"] = "error"
+            raise ValueError("Need a 'NEW_PLAN'.")
         elif status == "DONE":
             # Mark all step as done
             for step in plan['plan_steps']:
                 step["status"] = "done"
-        elif status == "CONTINUE":
-            # Mark the current step as pending
-            current_step = plan['plan_steps'][self.get_current_step_idx(plan)]
-            current_step["status"] = "pending"
         else:
             raise ValueError("Expecting either 'DONE', 'NEXT_TASK', or 'NEW_PLAN' from the reasoning agent.")
 
