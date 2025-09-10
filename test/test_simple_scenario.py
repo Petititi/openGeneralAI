@@ -1,10 +1,9 @@
 import os
-from pathlib import Path
 import time
-import pytest
 
 from agents.orchestrator import Orchestrator
 import configurator
+import graphviz
 import utils
 from agents.tools.ToolRegistry import ToolRegistry
 
@@ -46,7 +45,11 @@ def test_file_editing():
     cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
 
     orchestrator = Orchestrator(cfg, tools_registry)
-    result = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+    result, cost = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+
+    with open("templates/dbg.html", "w", encoding="utf-8") as f:
+        f.write(orchestrator.last_trace.to_html())
+
     assert result is not None
     assert "plan_steps" in result
     # all steps should be "done":
@@ -54,6 +57,131 @@ def test_file_editing():
         assert step["status"] == "done"
     # the file should also be modified correctly:
     assert validation_lambda("python loader.py")[0] == True
+
+import re
+
+def parse_sed_expr(expr: str):
+    r"""Parse l'expression à l'intérieur des quotes."""
+    i = 0; n = len(expr)
+    while i < n and expr[i].isspace(): i += 1
+    addr = None
+    m = re.match(r'(\d+)', expr[i:])
+    if m:
+        addr = int(m.group(1)); i += m.end(0)
+    while i < n and expr[i].isspace(): i += 1
+    if i >= n:
+        raise ValueError("Empty sed expression")
+    cmd = expr[i]; i += 1
+
+    def parse_field(start_idx: int, delim: str):
+        j = start_idx; out = []
+        while j < n:
+            ch = expr[j]
+            if ch == '\\' and j+1 < n:
+                out.append('\\'); out.append(expr[j+1]); j += 2
+            elif ch == delim:
+                return ''.join(out), j+1
+            else:
+                out.append(ch); j += 1
+        raise ValueError("Delimiter not closed")
+
+    if cmd == 's':
+        if i >= n: raise ValueError("Missing delimiter for s")
+        delim = expr[i]; i += 1
+        pattern, i = parse_field(i, delim)
+        replacement, i = parse_field(i, delim)
+        flags = expr[i:].strip()
+        return ('s', addr, pattern, replacement, flags)
+    elif cmd in ('i', 'a'):
+        if expr[i].isspace():
+            i += 1
+        text = expr[i:]
+        if text.startswith('\\'):
+            text = text[1:]
+        return (cmd, addr, text)
+    else:
+        raise ValueError(f"Unsupported sed command '{cmd}'")
+
+def _unescape_replacement(s: str) -> str:
+    r"""Decode \n, \t, \xNN, \uNNNN... but preserve \1, \2 backreferences (as '\1')."""
+    out = []; i = 0; n = len(s)
+    while i < n:
+        c = s[i]
+        if c == '\\' and i+1 < n:
+            nxt = s[i+1]
+            if nxt == 'n': out.append('\n'); i += 2
+            elif nxt == 't': out.append('\t'); i += 2
+            elif nxt == 'r': out.append('\r'); i += 2
+            elif nxt == '\\': out.append('\\'); i += 2
+            elif nxt == 'f': out.append('\f'); i += 2
+            elif nxt == 'v': out.append('\v'); i += 2
+            elif nxt == 'a': out.append('\a'); i += 2
+            elif nxt == 'b': out.append('\b'); i += 2
+            elif nxt in '0123456789':
+                out.append('\\' + nxt); i += 2  # backreference -> keep as \N
+            elif nxt == 'x' and i+3 < n and all(ch in "0123456789abcdefABCDEF" for ch in s[i+2:i+4]):
+                out.append(chr(int(s[i+2:i+4],16))); i += 4
+            elif nxt == 'u' and i+5 < n and all(ch in "0123456789abcdefABCDEF" for ch in s[i+2:i+6]):
+                out.append(chr(int(s[i+2:i+6],16))); i += 6
+            else:
+                out.append(nxt); i += 2
+        else:
+            out.append(c); i += 1
+    return ''.join(out)
+
+def _unescape_pattern(s: str) -> str:
+    # Pour les patterns on applique le même décodage (utile pour \n dans pattern, etc.)
+    return _unescape_replacement(s)
+
+def apply_sed(cmd: str, fs, params: list):
+    """Retourne (ok:bool, result). result = fs.write(...) ou message d'erreur."""
+    mq = re.search(r"'(.*?)'", cmd, re.DOTALL)
+    if not mq:
+        return False, "Invalid sed pattern (no quotes)"
+    expr = mq.group(1)
+    try:
+        parsed = parse_sed_expr(expr)
+    except ValueError as e:
+        return False, f"Invalid sed expression: {e}"
+
+    content = fs.read(params[-1])
+    lines = content.splitlines(keepends=True)
+
+    if parsed[0] in ('i', 'a'):
+        cmdc, addr, text = parsed
+        if addr is None:
+            return False, "Insert/append requires a line number address"
+        insert_text = _unescape_replacement(text)
+        if not insert_text.endswith('\n'):
+            insert_text += '\n'
+        idx = addr - 1
+        if cmdc == 'i':
+            if idx <= len(lines): lines.insert(idx, insert_text)
+            else: lines.append(insert_text)
+        else:
+            if 0 <= idx < len(lines): lines.insert(idx+1, insert_text)
+            else: lines.append(insert_text)
+        return True, fs.write(params[-1], "".join(lines))
+
+    # substitution
+    _, addr, pattern_raw, repl_raw, flags = parsed
+    pattern = _unescape_pattern(pattern_raw)
+    repl = _unescape_replacement(repl_raw)
+
+    count_per_line = 0 if ('g' in flags) else 1
+    re_flags = 0
+    if 'i' in flags or 'I' in flags:
+        re_flags |= re.IGNORECASE
+
+    if addr is not None:
+        idx = addr - 1
+        if 0 <= idx < len(lines):
+            lines[idx] = re.sub(pattern, repl, lines[idx], count=count_per_line, flags=re_flags)
+        return True, fs.write(params[-1], "".join(lines))
+    else:
+        # appliquer per-line (comme sed)
+        out_lines = [re.sub(pattern, repl, ln, count=count_per_line, flags=re_flags) for ln in lines]
+        return True, fs.write(params[-1], "".join(out_lines))
 
 
 def test_file_editing_only_bash():
@@ -78,30 +206,7 @@ def test_file_editing_only_bash():
                 new_content = cmd[5:cmd.rfind(" > ")].strip()
             return True, fs.write(cmd[cmd.rfind(" > ") + 3:], new_content)
         if "sed" in program:
-            try:
-                import re
-                m = re.search(r"'(?:(\d+)s|s)/([^/]*)/([^/]*)/'", cmd)
-                if m:
-                    line_number = int(m.group(1)) if m.group(1) else None
-                    pattern     = m.group(2)
-                    replacement = m.group(3)
-                    replacement = replacement.encode('utf-8').decode('unicode_escape')
-                    content = fs.read(params[-1])
-                    if line_number:
-                        # Remplacement uniquement sur la ligne donnée
-                        lines = content.splitlines(keepends=True)
-                        idx = int(line_number) - 1
-                        if 0 <= idx < len(lines):
-                            lines[idx] = re.sub(re.escape(pattern) if pattern != "^" else pattern, replacement, lines[idx])
-                        content = "".join(lines)
-                    else:
-                        # Remplacement global
-                        content = re.sub(re.escape(pattern) if pattern != "^" else pattern, replacement, content)
-                    return True, fs.write(params[-1], content)
-                else:
-                    return False, f"Invalid sed pattern"
-            except FileNotFoundError as e:
-                return False, f"{cmd}: {str(e)}"
+            return apply_sed(cmd, fs, params)
         if "python" in program:
             # look for loader.py in params:
             if "loader.py" in params:
@@ -114,6 +219,9 @@ def test_file_editing_only_bash():
                     return False, "python: NameError: name 'time' is not defined"
                 except FileNotFoundError as e:
                     return False, f"python: File not found: {e}"
+            if "-c" in params:
+                return True, "" # no output for this simple unit test...
+
         return False, "Invalid command"
 
     # 3) Tools creations:
@@ -130,7 +238,11 @@ def test_file_editing_only_bash():
     cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
 
     orchestrator = Orchestrator(cfg, tools_registry)
-    result = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+    result, cost = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+
+    with open("templates/dbg_bash.html", "w", encoding="utf-8") as f:
+        f.write(orchestrator.last_trace.to_html())
+
     assert result is not None
     assert "plan_steps" in result
     # all steps should be "done":

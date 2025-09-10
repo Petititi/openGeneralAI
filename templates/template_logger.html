@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="fr">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Trajectory – <<run_id>></title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="stylesheet" href="styles.css" />
+</head>
+
+<body>
+    <div id="app">
+        <header>
+            <div class="title">Trajectory <span class="muted">#<<run_id>></span></div>
+            <div class="meta small">nodes: <span id="count-nodes">–</span> • edges: <span id="count-edges">–</span>
+            </div>
+            <div class="spacer"></div>
+            <div class="legend plan"><span class="dot"></span>plan</div>
+            <div class="legend tool"><span class="dot"></span>tool</div>
+            <div class="legend done"><span class="dot"></span>done</div>
+            <div class="legend other"><span class="dot"></span>autre</div>
+            <div class="spacer"></div>
+            <input id="search" type="search" placeholder="Rechercher…" />
+            <select id="phase-filter">
+                <option value="">Toutes phases</option>
+                <option value="plan/">plan/*</option>
+                <option value="act/run">act/run</option>
+                <option value="done">done</option>
+            </select>
+            <button id="btn-fit">Fit</button>
+            <button id="btn-layout">Re-layout</button>
+            <button id="btn-export">Export</button>
+        </header>
+
+        <div id="cy"></div>
+
+        <aside><div class="resizer"></div>
+            <h3>Détails du noeud</h3>
+            <div class="scroll" id="details">
+                <div class="small muted">Cliquez sur un noeud pour voir les détails...</div>
+            </div>
+        </aside>
+    </div>
+
+    <!-- Données Python -->
+    <script>const LOG = <<data_json>>;</script>
+
+    <!-- Librairies externes -->
+    <script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
+    <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
+    <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
+    <script src="https://pfau-software.de/json-viewer/dist/iife/index.js"></script>
+
+    <!-- Modules -->
+    <script type="module" src="js/main.js"></script>
+</body>
+
+</html>
