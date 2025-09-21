@@ -1,21 +1,24 @@
 import configurator
 import json5
-from typing import Tuple
+from typing import Tuple, Callable, List
 
+from agents.logger import TrajectoryLogger, _digest_messages
 
 class ReasoningAgent:
-    def __init__(self, cfg: configurator.AppConfig):
+    def __init__(self, cfg: configurator.AppConfig, logger: TrajectoryLogger, ask_llm: Callable[[List[dict]], str]):
         self.cfg = cfg
+        self.logger = logger
+        self.ask_llm = ask_llm
 
         self.core_prompt = """Operating principles:
-* Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a success criteria.
+* Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a criteria needed to go to the next step.
 * Keep outputs precise and minimal; follow formats exactly.
 * Use the status "done" only when proof exists and ensure the last step is a validation of success.
 
 For the output, use only this JSON schemas:
 PLAN:
 {
-"plan_steps": ["descr": "...", "status": done|todo, "success_criteria": "..."]
+"plan_steps": ["descr": "...", "status": done|todo, "next_step_criteria": "..."]
 }
 """
         self.continue_plan_prompt = """Operating principles:
@@ -23,7 +26,7 @@ PLAN:
 * No elaboration.
 
 CURRENT → {task_description}
-SUCCESS_CRITERIA → {success_criteria}
+NEXT_STEP_CRITERIA → {next_step_criteria}
 
 NEXT_TASK → {next_task_description}
 NEW_PLAN → Current and next tasks are not working; need a new plan.
@@ -34,13 +37,13 @@ OUTPUT SCHEMA:
 }
 """
         self.last_plan_prompt = """Operating principles:
-* From the previous interactions, evaluate if we succeeded, according to success_criteria.
+* From the previous interactions, evaluate if we succeeded, according to next step criteria.
 * Use either "NEW_PLAN" or "DONE" to indicate the status
 * If "DONE", add a description of the success in the output.
 * No elaboration.
 
 CUR_TASK → {task_description}
-SUCCESS_CRITERIA → {success_criteria}
+NEXT_STEP_CRITERIA → {next_step_criteria}
 
 NEW_PLAN → Need to adjust plan according to previous interactions.
 
@@ -58,14 +61,68 @@ OUTPUT SCHEMA:
 For the output, use only this JSON schemas:
 PLAN:
 {
-"plan_steps": ["descr": "...", "status": done|todo, "success_criteria": "..."]
+"plan_steps": ["descr": "...", "status": done|todo, "next_step_criteria": "..."]
 }
 """
 
-    def planning_message(self, history: list, scratchpad: list) -> dict:
+    def planning_message(self) -> dict:
         return {"role": "system", "content": self.core_prompt}
 
+    def create_plan_with_callback(self, messages: List[dict], turn: int = 0) -> Tuple[dict, bool]:
+        """Create a new plan using the provided LLM callback function."""
+        messages_to_send = messages.copy()
+        messages_to_send.append(self.planning_message())
+        
+        # Create trace node for plan creation
+        self.logger.add_node(
+            phase="plan/create",
+            turn=turn,
+            tags={"digest": _digest_messages(messages_to_send)}
+        )
+
+        raw_response = self.ask_llm(messages_to_send)
+        return self.get_plan(raw_response)
+
+    def update_plan_with_callback(self, messages: List[dict], plan: dict, improve_plan: bool = False, turn: int = 0) -> Tuple[dict, bool]:
+        """Update an existing plan using the provided LLM callback function."""
+        try:
+            messages_to_send = messages.copy()
+            messages_to_send.append(self.reevaluate_plan_message(plan, improve_plan))
+            
+            # Create trace node for plan update
+            phase = "plan/update" if not improve_plan else "plan/recover"
+            extra_tags = {"reason": "update_failed"} if improve_plan else {}
+            tags = {"digest": _digest_messages(messages_to_send)}
+            tags.update(extra_tags)
+            
+            self.logger.add_node(
+                phase=phase,
+                turn=turn,
+                tags=tags
+            )
+            
+            raw_response = self.ask_llm(messages_to_send)
+            if improve_plan:
+                return self.get_plan(raw_response)
+            else:
+                return self.update_plan(plan, raw_response)
+        except ValueError:
+            # Fallback to improved plan creation
+            messages_to_send = messages.copy()
+            messages_to_send.append(self.reevaluate_plan_message(plan, improve_plan=True))
+            
+            # Create trace node for plan recovery
+            self.logger.add_node(
+                phase="plan/recover",
+                turn=turn,
+                tags={"digest": _digest_messages(messages_to_send), "reason": "update_failed"}
+            )
+            
+            raw_response = self.ask_llm(messages_to_send)
+            return self.get_plan(raw_response)
+
     def get_plan(self, raw_response: str) -> Tuple[dict, bool]:
+        node_id = self.logger.current_node().id
         # two possibilities: raw_response start with "FINAL" or "PLAN"
         json_data = None
         is_done = False
@@ -83,9 +140,15 @@ PLAN:
         # Check if the answer is well-formed according to the expected JSON schema
         try:
             parsed_json = json5.loads(json_data)
-            return parsed_json, is_done or parsed_json.get("done", False) or all(step.get("status") == "done" for step in parsed_json.get("plan_steps", []))
-        except ValueError:
-            raise ValueError("Response is not valid JSON")
+            # Defensive: ensure parsed_json is a dict
+            if not isinstance(parsed_json, dict):
+                raise ValueError("Parsed response is not a dict")
+            done_flag = is_done or parsed_json.get("done", False) or all(isinstance(step, dict) and step.get("status") == "done" for step in parsed_json.get("plan_steps", []))
+            if self.logger and node_id is not None:
+                self.logger.set_plan(plan=parsed_json, is_done=done_flag)
+            return parsed_json, done_flag
+        except ValueError as exc:
+            raise ValueError("Response is not valid JSON") from exc
 
     def get_current_step_idx(self, plan: dict) -> int:
         first_todo_step = -1
@@ -124,21 +187,24 @@ PLAN:
                 content_message = self.continue_plan_prompt.replace(
                     "{task_description}", cur_task.get('descr', '')).replace(
                     "{next_task_description}", next_task).replace(
-                    "{success_criteria}", cur_task.get('success_criteria', ''))
+                    "{next_step_criteria}", cur_task.get('next_step_criteria', ''))
             else:
                 content_message = self.last_plan_prompt.replace(
                     "{task_description}", cur_task.get('descr', '')).replace(
-                    "{success_criteria}", cur_task.get('success_criteria', ''))
+                    "{next_step_criteria}", cur_task.get('next_step_criteria', ''))
         return {"role": "system", "content": content_message}
 
     def update_plan(self, plan: dict, raw_response: str) -> Tuple[dict, bool]:
+        node_id = self.logger.current_node().id
         try:
             parsed_json = json5.loads(raw_response)
+            if not isinstance(parsed_json, dict):
+                raise ValueError("Parsed response is not a dict")
             if "status" not in parsed_json:
                 raise ValueError("Response JSON is missing 'status' field")
-            status = parsed_json["status"].strip().upper()
-        except ValueError:
-            raise ValueError("Response is not valid JSON")
+            status = str(parsed_json["status"]).strip().upper()
+        except ValueError as exc:
+            raise ValueError("Response is not valid JSON") from exc
 
         if status == "NEXT_TASK":
             # Mark the current step as done
@@ -157,5 +223,7 @@ PLAN:
         else:
             raise ValueError("Expecting either 'DONE', 'NEXT_TASK', or 'NEW_PLAN' from the reasoning agent.")
 
-    # return true if all steps are done
+        # Logging
+        if self.logger and node_id is not None:
+            self.logger.set_plan(plan=plan, is_done=all(step.get("status") == "done" for step in plan["plan_steps"]))
         return plan, all(step.get("status") == "done" for step in plan["plan_steps"])

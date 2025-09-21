@@ -5,7 +5,7 @@ from typing import Dict, List, Tuple, Any, Optional
 import litellm
 import time
 
-from agents.logger import TrajectoryLogger, Phase, _digest_messages
+from agents.logger import TrajectoryLogger
 import configurator
 import agents.tools.ToolRegistry as tools_module
 import agents.action as action
@@ -47,12 +47,11 @@ Readability:
             raw_response = raw_response[3:-3]
         return raw_response
 
-    def safe_ask(self, node_id: str,  messages: List[dict]) -> str:
+    def safe_ask(self, messages: List[dict]) -> str:
         t_r = time.time()
         if self.cur_trace is None:
             raise Exception("Trace not initialized")
-        
-        self.cur_trace.set_questions(node_id, prompt_messages=messages)
+        self.cur_trace.set_questions(messages)
         final_message_list = []
         # safeguard: devstral-small-250X doesn't take "system" messages into account
         if self.cfg.model.startswith("mistral/devstral-small-250"):
@@ -87,10 +86,10 @@ Readability:
         self.token_count += llm_response.usage['total_tokens']
         self.in_token += llm_response.usage['prompt_tokens']
         self.out_token += llm_response.usage['completion_tokens']
-        
+
         raw_response = self.clean_raw_response(llm_response.choices[0].message['content'])
         dur_r = time.time() - t_r
-        self.cur_trace.set_response(node_id, raw_response=raw_response, duration_s=dur_r, token_usage=[llm_response.usage['total_tokens'], llm_response.usage['prompt_tokens'], llm_response.usage['completion_tokens']])
+        self.cur_trace.set_response(raw_response=raw_response, duration_s=dur_r, token_usage=[llm_response.usage['total_tokens'], llm_response.usage['prompt_tokens'], llm_response.usage['completion_tokens']])
         return raw_response
 
     def clean_message_history(self, scratchpad: List[dict], only_system: bool = False, max_size: int = 3) -> List[dict]:
@@ -106,131 +105,75 @@ Readability:
         return [{"role": "system", "content": self.core_prompt}] + filtered_list
 
     def process_user_message(self, question: str) -> Tuple[dict, float]:
-        # --- init trace -----------------------------------------------------------
+        """
+        Orchestrates the reasoning and action agents to process a user message.
+        """
         self.cur_trace = TrajectoryLogger()
-        self.last_trace = None  # sera rempli à la fin
+        self.last_trace = None
 
-        scratchpad: List[List[Dict[str, Any]]] = [[]]  # historique "pratique" pour le prompt court
-        reasoning_agent = reasoning.ReasoningAgent(self.cfg)
-        action_agent = action.ActionAgent(self.cfg, self.tools)
+        reasoning_agent = reasoning.ReasoningAgent(self.cfg, logger=self.cur_trace, ask_llm=self.safe_ask)
+        action_agent = action.ActionAgent(self.cfg, logger=self.cur_trace, tools=self.tools, ask_llm=self.safe_ask)
 
         is_done = False
         plan: Dict[str, Any] = {}
-
-        in0, out0 = getattr(self, "in_token", 0), getattr(self, "out_token", 0)
-        total_usage = {"prompt": 0, "completion": 0, "total": 0}
-
         turn = 0
 
-        # noeud parent de l'interaction:
-        parent_node_id = self.cur_trace.add_node(
+        self.cur_trace.add_node(
             phase="start",
             turn=turn,
-            parent_id=None,
+            tags={"QUESTION": question}
         )
 
-        while not is_done and len(scratchpad) < self.max_turn:
+        while not is_done and turn < self.max_turn:
             turn += 1
-
-            # 1) Construire le prompt
-            if scratchpad[-1]:
-                messages_to_send = self.clean_message_history(scratchpad[-1], max_size=8)
+            
+            # Prepare base messages
+            if len(self.cur_trace.nodes) > 1:
+                base_messages = self.clean_message_history(self.cur_trace.get_current_interaction(), max_size=8)
             else:
-                messages_to_send = [{"role": "system", "content": self.core_prompt},
-                                    {"role": "user", "content": question}]
+                base_messages = [
+                    {"role": "system", "content": self.core_prompt},
+                    {"role": "user", "content": question}
+                ]
 
-            # 2) Création ou mise à jour du plan
-            phase: Phase = "plan/create" if not plan else "plan/update"
-            node_id = self.cur_trace.add_node(
-                phase=phase,
-                turn=turn,
-                parent_id=parent_node_id,
-                tags={"digest": _digest_messages(messages_to_send)}
-            )
-            t0 = time.time()
-            # injecte le message "plan" selon le cas
+            # Handle planning phase
             if not plan:
-                messages_to_send.append(reasoning_agent.planning_message(scratchpad[-1], messages_to_send))
-                raw_response = self.safe_ask(node_id, messages_to_send)
-                plan, is_done = reasoning_agent.get_plan(raw_response)
+                plan, is_done = reasoning_agent.create_plan_with_callback(base_messages, turn)
             else:
-                messages_to_send.append(reasoning_agent.reevaluate_plan_message(plan))
-                raw_response = self.safe_ask(node_id, messages_to_send)
                 try:
-                    plan, is_done = reasoning_agent.update_plan(plan, raw_response)
+                    plan, is_done = reasoning_agent.update_plan_with_callback(base_messages, plan, turn=turn)
                 except ValueError:
-                    # branche "recover": nouveau noeud enfant
-                    messages_to_send = self.clean_message_history(messages_to_send[:-1]) + \
-                                        [reasoning_agent.reevaluate_plan_message(plan, improve_plan=True)]
-                    recover_id = self.cur_trace.add_node(
-                        phase="plan/recover",
-                        turn=turn,
-                        parent_id=node_id,
-                        tags={"reason": "update_failed"}
-                    )
-                    raw_response = self.safe_ask(recover_id, messages_to_send)
-                    try:
-                        plan, is_done = reasoning_agent.get_plan(raw_response)
-                    except Exception as e:
-                        # try again:
-                        raw_response = self.safe_ask(recover_id, messages_to_send)
-                        plan, is_done = reasoning_agent.get_plan(raw_response)
-                    # on fait du noeud de recover le parent courant
-                    node_id = recover_id
+                    # Recovery: try with improved plan
+                    plan, is_done = reasoning_agent.update_plan_with_callback(base_messages, plan, improve_plan=True, turn=turn)
 
-            dur = time.time() - t0
-
-            self.cur_trace.set_plan(node_id, plan=plan, is_done=is_done)
-            parent_node_id = node_id  # par défaut, la suite s'accrochera à ce nœud
-
+            # Handle action phase
             if not is_done:
-                # 3) Décrire l’étape courante + exécuter action/outils
-                messages_to_send.append(reasoning_agent.get_step_description(plan))
-                messages_to_send = self.clean_message_history(messages_to_send, only_system=True, max_size=8)
+                # Add step description to messages
+                step_msg = reasoning_agent.get_step_description(plan)
+                action_messages = self.clean_message_history(base_messages + [step_msg], only_system=True, max_size=8)
+                
+                # Execute action
+                result_content, tool_name = action_agent.execute_action_with_callback(action_messages, turn)
+                
+                # Add result to trace for next iteration
+                self.cur_trace.get_current_interaction().append({"role": "user", "content": result_content})
 
-                # instrumentation de l'action
-                tool_msg = action_agent.get_tool_message()
-                messages_to_send.append(tool_msg)
-                act_id = self.cur_trace.add_node(
-                    phase="act/run",
-                    turn=turn,
-                    parent_id=parent_node_id,
-                    tags={"tool_request": tool_msg}
-                )
-
-                t1 = time.time()
-                raw_response = self.safe_ask(act_id, messages_to_send)
-                try:
-                    result, tool_name = action_agent.execute_tool(raw_response)
-                    messages_to_send.append({"role": "user", "content": json.dumps(result)})
-                    self.cur_trace.set_tool(act_id, tool_name=tool_name, tool_input=raw_response, tool_output=result)
-                except action.AgentError as e:
-                    messages_to_send.append({"role": "user", "content": str(e)})
-                    self.cur_trace.set_tool(act_id, tool_name=e.tool_name, tool_input=raw_response, error=str(e))
-                except Exception as e:
-                    messages_to_send.append({"role": "user", "content": str(e)})
-                    self.cur_trace.set_tool(act_id, tool_name="No Tool", tool_input=raw_response, error=str(e))
-                dur_act = time.time() - t1
-
-            scratchpad.append(messages_to_send)
-            parent_node_id = act_id if not is_done else node_id  # prochaine boucle accrochée au dernier nœud
-
-        # 4) coût interaction
         try:
-            in_cost, out_cost = cost_per_token(self.cfg.model, prompt_tokens=self.in_token, completion_tokens=self.out_token)  # prix par token (entrée, sortie)
+            in_cost, out_cost = cost_per_token(self.cfg.model, prompt_tokens=self.in_token, completion_tokens=self.out_token)
             interaction_cost = in_cost + out_cost
         except Exception:
             interaction_cost = 0
 
-        done_id = self.cur_trace.add_node(
+        self.cur_trace.add_node(
             phase="done",
             turn=turn,
-            parent_id=parent_node_id,
             tags={"cost": interaction_cost}
         )
-        self.cur_trace.set_response(done_id, raw_response="DONE" if is_done else "too much interactions", duration_s=0, token_usage=[self.token_count, self.in_token, self.out_token])
-
+        self.cur_trace.set_response(
+            raw_response="DONE" if is_done else "too much interactions",
+            duration_s=0,
+            token_usage=[self.token_count, self.in_token, self.out_token]
+        )
         self.last_trace = self.cur_trace
         self.cur_trace = None
-
         return plan, interaction_cost

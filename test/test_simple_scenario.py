@@ -45,7 +45,7 @@ def test_file_editing():
     cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
 
     orchestrator = Orchestrator(cfg, tools_registry)
-    result, cost = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+    result, cost = orchestrator.process_user_message("Script `loader.py` doesn't start. Fix the mistake.")
 
     with open("templates/dbg.html", "w", encoding="utf-8") as f:
         f.write(orchestrator.last_trace.to_html())
@@ -177,11 +177,11 @@ def apply_sed(cmd: str, fs, params: list):
         idx = addr - 1
         if 0 <= idx < len(lines):
             lines[idx] = re.sub(pattern, repl, lines[idx], count=count_per_line, flags=re_flags)
-        return True, fs.write(params[-1], "".join(lines))
     else:
         # appliquer per-line (comme sed)
-        out_lines = [re.sub(pattern, repl, ln, count=count_per_line, flags=re_flags) for ln in lines]
-        return True, fs.write(params[-1], "".join(out_lines))
+        lines = [re.sub(re.escape(pattern), repl, ln, count=count_per_line, flags=re_flags) for ln in lines]
+    output = fs.write(params[-1], "".join(lines))
+    return True, output
 
 
 def test_file_editing_only_bash():

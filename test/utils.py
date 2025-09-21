@@ -37,7 +37,8 @@ class InMemoryFS:
             old.splitlines(), content.splitlines(),
             fromfile="before", tofile="after", lineterm=""
         )
-        return "\n".join(diff)
+        readable_diff = "\n".join(diff)
+        return readable_diff
 
 
 # ---------- Concrete tools (using FS) ----------
@@ -59,16 +60,16 @@ class ReadFile(Tool):
 
 class EditFile(Tool):
     name = "edit_file"
-    signature = "(filepath:str, content:str) → diff (old vs new)"
+    signature = "(filepath:str, full_content:str) → diff (old vs new)"
 
     def __init__(self, fs: InMemoryFS):
         super().__init__()
         self.fs = fs
     def run(self, **kwargs) -> ToolResult:
         path = kwargs.get("filepath")
-        content = kwargs.get("content")
+        content = kwargs.get("full_content")
         if not path or content is None:
-            return ToolResult(False, meta={"error": "Missing 'filepath' or 'content'"})
+            return ToolResult(False, meta={"error": "Missing 'filepath' or 'full_content'"})
         diff = self.fs.write(path, content)
         return ToolResult(True, diff, meta={"file_path": path})
 

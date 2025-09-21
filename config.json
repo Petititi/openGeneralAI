@@ -1,5 +1,5 @@
 {
   "model": "mistral/devstral-small-2505",
   "provider": "mistral",
-  "user_lang": "French"
+  "user_lang": "English"
 }

@@ -58,7 +58,7 @@ export function buildElements(LOG) {
         if (Array.isArray(n.prompt_messages) && n.prompt_messages.length > 0) {
             n.prompt_messages.forEach((msg, idx) => {
                 const msgId = `${id}::msg${idx}`;
-                const msgLabel = truncate(msg.content || "", 220);
+                const msgLabel = pretty(truncate(msg.content || "", 220));
 
                 // Créer le noeud pour ce message
                 elements.push({
