@@ -1,11 +1,7 @@
 import os
-import io
 import sys
 import json
-import time
-import math
 import hashlib
-import shutil
 import sqlite3
 import datetime as dt
 from pathlib import Path
@@ -184,6 +180,19 @@ def extract_text_chunks(text: str, max_chars: int = 3000) -> List[Tuple[int, int
 # --------------------------
 
 class LongTermMemory:
+    """
+    Système de mémoire à long terme basé sur l'indexation de fichiers.
+    
+    Version modifiée pour ne pas copier les fichiers analysés mais stocker
+    seulement leurs chemins d'accès. Cela économise l'espace disque mais
+    nécessite que les fichiers restent à leur emplacement original.
+    
+    Fonctionnalités:
+    - Indexation de code (via tree-sitter) et de texte
+    - Recherche hybride (mots-clés + sémantique)
+    - Vérification de l'intégrité des fichiers
+    - Nettoyage automatique des références cassées
+    """
     def __init__(
         self,
         db_path: str = "memory.sqlite",
@@ -193,11 +202,12 @@ class LongTermMemory:
         hybrid_alpha: float = 0.5,
     ):
         self.db_path = db_path
-        self.storage_dir = Path(storage_dir)
+        self.storage_dir = Path(storage_dir)  # Conservé pour compatibilité mais non utilisé
         self.faiss_index_path = faiss_index_path
         self.hybrid_alpha = hybrid_alpha
 
-        self.storage_dir.mkdir(parents=True, exist_ok=True)
+        # Plus besoin de créer le storage_dir car on ne copie plus les fichiers
+        # self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -219,7 +229,7 @@ class LongTermMemory:
         cur.execute("""
         CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
-            source_path TEXT,
+            source_path TEXT NOT NULL,
             rel_path TEXT,
             media_type TEXT,
             language TEXT,
@@ -295,19 +305,14 @@ class LongTermMemory:
 
     def add(self, path: str, rel_to: Optional[str] = None, extra: Optional[Dict] = None) -> str:
         """
-        Ajoute un document fichier : copie le brut, crée des chunks, indexe FTS + FAISS.
-        Retourne document_id (sha256).
+        Ajoute un document fichier : analyse le contenu, crée des chunks, indexe FTS + FAISS.
+        Retourne document_id (sha256 du contenu).
         """
         p = Path(path)
         data = p.read_bytes()
         doc_id = sha256_bytes(data)
 
-        # Copie content-addressed
-        sub = self.storage_dir / doc_id[:2]
-        sub.mkdir(parents=True, exist_ok=True)
-        raw_path = sub / doc_id
-        if not raw_path.exists():
-            raw_path.write_bytes(data)
+        # Plus de copie dans storage_dir, on garde seulement le chemin d'accès original
 
         # Déterminer type/langue
         ext = p.suffix.lower()
@@ -493,6 +498,11 @@ class LongTermMemory:
         d = cur.fetchone()
         if not d:
             return {}
+        
+        # Vérifier que le fichier source existe encore
+        source_path = Path(d[1])
+        file_exists = source_path.exists()
+        
         cur.execute("""
             SELECT id, ord, start_line, end_line, content FROM chunks WHERE document_id=?
             ORDER BY ord ASC
@@ -504,9 +514,45 @@ class LongTermMemory:
             "document": {
                 "id": d[0], "source_path": d[1], "media_type": d[2],
                 "language": d[3], "size_bytes": d[4], "created_at": d[5],
-                "extra": json.loads(d[6] or "{}")
+                "extra": json.loads(d[6] or "{}"),
+                "file_exists": file_exists
             },
             "chunks": chunks
+        }
+
+    def check_file_integrity(self) -> Dict:
+        """
+        Vérifie l'intégrité des fichiers indexés.
+        Retourne des statistiques sur les fichiers existants/manquants/modifiés.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, source_path, sha256 FROM documents")
+        docs = cur.fetchall()
+        
+        existing = 0
+        missing = 0
+        modified = 0
+        
+        for doc_id, source_path, expected_sha256 in docs:
+            path = Path(source_path)
+            if not path.exists():
+                missing += 1
+            else:
+                try:
+                    current_data = path.read_bytes()
+                    current_sha256 = sha256_bytes(current_data)
+                    if current_sha256 == expected_sha256:
+                        existing += 1
+                    else:
+                        modified += 1
+                except Exception:
+                    missing += 1
+        
+        return {
+            "total_documents": len(docs),
+            "existing_unchanged": existing,
+            "missing": missing,
+            "modified": modified
         }
 
     def stats(self) -> Dict:
@@ -519,8 +565,60 @@ class LongTermMemory:
             "documents": n_docs,
             "chunks": n_chunks,
             "faiss_ntotal": int(self.index.ntotal),
-            "embedding_dim": int(self.dim)
+            "embedding_dim": int(self.dim) if self.dim is not None else 0
         }
+
+    def cleanup_missing_files(self) -> int:
+        """
+        Supprime de la base de données les références vers les fichiers qui n'existent plus.
+        Retourne le nombre de documents supprimés.
+        """
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, source_path FROM documents")
+        docs = cur.fetchall()
+        
+        deleted_count = 0
+        for doc_id, source_path in docs:
+            if not Path(source_path).exists():
+                # Supprimer le document (les chunks et entrées FAISS seront supprimés en cascade)
+                cur.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+                deleted_count += 1
+        
+        if deleted_count > 0:
+            self.conn.commit()
+            # Reconstruire l'index FAISS pour éliminer les vecteurs orphelins
+            self._rebuild_faiss_index()
+        
+        return deleted_count
+
+    def _rebuild_faiss_index(self):
+        """Reconstruit l'index FAISS à partir des chunks restants."""
+        # Créer un nouvel index
+        self.index = faiss.IndexFlatIP(self.dim)
+        
+        # Récupérer tous les chunks restants
+        cur = self.conn.cursor()
+        cur.execute("SELECT id, content FROM chunks ORDER BY id")
+        chunks = cur.fetchall()
+        
+        # Vider la table de mapping
+        cur.execute("DELETE FROM faiss_map")
+        
+        # Réencoder et réindexer tous les chunks
+        if chunks:
+            contents = [chunk[1] for chunk in chunks]
+            embeddings = self.model.encode(contents, convert_to_numpy=True, normalize_embeddings=True)
+            embeddings = embeddings.astype("float32")
+            
+            # Ajouter à FAISS
+            self.index.add(embeddings)
+            
+            # Mettre à jour la table de mapping
+            for i, (chunk_id, _) in enumerate(chunks):
+                cur.execute("INSERT INTO faiss_map(faiss_id, chunk_id) VALUES(?,?)", (i, chunk_id))
+        
+        self.conn.commit()
+        self._persist_faiss()
 
     def close(self):
         self._persist_faiss()
@@ -546,22 +644,43 @@ def _cmd_search(query: str, mode: str = "hybrid"):
         print(snippet[:800] + ("..." if len(snippet) > 800 else ""))
     ltm.close()
 
+def _cmd_integrity():
+    ltm = LongTermMemory()
+    integrity = ltm.check_file_integrity()
+    print(json.dumps(integrity, indent=2))
+    ltm.close()
+
+def _cmd_cleanup():
+    ltm = LongTermMemory()
+    deleted = ltm.cleanup_missing_files()
+    print(f"Supprimé {deleted} documents avec fichiers manquants")
+    print(json.dumps(ltm.stats(), indent=2))
+    ltm.close()
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd")
 
-    ap_idx = sub.add_parser("index", help="Indexer un dossier")
+    ap_idx = sub.add_parser("index", help="Indexer un dossier (stocke seulement les chemins)")
     ap_idx.add_argument("folder", type=str)
 
     ap_s = sub.add_parser("search", help="Rechercher")
     ap_s.add_argument("query", type=str)
     ap_s.add_argument("--mode", type=str, default="hybrid", choices=["keyword", "semantic", "hybrid"])
 
+    ap_int = sub.add_parser("integrity", help="Vérifier l'intégrité des fichiers indexés")
+    
+    ap_clean = sub.add_parser("cleanup", help="Supprimer les références vers les fichiers manquants")
+
     args = ap.parse_args()
     if args.cmd == "index":
         _cmd_index(args.folder)
     elif args.cmd == "search":
         _cmd_search(args.query, args.mode)
+    elif args.cmd == "integrity":
+        _cmd_integrity()
+    elif args.cmd == "cleanup":
+        _cmd_cleanup()
     else:
         ap.print_help()
