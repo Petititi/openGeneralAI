@@ -23,12 +23,35 @@
       "console": "integratedTerminal"
     },
     {
-      "name": "Python: index code",
+      "name": "memory: index code",
       "type": "python",
       "request": "launch",
       "module": "agents.tools.longterm_memory",
       "args": [
-        "index","C:/Research/LLM/openGeneralAI"
+        "index",
+        "C:/Research/LLM/openGeneralAI"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "memory: verify integrity",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "agents.tools.longterm_memory",
+      "args": [
+        "integrity",
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "memory: query content",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "agents.tools.longterm_memory",
+      "args": [
+        "search",
+        "Which class is responsible to make system calls?",
+        "--mode", "semantic",
       ],
       "console": "integratedTerminal"
     },

@@ -11,7 +11,7 @@ import numpy as np
 import faiss
 
 from sentence_transformers import SentenceTransformer
-from tree_sitter_languages import get_parser  # bundlé (py, js, ts, c, cpp, java, go, rust, etc.)
+from tree_sitter_language_pack import get_parser
 
 # --------------------------
 # Utilitaires
@@ -62,82 +62,181 @@ def normalize(v: np.ndarray) -> np.ndarray:
     norms = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
     return v / norms
 
-def read_text_safe(path: Path, max_bytes: int = 10_000_000) -> str:
+def read_text_safe(path: Path, max_bytes: int = 10_000_000) -> bytes:
     data = path.read_bytes()
     if len(data) > max_bytes:
         data = data[:max_bytes]
-    try:
-        return data.decode("utf-8")
-    except UnicodeDecodeError:
-        return data.decode("latin-1", errors="replace")
+    return data
 
 # --------------------------
 # Chunking via tree-sitter
 # --------------------------
 
-def extract_code_chunks(source: str, language: str) -> List[Tuple[int, int, str]]:
+def extract_name_from_node(node, source: bytes) -> Optional[str]:
+    """Extrait le nom d'une fonction/classe/méthode depuis un noeud tree-sitter."""
+    for child in node.children:
+        if child.type in {"identifier", "name"}:
+            return source[child.start_byte:child.end_byte].decode("utf-8")
+    return None
+
+def extract_imports(root_node, source: bytes, _language: str) -> List[str]:
+    """Extrait tous les imports/includes d'un fichier."""
+    imports = []
+    
+    IMPORT_TYPES = {
+        "import_statement",
+        "import_from_statement",
+        "preproc_include",
+        "using_directive",
+        "package_declaration",
+    }
+    
+    def walk_imports(node):
+        if node.type in IMPORT_TYPES:
+            import_text = source[node.start_byte:node.end_byte].strip()
+            imports.append(import_text)
+        for child in node.children:
+            walk_imports(child)
+    
+    walk_imports(root_node)
+    return imports
+
+def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, int, str, Dict]], List[str], Dict[str, List[int]]]:
     """
-    Retourne des chunks (start_line, end_line, text) pour fonctions/classes.
+    Retourne des chunks (start_line, end_line, text, metadata) pour fonctions/classes.
+    metadata contient: {type, name, class_name, parent_class}
     Si rien de structuré trouvé, fallback: chunk par ~120 lignes.
+    
+    Retourne: (chunks, imports, class_methods_map)
+    class_methods_map: Dict[class_name, List[chunk_index]] pour lier classes et méthodes
     """
     try:
         parser = get_parser(language)
-    except Exception:
+    except LookupError as e:  # type: ignore
+        print(f"[WARN] extract_code_chunks: pas de parser pour '{language}': {e}", file=sys.stderr)
         # parser non dispo -> fallback lignes
-        lines = source.splitlines()
+        lines = source.decode("utf-8").splitlines()
         chunks = []
         step = 120
         for i in range(0, len(lines), step):
             part = "\n".join(lines[i:i+step])
             if part.strip():
-                chunks.append((i+1, min(i+step, len(lines)), part))
-        return chunks
-
-    tree = parser.parse(bytes(source, "utf-8"))
+                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "block"}))
+        return chunks, [], {}
+    tree = parser.parse(source)
     root = tree.root_node
 
+    # Extraire les imports une fois pour tout le fichier
+    imports = extract_imports(root, source, language)
+
     # Noms de noeuds typiques par langage
-    CANDIDATE_TYPES = {
+    FUNCTION_TYPES = {
         "function_definition",
         "function_declaration",
+    }
+    
+    METHOD_TYPES = {
         "method_definition",
+    }
+    
+    CLASS_TYPES = {
         "class_definition",
         "class_declaration",
         "interface_declaration",
         "struct_specifier",
         "enum_specifier",
+    }
+    
+    MODULE_TYPES = {
         "module_declaration",
     }
 
     chunks = []
-    def walk(node):
-        # Sélectionne les noeuds "importants"
-        if node.type in CANDIDATE_TYPES:
+    class_methods_map = {}  # {class_name: [chunk_indices]}
+    
+    def is_docstring(node):
+        if node.type == "string":
+            parent = node.parent
+            if parent is None or parent.type != "expression_statement":
+                return False
+            grandparent = parent.parent
+            if grandparent is None:
+                return False
+            # Vérifie que c'est le premier élément du bloc
+            first_child = grandparent.children[0] if grandparent.children else None
+            return first_child == parent and grandparent.type in ("module", "class_definition", "function_definition")
+        elif node.type == "comment" and node.parent is not None:
+            parent = node.parent
+            next_node = node.next_sibling
+            return next_node is not None and next_node.type == "class_definition"
+
+    
+    def walk(node, parent_class=None):
+        # Identifier le type de noeud
+        chunk_type = None
+        if node.type in CLASS_TYPES:
+            chunk_type = "class"
+        elif node.type in METHOD_TYPES:
+            chunk_type = "method"
+        elif node.type in FUNCTION_TYPES:
+            # Différencier méthode (dans une classe) de fonction (standalone)
+            if parent_class:
+                chunk_type = "method"
+            else:
+                chunk_type = "function"
+        elif node.type in MODULE_TYPES:
+            chunk_type = "module"
+        elif node.type == "comment":
+            if is_docstring(node):
+                print('found ' + source[node.start_byte:node.end_byte].decode("utf-8"))
+        
+        if chunk_type:
             start = node.start_point[0] + 1
             end = node.end_point[0] + 1
-            text = source[node.start_byte:node.end_byte]
+            text = source[node.start_byte:node.end_byte].decode("utf-8")
+            
             if text.strip():
-                chunks.append((start, end, text))
+                name = extract_name_from_node(node, source)
+                metadata = {
+                    "type": chunk_type,
+                    "name": name,
+                    "parent_class": parent_class
+                }
+                chunk_index = len(chunks)
+                chunks.append((start, end, text, metadata))
+                
+                # Si c'est une méthode, l'ajouter à la map de sa classe
+                if chunk_type == "method" and parent_class:
+                    if parent_class not in class_methods_map:
+                        class_methods_map[parent_class] = []
+                    class_methods_map[parent_class].append(chunk_index)
+                
+                # Si c'est une classe, on marque les méthodes enfants avec ce parent
+                if chunk_type == "class":
+                    parent_class = name
+        
+        # Continuer la marche récursive
         for c in node.children:
-            walk(c)
+            walk(c, parent_class)
 
     walk(root)
 
     if not chunks:
         # fallback: grands blocs
-        lines = source.splitlines()
+        lines = source.decode("utf-8").splitlines()
         step = 120
         for i in range(0, len(lines), step):
             part = "\n".join(lines[i:i+step])
             if part.strip():
-                chunks.append((i+1, min(i+step, len(lines)), part))
+                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "block"}))
+        return chunks, imports, {}
 
     # Limiter la taille de chunk (~1500 tokens équiv) par nombre de caractères
     MAX_CHARS = 6000
     final = []
-    for s, e, t in chunks:
+    for s, e, t, meta in chunks:
         if len(t) <= MAX_CHARS:
-            final.append((s, e, t))
+            final.append((s, e, t, meta))
         else:
             # re-split par lignes
             lines = t.splitlines()
@@ -148,14 +247,21 @@ def extract_code_chunks(source: str, language: str) -> List[Tuple[int, int, str]
                 count += len(line) + 1
                 if count >= MAX_CHARS:
                     segment = "\n".join(buf)
-                    final.append((start, s + idx, segment))
+                    final.append((start, s + idx, segment, {**meta, "type": "partial"}))
                     buf, start, count = [], s + idx + 1, 0
             if buf:
-                final.append((start, e, "\n".join(buf)))
-    return final
+                final.append((start, e, "\n".join(buf), meta))
+    
+    # Mettre à jour class_methods_map avec les nouveaux indices après split
+    # Note: les indices peuvent avoir changé, mais on garde la structure originale
+    # car le split ne devrait affecter que les chunks trop longs
+    
+    # Retourner aussi les imports et le mapping classe->méthodes
+    return final, imports, class_methods_map
 
-def extract_text_chunks(text: str, max_chars: int = 3000) -> List[Tuple[int, int, str]]:
-    # Split par paragraphes, puis pack jusqu’à ~max_chars
+def extract_text_chunks(source: bytes, max_chars: int = 3000) -> Tuple[List[Tuple[int, int, str, Dict]], List[str], Dict[str, List[int]]]:
+    # Split par paragraphes, puis pack jusqu'à ~max_chars
+    text = source.decode("utf-8")
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks = []
     buf = []
@@ -166,14 +272,14 @@ def extract_text_chunks(text: str, max_chars: int = 3000) -> List[Tuple[int, int
         if size + len(p) + 2 > max_chars and buf:
             chunk = "\n\n".join(buf)
             end = line_counter
-            chunks.append((start, end, chunk))
+            chunks.append((start, end, chunk, {"type": "text"}))
             buf, size, start = [], 0, line_counter + 1
         buf.append(p)
         size += len(p) + 2
         line_counter += p.count("\n") + 2
     if buf:
-        chunks.append((start, line_counter, "\n\n".join(buf)))
-    return chunks
+        chunks.append((start, line_counter, "\n\n".join(buf), {"type": "text"}))
+    return chunks, [], {}
 
 # --------------------------
 # LongTermMemory
@@ -198,16 +304,13 @@ class LongTermMemory:
         db_path: str = "memory.sqlite",
         storage_dir: str = "storage",
         faiss_index_path: str = "faiss.index",
-        model_name: str = "sentence-transformers/all-MiniLM-L6-v2",
+        model_name: str = "mixedbread-ai/mxbai-embed-large-v1",
         hybrid_alpha: float = 0.5,
     ):
         self.db_path = db_path
         self.storage_dir = Path(storage_dir)  # Conservé pour compatibilité mais non utilisé
         self.faiss_index_path = faiss_index_path
         self.hybrid_alpha = hybrid_alpha
-
-        # Plus besoin de créer le storage_dir car on ne copie plus les fichiers
-        # self.storage_dir.mkdir(parents=True, exist_ok=True)
 
         self.conn = sqlite3.connect(self.db_path)
         self.conn.execute("PRAGMA journal_mode=WAL;")
@@ -238,6 +341,13 @@ class LongTermMemory:
             created_at TEXT,
             extra JSON
         )""")
+        # Table pour stocker les imports d'un document
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS document_imports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+            import_statement TEXT
+        )""")
         cur.execute("""
         CREATE TABLE IF NOT EXISTS chunks (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -246,7 +356,10 @@ class LongTermMemory:
             start_line INTEGER,
             end_line INTEGER,
             content TEXT,
-            token_count INTEGER DEFAULT NULL
+            token_count INTEGER DEFAULT NULL,
+            chunk_type TEXT,
+            chunk_name TEXT,
+            parent_class TEXT
         )""")
         # FTS5 avec contenu externe pour sync facile
         cur.execute("""
@@ -279,6 +392,16 @@ class LongTermMemory:
             faiss_id INTEGER PRIMARY KEY,
             chunk_id INTEGER UNIQUE REFERENCES chunks(id) ON DELETE CASCADE
         )""")
+        # Index pour rechercher efficacement par type de chunk, nom, classe parente
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chunk_type ON chunks(chunk_type)
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_chunk_name ON chunks(chunk_name)
+        """)
+        cur.execute("""
+        CREATE INDEX IF NOT EXISTS idx_parent_class ON chunks(parent_class)
+        """)
         self.conn.commit()
 
     def _load_faiss(self):
@@ -316,16 +439,17 @@ class LongTermMemory:
 
         # Déterminer type/langue
         ext = p.suffix.lower()
+        class_methods_map = {}
         if ext in SUPPORTED_CODE_EXT:
             language = SUPPORTED_CODE_EXT[ext]
             media_type = "code"
             text = read_text_safe(p)
-            chunks = extract_code_chunks(text, language)
+            chunks, imports, class_methods_map = extract_code_chunks(text, language)
         elif ext in TEXT_EXT:
             language = None
             media_type = "text"
             text = read_text_safe(p)
-            chunks = extract_text_chunks(text)
+            chunks, imports, class_methods_map = extract_text_chunks(text)
         else:
             # Fallback: on ignore les binaires ici pour rester simple
             raise ValueError(f"Type de fichier non géré pour l’indexation: {ext}")
@@ -340,22 +464,95 @@ class LongTermMemory:
             doc_id, str(p.resolve()), rel_path, media_type, language, doc_id, len(data), now_iso(), json.dumps(extra or {})
         ))
 
-        # Insérer chunks
-        for i, (start, end, content) in enumerate(chunks):
+        # Insérer les imports pour ce document
+        for imp in imports:
             cur.execute("""
-                INSERT INTO chunks(document_id, ord, start_line, end_line, content)
-                VALUES(?,?,?,?,?)
-            """, (doc_id, i, start, end, content))
-            chunk_id = cur.lastrowid
+                INSERT INTO document_imports(document_id, import_statement)
+                VALUES(?,?)
+            """, (doc_id, imp))
 
-            # Embedding & FAISS
-            emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True)
-            # emb est déjà normalisé par sentence-transformers si normalize_embeddings=True,
-            # mais normalisons pour être sûrs si l’impl change :
-            emb = normalize(emb.astype("float32"))
-            faiss_id = self.index.ntotal
-            self.index.add(emb)
-            cur.execute("INSERT INTO faiss_map(faiss_id, chunk_id) VALUES(?,?)", (faiss_id, chunk_id))
+        # Première passe: insérer tous les chunks et calculer les embeddings des non-classes
+        chunk_ids = []
+        chunk_embeddings = {}
+        
+        for i, (start, end, content, metadata) in enumerate(chunks):
+            cur.execute("""
+                INSERT INTO chunks(document_id, ord, start_line, end_line, content, chunk_type, chunk_name, parent_class)
+                VALUES(?,?,?,?,?,?,?,?)
+            """, (doc_id, i, start, end, content, 
+                  metadata.get("type"), metadata.get("name"), metadata.get("parent_class")))
+            chunk_id = cur.lastrowid
+            chunk_ids.append(chunk_id)
+            
+            chunk_type = metadata.get("type")
+            chunk_name = metadata.get("name")
+            
+            # Pour les classes, on ne calcule pas encore l'embedding
+            if chunk_type == "class":
+                chunk_embeddings[i] = None  # Sera calculé plus tard
+            else:
+                # Embedding normal pour fonctions, méthodes, etc.
+                emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                chunk_embeddings[i] = emb[0]
+        
+        # Deuxième passe: calculer les embeddings des classes comme somme pondérée des méthodes
+        for i, (start, end, content, metadata) in enumerate(chunks):
+            chunk_type = metadata.get("type")
+            chunk_name = metadata.get("name")
+            
+            if chunk_type == "class" and chunk_name in class_methods_map:
+                method_indices = class_methods_map[chunk_name]
+                method_embeddings = []
+                method_weights = []
+                # Classe sans méthodes ou non trouvée dans la map
+                class_emb = self.model.encode([f"This is a {language} class named {chunk_name}"], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                method_embeddings.append(class_emb[0])
+                method_weights.append(500) # arbitrary weight for class description
+                
+                # Collecter les embeddings des méthodes de cette classe avec leurs tailles
+                for method_idx in method_indices:
+                    if method_idx < len(chunk_embeddings) and chunk_embeddings[method_idx] is not None:
+                        method_embeddings.append(chunk_embeddings[method_idx])
+                        # Poids basé sur la taille en bytes du contenu de la méthode
+                        method_content = chunks[method_idx][2]
+                        method_weights.append(len(method_content.encode('utf-8')))
+                
+                if method_embeddings:
+                    # Calculer la moyenne pondérée par la taille (bytes) de chaque méthode
+                    method_embeddings_array = np.array(method_embeddings)
+                    method_weights_array = np.array(method_weights, dtype="float32")
+                    
+                    # Normaliser les poids pour qu'ils somment à 1
+                    weights_sum = np.sum(method_weights_array)
+                    if weights_sum > 0:
+                        normalized_weights = method_weights_array / weights_sum
+                        # Moyenne pondérée: somme des embeddings multipliés par leurs poids
+                        class_emb = np.sum(method_embeddings_array * normalized_weights[:, np.newaxis], axis=0).astype("float32")
+                    else:
+                        # Fallback sur moyenne simple si problème avec les poids
+                        class_emb = np.mean(method_embeddings_array, axis=0).astype("float32")
+                    
+                    # Re-normaliser
+                    norm = np.linalg.norm(class_emb)
+                    if norm > 1e-12:
+                        class_emb = class_emb / norm
+                    chunk_embeddings[i] = class_emb
+                else:
+                    # Pas de méthodes trouvées, utiliser l'embedding du contenu de la classe
+                    emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                    chunk_embeddings[i] = emb[0]
+            elif chunk_type == "class":
+                # Classe sans méthodes ou non trouvée dans la map
+                emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                chunk_embeddings[i] = emb[0]
+        
+        # Troisième passe: ajouter tous les embeddings à FAISS
+        for i, chunk_id in enumerate(chunk_ids):
+            if i in chunk_embeddings and chunk_embeddings[i] is not None:
+                emb = chunk_embeddings[i].reshape(1, -1)
+                faiss_id = self.index.ntotal
+                self.index.add(emb)
+                cur.execute("INSERT INTO faiss_map(faiss_id, chunk_id) VALUES(?,?)", (faiss_id, chunk_id))
 
         self.conn.commit()
         self._persist_faiss()
@@ -378,7 +575,7 @@ class LongTermMemory:
         for f in files:
             try:
                 self.add(str(f), rel_to=str(root))
-            except Exception as e:
+            except Exception as e:  # type: ignore
                 print(f"[WARN] Skip {f}: {e}", file=sys.stderr)
 
     def search(self, query: str, top_k: int = 8, mode: str = "hybrid") -> List[Dict]:
@@ -408,7 +605,7 @@ class LongTermMemory:
             kw_results = cur.fetchall()
 
         if mode in {"semantic", "hybrid"}:
-            q_emb = self.model.encode([query], convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+            q_emb = self.model.encode([query], prompt_name="query", convert_to_numpy=True, normalize_embeddings=True).astype("float32")
             sims, ids = self.index.search(q_emb, top_k * 3)  # dot product (cosine) scores
             ids = ids[0]
             sims = sims[0]
@@ -533,7 +730,7 @@ class LongTermMemory:
         missing = 0
         modified = 0
         
-        for doc_id, source_path, expected_sha256 in docs:
+        for _doc_id, source_path, expected_sha256 in docs:
             path = Path(source_path)
             if not path.exists():
                 missing += 1
@@ -545,7 +742,7 @@ class LongTermMemory:
                         existing += 1
                     else:
                         modified += 1
-                except Exception:
+                except Exception:  # type: ignore
                     missing += 1
         
         return {
@@ -620,6 +817,280 @@ class LongTermMemory:
         self.conn.commit()
         self._persist_faiss()
 
+    def get_methods_by_class(self, class_name: str) -> List[Dict]:
+        """
+        Retourne toutes les méthodes d'une classe spécifique.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT c.id, c.document_id, c.start_line, c.end_line, c.content, 
+                   c.chunk_name, c.parent_class, d.source_path, d.language
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.parent_class = ? AND c.chunk_type = 'method'
+            ORDER BY c.start_line
+        """, (class_name,))
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "chunk_id": row[0],
+                "document_id": row[1],
+                "start_line": row[2],
+                "end_line": row[3],
+                "content": row[4],
+                "method_name": row[5],
+                "class_name": row[6],
+                "source_path": row[7],
+                "language": row[8]
+            })
+        return results
+
+    def get_class_code(self, class_name: str) -> List[Dict]:
+        """
+        Retourne le code complet d'une classe spécifique.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
+                   c.chunk_name, d.source_path, d.language
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.chunk_name = ? AND c.chunk_type = 'class'
+            ORDER BY c.start_line
+        """, (class_name,))
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "chunk_id": row[0],
+                "document_id": row[1],
+                "start_line": row[2],
+                "end_line": row[3],
+                "content": row[4],
+                "class_name": row[5],
+                "source_path": row[6],
+                "language": row[7]
+            })
+        return results
+
+    def get_method_code(self, method_name: str, class_name: Optional[str] = None) -> List[Dict]:
+        """
+        Retourne le code d'une méthode spécifique. 
+        Si class_name est fourni, recherche dans cette classe uniquement.
+        """
+        cur = self.conn.cursor()
+        if class_name:
+            cur.execute("""
+                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
+                       c.chunk_name, c.parent_class, d.source_path, d.language
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.chunk_name = ? AND c.parent_class = ? AND c.chunk_type = 'method'
+                ORDER BY c.start_line
+            """, (method_name, class_name))
+        else:
+            cur.execute("""
+                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
+                       c.chunk_name, c.parent_class, d.source_path, d.language
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.chunk_name = ? AND c.chunk_type IN ('method', 'function')
+                ORDER BY c.start_line
+            """, (method_name,))
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "chunk_id": row[0],
+                "document_id": row[1],
+                "start_line": row[2],
+                "end_line": row[3],
+                "content": row[4],
+                "method_name": row[5],
+                "class_name": row[6],
+                "source_path": row[7],
+                "language": row[8]
+            })
+        return results
+
+    def get_function_code(self, function_name: str) -> List[Dict]:
+        """
+        Retourne le code d'une fonction spécifique (pas de classe parente).
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
+                   c.chunk_name, d.source_path, d.language
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.chunk_name = ? AND c.chunk_type = 'function' AND c.parent_class IS NULL
+            ORDER BY c.start_line
+        """, (function_name,))
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "chunk_id": row[0],
+                "document_id": row[1],
+                "start_line": row[2],
+                "end_line": row[3],
+                "content": row[4],
+                "function_name": row[5],
+                "source_path": row[6],
+                "language": row[7]
+            })
+        return results
+
+    def get_document_imports(self, document_id: str) -> List[str]:
+        """
+        Retourne tous les imports d'un document spécifique.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT import_statement
+            FROM document_imports
+            WHERE document_id = ?
+            ORDER BY id
+        """, (document_id,))
+        
+        return [row[0] for row in cur.fetchall()]
+
+    def get_imports_by_file(self, file_path: str) -> List[str]:
+        """
+        Retourne tous les imports d'un fichier par son chemin.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT di.import_statement
+            FROM document_imports di
+            JOIN documents d ON di.document_id = d.id
+            WHERE d.source_path = ?
+            ORDER BY di.id
+        """, (file_path,))
+        
+        return [row[0] for row in cur.fetchall()]
+
+    def list_all_classes(self) -> List[Dict]:
+        """
+        Liste toutes les classes indexées avec leurs informations.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT c.chunk_name, d.source_path, d.language, c.document_id
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.chunk_type = 'class' AND c.chunk_name IS NOT NULL
+            ORDER BY c.chunk_name
+        """)
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "class_name": row[0],
+                "source_path": row[1],
+                "language": row[2],
+                "document_id": row[3]
+            })
+        return results
+
+    def list_all_functions(self) -> List[Dict]:
+        """
+        Liste toutes les fonctions indexées (hors méthodes de classe).
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT DISTINCT c.chunk_name, d.source_path, d.language, c.document_id
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.chunk_type = 'function' AND c.parent_class IS NULL AND c.chunk_name IS NOT NULL
+            ORDER BY c.chunk_name
+        """)
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "function_name": row[0],
+                "source_path": row[1],
+                "language": row[2],
+                "document_id": row[3]
+            })
+        return results
+
+    def get_chunk_metadata(self, chunk_id: int) -> Optional[Dict]:
+        """
+        Retourne toutes les métadonnées d'un chunk spécifique.
+        """
+        cur = self.conn.cursor()
+        cur.execute("""
+            SELECT c.id, c.document_id, c.ord, c.start_line, c.end_line, 
+                   c.content, c.chunk_type, c.chunk_name, c.parent_class,
+                   d.source_path, d.language, d.media_type
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.id = ?
+        """, (chunk_id,))
+        
+        row = cur.fetchone()
+        if not row:
+            return None
+        
+        return {
+            "chunk_id": row[0],
+            "document_id": row[1],
+            "order": row[2],
+            "start_line": row[3],
+            "end_line": row[4],
+            "content": row[5],
+            "chunk_type": row[6],
+            "chunk_name": row[7],
+            "parent_class": row[8],
+            "source_path": row[9],
+            "language": row[10],
+            "media_type": row[11]
+        }
+
+    def search_by_type(self, chunk_type: str, name_pattern: Optional[str] = None) -> List[Dict]:
+        """
+        Recherche des chunks par type (class, method, function, etc.) 
+        avec option de filtre par pattern de nom.
+        """
+        cur = self.conn.cursor()
+        if name_pattern:
+            cur.execute("""
+                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
+                       c.chunk_name, c.parent_class, c.chunk_type, d.source_path, d.language
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.chunk_type = ? AND c.chunk_name LIKE ?
+                ORDER BY c.chunk_name
+            """, (chunk_type, f"%{name_pattern}%"))
+        else:
+            cur.execute("""
+                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
+                       c.chunk_name, c.parent_class, c.chunk_type, d.source_path, d.language
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE c.chunk_type = ?
+                ORDER BY c.chunk_name
+            """, (chunk_type,))
+        
+        results = []
+        for row in cur.fetchall():
+            results.append({
+                "chunk_id": row[0],
+                "document_id": row[1],
+                "start_line": row[2],
+                "end_line": row[3],
+                "content": row[4],
+                "name": row[5],
+                "parent_class": row[6],
+                "chunk_type": row[7],
+                "source_path": row[8],
+                "language": row[9]
+            })
+        return results
+
     def close(self):
         self._persist_faiss()
         self.conn.close()
@@ -636,12 +1107,22 @@ def _cmd_index(folder: str):
 
 def _cmd_search(query: str, mode: str = "hybrid"):
     ltm = LongTermMemory()
+
+    classes = ltm.list_all_classes()
+    for cls in classes[:10]:  # Top 10
+        print(f"   - {cls['class_name']:30} [{cls['language']:10}] {cls['source_path']}")
+
+
     res = ltm.search(query, top_k=8, mode=mode)
     for i, r in enumerate(res, 1):
         print(f"\n[{i}] score={r['score']:.4f}  {r['source_path']}:{r['start_line']}-{r['end_line']}")
         print("-" * 80)
         snippet = r["content"]
-        print(snippet[:800] + ("..." if len(snippet) > 800 else ""))
+        linebreak = snippet.find("\n")
+        if linebreak > 0:
+            print(snippet[:linebreak] + "...")
+        else:
+            print(snippet[:100] + ("..." if len(snippet) > 100 else ""))
     ltm.close()
 
 def _cmd_integrity():
@@ -655,6 +1136,78 @@ def _cmd_cleanup():
     deleted = ltm.cleanup_missing_files()
     print(f"Supprimé {deleted} documents avec fichiers manquants")
     print(json.dumps(ltm.stats(), indent=2))
+    ltm.close()
+
+def _cmd_list_classes():
+    ltm = LongTermMemory()
+    classes = ltm.list_all_classes()
+    print(f"Found {len(classes)} classes:")
+    for cls in classes:
+        print(f"  - {cls['class_name']} in {cls['source_path']} ({cls['language']})")
+    ltm.close()
+
+def _cmd_list_functions():
+    ltm = LongTermMemory()
+    functions = ltm.list_all_functions()
+    print(f"Found {len(functions)} functions:")
+    for func in functions:
+        print(f"  - {func['function_name']} in {func['source_path']} ({func['language']})")
+    ltm.close()
+
+def _cmd_get_class(class_name: str):
+    ltm = LongTermMemory()
+    results = ltm.get_class_code(class_name)
+    if not results:
+        print(f"No class found with name: {class_name}")
+    else:
+        for r in results:
+            print(f"\n{'='*80}")
+            print(f"Class: {r['class_name']}")
+            print(f"File: {r['source_path']}:{r['start_line']}-{r['end_line']}")
+            print(f"Language: {r['language']}")
+            print(f"{'='*80}")
+            print(r['content'])
+    ltm.close()
+
+def _cmd_get_methods(class_name: str):
+    ltm = LongTermMemory()
+    methods = ltm.get_methods_by_class(class_name)
+    if not methods:
+        print(f"No methods found for class: {class_name}")
+    else:
+        print(f"Found {len(methods)} methods in class {class_name}:")
+        for m in methods:
+            print(f"\n{'-'*80}")
+            print(f"Method: {m['method_name']} (lines {m['start_line']}-{m['end_line']})")
+            print(f"File: {m['source_path']}")
+            print(f"{'-'*80}")
+            print(m['content'][:500] + ("..." if len(m['content']) > 500 else ""))
+    ltm.close()
+
+def _cmd_get_function(function_name: str):
+    ltm = LongTermMemory()
+    results = ltm.get_function_code(function_name)
+    if not results:
+        print(f"No function found with name: {function_name}")
+    else:
+        for r in results:
+            print(f"\n{'='*80}")
+            print(f"Function: {r['function_name']}")
+            print(f"File: {r['source_path']}:{r['start_line']}-{r['end_line']}")
+            print(f"Language: {r['language']}")
+            print(f"{'='*80}")
+            print(r['content'])
+    ltm.close()
+
+def _cmd_get_imports(file_path: str):
+    ltm = LongTermMemory()
+    imports = ltm.get_imports_by_file(file_path)
+    if not imports:
+        print(f"No imports found for file: {file_path}")
+    else:
+        print(f"Imports in {file_path}:")
+        for imp in imports:
+            print(f"  {imp}")
     ltm.close()
 
 if __name__ == "__main__":
@@ -673,6 +1226,22 @@ if __name__ == "__main__":
     
     ap_clean = sub.add_parser("cleanup", help="Supprimer les références vers les fichiers manquants")
 
+    ap_list_cls = sub.add_parser("list-classes", help="Lister toutes les classes indexées")
+    
+    ap_list_fn = sub.add_parser("list-functions", help="Lister toutes les fonctions indexées")
+    
+    ap_get_cls = sub.add_parser("get-class", help="Obtenir le code d'une classe")
+    ap_get_cls.add_argument("class_name", type=str)
+    
+    ap_get_methods = sub.add_parser("get-methods", help="Obtenir toutes les méthodes d'une classe")
+    ap_get_methods.add_argument("class_name", type=str)
+    
+    ap_get_fn = sub.add_parser("get-function", help="Obtenir le code d'une fonction")
+    ap_get_fn.add_argument("function_name", type=str)
+    
+    ap_get_imp = sub.add_parser("get-imports", help="Obtenir les imports d'un fichier")
+    ap_get_imp.add_argument("file_path", type=str)
+
     args = ap.parse_args()
     if args.cmd == "index":
         _cmd_index(args.folder)
@@ -682,5 +1251,17 @@ if __name__ == "__main__":
         _cmd_integrity()
     elif args.cmd == "cleanup":
         _cmd_cleanup()
+    elif args.cmd == "list-classes":
+        _cmd_list_classes()
+    elif args.cmd == "list-functions":
+        _cmd_list_functions()
+    elif args.cmd == "get-class":
+        _cmd_get_class(args.class_name)
+    elif args.cmd == "get-methods":
+        _cmd_get_methods(args.class_name)
+    elif args.cmd == "get-function":
+        _cmd_get_function(args.function_name)
+    elif args.cmd == "get-imports":
+        _cmd_get_imports(args.file_path)
     else:
         ap.print_help()
