@@ -9,7 +9,7 @@ import pytest
 # Ajouter le répertoire parent au path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agents.tools.longterm_memory import LongTermMemory
+from storage.longterm_memory import LongTermMemory
 
 
 @pytest.fixture

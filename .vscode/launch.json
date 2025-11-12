@@ -26,7 +26,7 @@
       "name": "memory: index code",
       "type": "python",
       "request": "launch",
-      "module": "agents.tools.longterm_memory",
+      "module": "storage.longterm_memory",
       "args": [
         "index",
         "C:/Research/LLM/openGeneralAI"
@@ -37,7 +37,7 @@
       "name": "memory: verify integrity",
       "type": "debugpy",
       "request": "launch",
-      "module": "agents.tools.longterm_memory",
+      "module": "storage.longterm_memory",
       "args": [
         "integrity",
       ],
@@ -47,7 +47,7 @@
       "name": "memory: query content",
       "type": "debugpy",
       "request": "launch",
-      "module": "agents.tools.longterm_memory",
+      "module": "storage.longterm_memory",
       "args": [
         "search",
         "Which class is responsible to make system calls?",

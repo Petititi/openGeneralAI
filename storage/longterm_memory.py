@@ -2,16 +2,16 @@ import os
 import sys
 import json
 import hashlib
-import sqlite3
 import datetime as dt
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 import numpy as np
-import faiss
 
-from sentence_transformers import SentenceTransformer
 from tree_sitter_language_pack import get_parser
+
+from .DatabaseManagement import DatabaseManager
+from .EmbeddingManagement import EmbeddingManager
 
 # --------------------------
 # Utilitaires
@@ -281,6 +281,7 @@ def extract_text_chunks(source: bytes, max_chars: int = 3000) -> Tuple[List[Tupl
         chunks.append((start, line_counter, "\n\n".join(buf), {"type": "text"}))
     return chunks, [], {}
 
+
 # --------------------------
 # LongTermMemory
 # --------------------------
@@ -307,122 +308,29 @@ class LongTermMemory:
         model_name: str = "mixedbread-ai/mxbai-embed-large-v1",
         hybrid_alpha: float = 0.5,
     ):
-        self.db_path = db_path
-        self.storage_dir = Path(storage_dir)  # Conservé pour compatibilité mais non utilisé
-        self.faiss_index_path = faiss_index_path
+        self.storage_dir = Path(storage_dir)  # Conservé pour compatibilité
         self.hybrid_alpha = hybrid_alpha
 
-        self.conn = sqlite3.connect(self.db_path)
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA foreign_keys=ON;")
-        self._ensure_schema()
+        # Initialiser les managers
+        self.db = DatabaseManager(db_path)
+        self.embeddings = EmbeddingManager(faiss_index_path, model_name)
 
-        # Embedding model
-        self.model = SentenceTransformer(model_name)
-        self.dim = self.model.get_sentence_embedding_dimension()
-
-        # FAISS index (cosine via dot-product sur vecteurs normalisés)
-        self.index = faiss.IndexFlatIP(self.dim)
-        self._load_faiss()
-
-    # ---------- Schema & FAISS ----------
-
-    def _ensure_schema(self):
-        cur = self.conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS documents (
-            id TEXT PRIMARY KEY,
-            source_path TEXT NOT NULL,
-            rel_path TEXT,
-            media_type TEXT,
-            language TEXT,
-            sha256 TEXT,
-            size_bytes INTEGER,
-            created_at TEXT,
-            extra JSON
-        )""")
-        # Table pour stocker les imports d'un document
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS document_imports (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
-            import_statement TEXT
-        )""")
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS chunks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            document_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
-            ord INTEGER,
-            start_line INTEGER,
-            end_line INTEGER,
-            content TEXT,
-            token_count INTEGER DEFAULT NULL,
-            chunk_type TEXT,
-            chunk_name TEXT,
-            parent_class TEXT
-        )""")
-        # FTS5 avec contenu externe pour sync facile
-        cur.execute("""
-        CREATE VIRTUAL TABLE IF NOT EXISTS chunks_fts USING fts5(
-            content, 
-            chunk_id UNINDEXED, 
-            document_id UNINDEXED, 
-            tokenize='porter',
-            content='chunks',
-            content_rowid='id'
-        )""")
-        # Triggers pour garder FTS en phase
-        cur.executescript("""
-        CREATE TRIGGER IF NOT EXISTS chunks_ai AFTER INSERT ON chunks BEGIN
-            INSERT INTO chunks_fts(rowid, content, chunk_id, document_id)
-            VALUES (new.id, new.content, new.id, new.document_id);
-        END;
-        CREATE TRIGGER IF NOT EXISTS chunks_ad AFTER DELETE ON chunks BEGIN
-            INSERT INTO chunks_fts(chunks_fts, rowid) VALUES('delete', old.id);
-        END;
-        CREATE TRIGGER IF NOT EXISTS chunks_au AFTER UPDATE ON chunks BEGIN
-            INSERT INTO chunks_fts(chunks_fts, rowid, content, chunk_id, document_id)
-            VALUES('delete', old.id, old.content, old.id, old.document_id);
-            INSERT INTO chunks_fts(rowid, content, chunk_id, document_id)
-            VALUES (new.id, new.content, new.id, new.document_id);
-        END;
-        """)
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS faiss_map (
-            faiss_id INTEGER PRIMARY KEY,
-            chunk_id INTEGER UNIQUE REFERENCES chunks(id) ON DELETE CASCADE
-        )""")
-        # Index pour rechercher efficacement par type de chunk, nom, classe parente
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_chunk_type ON chunks(chunk_type)
-        """)
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_chunk_name ON chunks(chunk_name)
-        """)
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_parent_class ON chunks(parent_class)
-        """)
-        self.conn.commit()
-
-    def _load_faiss(self):
-        # Recharger un index existant si présent, sinon construire à partir de la DB
-        if os.path.exists(self.faiss_index_path):
-            self.index = faiss.read_index(self.faiss_index_path)
-            return
-
-        # (Re)construire depuis zéro si faiss_map non vide sans index — cas rare
-        cur = self.conn.cursor()
-        cur.execute("SELECT COUNT(1) FROM faiss_map")
-        if cur.fetchone()[0] == 0:
-            # Pas de vecteurs encore
-            return
-        # Si on a une map mais pas l’index, on reconstruit à partir des embeddings stockés ?
-        # Ici, par simplicité, on considère que l’on recompute lors du prochain add() si besoin.
-        # (Alternative: stocker les embeddings en BLOB pour reconstruction.)
-        return
-
-    def _persist_faiss(self):
-        faiss.write_index(self.index, self.faiss_index_path)
+    # Propriétés de compatibilité pour accès legacy
+    @property
+    def conn(self):
+        return self.db.conn
+    
+    @property
+    def index(self):
+        return self.embeddings.index
+    
+    @property
+    def model(self):
+        return self.embeddings.model
+    
+    @property
+    def dim(self):
+        return self.embeddings.dim
 
     # ---------- API publique ----------
 
@@ -456,32 +364,23 @@ class LongTermMemory:
 
         rel_path = str(Path(rel_to).resolve().joinpath(p).resolve()) if rel_to else None
 
-        cur = self.conn.cursor()
-        cur.execute("""
-            INSERT OR IGNORE INTO documents(id, source_path, rel_path, media_type, language, sha256, size_bytes, created_at, extra)
-            VALUES(?,?,?,?,?,?,?,?,?)
-        """, (
-            doc_id, str(p.resolve()), rel_path, media_type, language, doc_id, len(data), now_iso(), json.dumps(extra or {})
-        ))
+        # Insérer le document
+        self.db.insert_document(
+            doc_id, str(p.resolve()), rel_path, media_type, language, doc_id, len(data), extra
+        )
 
-        # Insérer les imports pour ce document
-        for imp in imports:
-            cur.execute("""
-                INSERT INTO document_imports(document_id, import_statement)
-                VALUES(?,?)
-            """, (doc_id, imp))
+        # Insérer les imports
+        self.db.insert_imports(doc_id, imports)
 
         # Première passe: insérer tous les chunks et calculer les embeddings des non-classes
         chunk_ids = []
         chunk_embeddings = {}
         
         for i, (start, end, content, metadata) in enumerate(chunks):
-            cur.execute("""
-                INSERT INTO chunks(document_id, ord, start_line, end_line, content, chunk_type, chunk_name, parent_class)
-                VALUES(?,?,?,?,?,?,?,?)
-            """, (doc_id, i, start, end, content, 
-                  metadata.get("type"), metadata.get("name"), metadata.get("parent_class")))
-            chunk_id = cur.lastrowid
+            chunk_id = self.db.insert_chunk(
+                doc_id, i, start, end, content,
+                metadata.get("type"), metadata.get("name"), metadata.get("parent_class")
+            )
             chunk_ids.append(chunk_id)
             
             chunk_type = metadata.get("type")
@@ -492,7 +391,7 @@ class LongTermMemory:
                 chunk_embeddings[i] = None  # Sera calculé plus tard
             else:
                 # Embedding normal pour fonctions, méthodes, etc.
-                emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                emb = self.embeddings.encode([content], normalize=True)
                 chunk_embeddings[i] = emb[0]
         
         # Deuxième passe: calculer les embeddings des classes comme somme pondérée des méthodes
@@ -505,7 +404,7 @@ class LongTermMemory:
                 method_embeddings = []
                 method_weights = []
                 # Classe sans méthodes ou non trouvée dans la map
-                class_emb = self.model.encode([f"This is a {language} class named {chunk_name}"], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                class_emb = self.embeddings.encode([f"This is a {language} class named {chunk_name}"], normalize=True)
                 method_embeddings.append(class_emb[0])
                 method_weights.append(500) # arbitrary weight for class description
                 
@@ -539,23 +438,21 @@ class LongTermMemory:
                     chunk_embeddings[i] = class_emb
                 else:
                     # Pas de méthodes trouvées, utiliser l'embedding du contenu de la classe
-                    emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                    emb = self.embeddings.encode([content], normalize=True)
                     chunk_embeddings[i] = emb[0]
             elif chunk_type == "class":
                 # Classe sans méthodes ou non trouvée dans la map
-                emb = self.model.encode([content], batch_size=1, convert_to_numpy=True, normalize_embeddings=True).astype("float32")
+                emb = self.embeddings.encode([content], normalize=True)
                 chunk_embeddings[i] = emb[0]
         
         # Troisième passe: ajouter tous les embeddings à FAISS
         for i, chunk_id in enumerate(chunk_ids):
             if i in chunk_embeddings and chunk_embeddings[i] is not None:
                 emb = chunk_embeddings[i].reshape(1, -1)
-                faiss_id = self.index.ntotal
-                self.index.add(emb)
-                cur.execute("INSERT INTO faiss_map(faiss_id, chunk_id) VALUES(?,?)", (faiss_id, chunk_id))
+                faiss_ids = self.embeddings.add_embeddings(emb)
+                self.db.insert_faiss_mapping(faiss_ids[0], chunk_id)
 
-        self.conn.commit()
-        self._persist_faiss()
+        self.embeddings.persist()
         return doc_id
 
     def add_folder(self, folder: str):
@@ -594,44 +491,30 @@ class LongTermMemory:
 
         if mode in {"keyword", "hybrid"}:
             # FTS5: bm25-like; on prend un peu plus puis on tronque
-            cur.execute("""
-                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                       bm25(chunks_fts) AS score
-                FROM chunks_fts
-                JOIN chunks c ON c.id = chunks_fts.rowid
-                WHERE chunks_fts MATCH ?
-                ORDER BY score LIMIT ?
-            """, (query, top_k * 3))
-            kw_results = cur.fetchall()
+            kw_results = self.db.keyword_search(query, top_k * 3)
 
         if mode in {"semantic", "hybrid"}:
-            q_emb = self.model.encode([query], prompt_name="query", convert_to_numpy=True, normalize_embeddings=True).astype("float32")
-            sims, ids = self.index.search(q_emb, top_k * 3)  # dot product (cosine) scores
+            q_emb = self.embeddings.encode([query], normalize=True, prompt_name="query")
+            sims, ids = self.embeddings.search(q_emb, top_k * 3)
             ids = ids[0]
             sims = sims[0]
             # map faiss_id -> chunk
             if len(ids) > 0 and ids[0] != -1:
-                q = f"SELECT faiss_id, chunk_id FROM faiss_map WHERE faiss_id IN ({','.join('?'*len(ids))})"
-                cur.execute(q, [int(i) for i in ids])
-                mapping = {row[0]: row[1] for row in cur.fetchall()}
+                mapping = self.db.get_faiss_chunk_mapping([int(i) for i in ids])
                 for faiss_id, sim in zip(ids, sims):
                     if faiss_id == -1: 
                         continue
                     chunk_id = mapping.get(int(faiss_id))
                     if chunk_id is None:
                         continue
-                    cur.execute("""
-                        SELECT id, document_id, start_line, end_line, content FROM chunks WHERE id=?
-                    """, (chunk_id,))
-                    row = cur.fetchone()
+                    row = self.db.get_chunk_by_id(chunk_id)
                     if row:
                         sem_results.append((*row, float(sim)))
 
         def assemble(rows):
             out = []
             for cid, did, s, e, content, score in rows:
-                cur.execute("SELECT source_path, language FROM documents WHERE id=?", (did,))
-                d = cur.fetchone()
+                d = self.db.get_document_info(did)
                 out.append({
                     "chunk_id": int(cid),
                     "document_id": did,
@@ -687,44 +570,15 @@ class LongTermMemory:
         return assemble(fused[:top_k])
 
     def get(self, document_id: str) -> Dict:
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT id, source_path, media_type, language, size_bytes, created_at, extra
-            FROM documents WHERE id=?
-        """, (document_id,))
-        d = cur.fetchone()
-        if not d:
-            return {}
-        
-        # Vérifier que le fichier source existe encore
-        source_path = Path(d[1])
-        file_exists = source_path.exists()
-        
-        cur.execute("""
-            SELECT id, ord, start_line, end_line, content FROM chunks WHERE document_id=?
-            ORDER BY ord ASC
-        """, (document_id,))
-        chunks = [{
-            "chunk_id": r[0], "ord": r[1], "start_line": r[2], "end_line": r[3], "content": r[4]
-        } for r in cur.fetchall()]
-        return {
-            "document": {
-                "id": d[0], "source_path": d[1], "media_type": d[2],
-                "language": d[3], "size_bytes": d[4], "created_at": d[5],
-                "extra": json.loads(d[6] or "{}"),
-                "file_exists": file_exists
-            },
-            "chunks": chunks
-        }
+        result = self.db.get_document_details(document_id)
+        return result if result else {}
 
     def check_file_integrity(self) -> Dict:
         """
         Vérifie l'intégrité des fichiers indexés.
         Retourne des statistiques sur les fichiers existants/manquants/modifiés.
         """
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, source_path, sha256 FROM documents")
-        docs = cur.fetchall()
+        docs = self.db.get_all_documents()
         
         existing = 0
         missing = 0
@@ -753,16 +607,11 @@ class LongTermMemory:
         }
 
     def stats(self) -> Dict:
-        cur = self.conn.cursor()
-        cur.execute("SELECT COUNT(*) FROM documents")
-        n_docs = cur.fetchone()[0]
-        cur.execute("SELECT COUNT(*) FROM chunks")
-        n_chunks = cur.fetchone()[0]
+        db_stats = self.db.get_stats()
         return {
-            "documents": n_docs,
-            "chunks": n_chunks,
-            "faiss_ntotal": int(self.index.ntotal),
-            "embedding_dim": int(self.dim) if self.dim is not None else 0
+            **db_stats,
+            "faiss_ntotal": self.embeddings.ntotal,
+            "embedding_dim": self.embeddings.embedding_dim
         }
 
     def cleanup_missing_files(self) -> int:
@@ -770,19 +619,16 @@ class LongTermMemory:
         Supprime de la base de données les références vers les fichiers qui n'existent plus.
         Retourne le nombre de documents supprimés.
         """
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, source_path FROM documents")
-        docs = cur.fetchall()
+        docs = self.db.get_all_documents()
         
         deleted_count = 0
-        for doc_id, source_path in docs:
+        for doc_id, source_path, _sha256 in docs:
             if not Path(source_path).exists():
                 # Supprimer le document (les chunks et entrées FAISS seront supprimés en cascade)
-                cur.execute("DELETE FROM documents WHERE id=?", (doc_id,))
+                self.db.delete_document(doc_id)
                 deleted_count += 1
         
         if deleted_count > 0:
-            self.conn.commit()
             # Reconstruire l'index FAISS pour éliminer les vecteurs orphelins
             self._rebuild_faiss_index()
         
@@ -790,310 +636,60 @@ class LongTermMemory:
 
     def _rebuild_faiss_index(self):
         """Reconstruit l'index FAISS à partir des chunks restants."""
-        # Créer un nouvel index
-        self.index = faiss.IndexFlatIP(self.dim)
-        
         # Récupérer tous les chunks restants
-        cur = self.conn.cursor()
-        cur.execute("SELECT id, content FROM chunks ORDER BY id")
-        chunks = cur.fetchall()
+        chunks = self.db.get_all_chunks()
         
         # Vider la table de mapping
-        cur.execute("DELETE FROM faiss_map")
+        self.db.clear_faiss_mappings()
         
         # Réencoder et réindexer tous les chunks
         if chunks:
             contents = [chunk[1] for chunk in chunks]
-            embeddings = self.model.encode(contents, convert_to_numpy=True, normalize_embeddings=True)
-            embeddings = embeddings.astype("float32")
+            embeddings = self.embeddings.encode(contents, normalize=True)
             
-            # Ajouter à FAISS
-            self.index.add(embeddings)
+            # Reconstruire l'index
+            self.embeddings.rebuild_index(embeddings)
             
             # Mettre à jour la table de mapping
             for i, (chunk_id, _) in enumerate(chunks):
-                cur.execute("INSERT INTO faiss_map(faiss_id, chunk_id) VALUES(?,?)", (i, chunk_id))
+                self.db.insert_faiss_mapping(i, chunk_id)
         
-        self.conn.commit()
-        self._persist_faiss()
+        self.embeddings.persist()
 
+    # Méthodes de délégation vers DatabaseManager
     def get_methods_by_class(self, class_name: str) -> List[Dict]:
-        """
-        Retourne toutes les méthodes d'une classe spécifique.
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT c.id, c.document_id, c.start_line, c.end_line, c.content, 
-                   c.chunk_name, c.parent_class, d.source_path, d.language
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE c.parent_class = ? AND c.chunk_type = 'method'
-            ORDER BY c.start_line
-        """, (class_name,))
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "chunk_id": row[0],
-                "document_id": row[1],
-                "start_line": row[2],
-                "end_line": row[3],
-                "content": row[4],
-                "method_name": row[5],
-                "class_name": row[6],
-                "source_path": row[7],
-                "language": row[8]
-            })
-        return results
+        return self.db.get_methods_by_class(class_name)
 
     def get_class_code(self, class_name: str) -> List[Dict]:
-        """
-        Retourne le code complet d'une classe spécifique.
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                   c.chunk_name, d.source_path, d.language
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE c.chunk_name = ? AND c.chunk_type = 'class'
-            ORDER BY c.start_line
-        """, (class_name,))
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "chunk_id": row[0],
-                "document_id": row[1],
-                "start_line": row[2],
-                "end_line": row[3],
-                "content": row[4],
-                "class_name": row[5],
-                "source_path": row[6],
-                "language": row[7]
-            })
-        return results
+        return self.db.get_class_code(class_name)
 
     def get_method_code(self, method_name: str, class_name: Optional[str] = None) -> List[Dict]:
-        """
-        Retourne le code d'une méthode spécifique. 
-        Si class_name est fourni, recherche dans cette classe uniquement.
-        """
-        cur = self.conn.cursor()
-        if class_name:
-            cur.execute("""
-                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                       c.chunk_name, c.parent_class, d.source_path, d.language
-                FROM chunks c
-                JOIN documents d ON c.document_id = d.id
-                WHERE c.chunk_name = ? AND c.parent_class = ? AND c.chunk_type = 'method'
-                ORDER BY c.start_line
-            """, (method_name, class_name))
-        else:
-            cur.execute("""
-                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                       c.chunk_name, c.parent_class, d.source_path, d.language
-                FROM chunks c
-                JOIN documents d ON c.document_id = d.id
-                WHERE c.chunk_name = ? AND c.chunk_type IN ('method', 'function')
-                ORDER BY c.start_line
-            """, (method_name,))
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "chunk_id": row[0],
-                "document_id": row[1],
-                "start_line": row[2],
-                "end_line": row[3],
-                "content": row[4],
-                "method_name": row[5],
-                "class_name": row[6],
-                "source_path": row[7],
-                "language": row[8]
-            })
-        return results
+        return self.db.get_method_code(method_name, class_name)
 
     def get_function_code(self, function_name: str) -> List[Dict]:
-        """
-        Retourne le code d'une fonction spécifique (pas de classe parente).
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                   c.chunk_name, d.source_path, d.language
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE c.chunk_name = ? AND c.chunk_type = 'function' AND c.parent_class IS NULL
-            ORDER BY c.start_line
-        """, (function_name,))
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "chunk_id": row[0],
-                "document_id": row[1],
-                "start_line": row[2],
-                "end_line": row[3],
-                "content": row[4],
-                "function_name": row[5],
-                "source_path": row[6],
-                "language": row[7]
-            })
-        return results
+        return self.db.get_function_code(function_name)
 
     def get_document_imports(self, document_id: str) -> List[str]:
-        """
-        Retourne tous les imports d'un document spécifique.
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT import_statement
-            FROM document_imports
-            WHERE document_id = ?
-            ORDER BY id
-        """, (document_id,))
-        
-        return [row[0] for row in cur.fetchall()]
+        return self.db.get_document_imports(document_id)
 
     def get_imports_by_file(self, file_path: str) -> List[str]:
-        """
-        Retourne tous les imports d'un fichier par son chemin.
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT di.import_statement
-            FROM document_imports di
-            JOIN documents d ON di.document_id = d.id
-            WHERE d.source_path = ?
-            ORDER BY di.id
-        """, (file_path,))
-        
-        return [row[0] for row in cur.fetchall()]
+        return self.db.get_imports_by_file(file_path)
 
     def list_all_classes(self) -> List[Dict]:
-        """
-        Liste toutes les classes indexées avec leurs informations.
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT c.chunk_name, d.source_path, d.language, c.document_id
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE c.chunk_type = 'class' AND c.chunk_name IS NOT NULL
-            ORDER BY c.chunk_name
-        """)
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "class_name": row[0],
-                "source_path": row[1],
-                "language": row[2],
-                "document_id": row[3]
-            })
-        return results
+        return self.db.list_all_classes()
 
     def list_all_functions(self) -> List[Dict]:
-        """
-        Liste toutes les fonctions indexées (hors méthodes de classe).
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT DISTINCT c.chunk_name, d.source_path, d.language, c.document_id
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE c.chunk_type = 'function' AND c.parent_class IS NULL AND c.chunk_name IS NOT NULL
-            ORDER BY c.chunk_name
-        """)
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "function_name": row[0],
-                "source_path": row[1],
-                "language": row[2],
-                "document_id": row[3]
-            })
-        return results
+        return self.db.list_all_functions()
 
     def get_chunk_metadata(self, chunk_id: int) -> Optional[Dict]:
-        """
-        Retourne toutes les métadonnées d'un chunk spécifique.
-        """
-        cur = self.conn.cursor()
-        cur.execute("""
-            SELECT c.id, c.document_id, c.ord, c.start_line, c.end_line, 
-                   c.content, c.chunk_type, c.chunk_name, c.parent_class,
-                   d.source_path, d.language, d.media_type
-            FROM chunks c
-            JOIN documents d ON c.document_id = d.id
-            WHERE c.id = ?
-        """, (chunk_id,))
-        
-        row = cur.fetchone()
-        if not row:
-            return None
-        
-        return {
-            "chunk_id": row[0],
-            "document_id": row[1],
-            "order": row[2],
-            "start_line": row[3],
-            "end_line": row[4],
-            "content": row[5],
-            "chunk_type": row[6],
-            "chunk_name": row[7],
-            "parent_class": row[8],
-            "source_path": row[9],
-            "language": row[10],
-            "media_type": row[11]
-        }
+        return self.db.get_chunk_metadata(chunk_id)
 
     def search_by_type(self, chunk_type: str, name_pattern: Optional[str] = None) -> List[Dict]:
-        """
-        Recherche des chunks par type (class, method, function, etc.) 
-        avec option de filtre par pattern de nom.
-        """
-        cur = self.conn.cursor()
-        if name_pattern:
-            cur.execute("""
-                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                       c.chunk_name, c.parent_class, c.chunk_type, d.source_path, d.language
-                FROM chunks c
-                JOIN documents d ON c.document_id = d.id
-                WHERE c.chunk_type = ? AND c.chunk_name LIKE ?
-                ORDER BY c.chunk_name
-            """, (chunk_type, f"%{name_pattern}%"))
-        else:
-            cur.execute("""
-                SELECT c.id, c.document_id, c.start_line, c.end_line, c.content,
-                       c.chunk_name, c.parent_class, c.chunk_type, d.source_path, d.language
-                FROM chunks c
-                JOIN documents d ON c.document_id = d.id
-                WHERE c.chunk_type = ?
-                ORDER BY c.chunk_name
-            """, (chunk_type,))
-        
-        results = []
-        for row in cur.fetchall():
-            results.append({
-                "chunk_id": row[0],
-                "document_id": row[1],
-                "start_line": row[2],
-                "end_line": row[3],
-                "content": row[4],
-                "name": row[5],
-                "parent_class": row[6],
-                "chunk_type": row[7],
-                "source_path": row[8],
-                "language": row[9]
-            })
-        return results
+        return self.db.search_by_type(chunk_type, name_pattern)
 
     def close(self):
-        self._persist_faiss()
-        self.conn.close()
+        self.embeddings.persist()
+        self.db.close()
 
 # --------------------------
 # CLI simple
