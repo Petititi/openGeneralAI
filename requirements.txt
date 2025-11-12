@@ -2,3 +2,7 @@ Flask
 Flask-Cors
 litellm
 python-dotenv
+faiss-cpu
+sentence-transformers
+tree_sitter
+tree_sitter_languages

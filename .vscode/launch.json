@@ -17,8 +17,20 @@
       "type": "python",
       "request": "launch",
       "module": "pytest",
-      "args": ["--last-failed"],
+      "args": [
+        "--last-failed"
+      ],
       "console": "integratedTerminal"
-    }
+    },
+    {
+      "name": "Python: index code",
+      "type": "python",
+      "request": "launch",
+      "module": "agents.tools.longterm_memory",
+      "args": [
+        "index","C:/Research/LLM/openGeneralAI"
+      ],
+      "console": "integratedTerminal"
+    },
   ]
 }
