@@ -68,7 +68,7 @@ PLAN:
     def planning_message(self) -> dict:
         return {"role": "system", "content": self.core_prompt}
 
-    def create_plan_with_callback(self, messages: List[dict], turn: int = 0) -> Tuple[dict, bool]:
+    def create_plan(self, messages: List[dict], turn: int = 0) -> Tuple[dict, bool]:
         """Create a new plan using the provided LLM callback function."""
         messages_to_send = messages.copy()
         messages_to_send.append(self.planning_message())
@@ -83,8 +83,7 @@ PLAN:
         raw_response = self.ask_llm(messages_to_send)
         return self.get_plan(raw_response)
 
-    def update_plan_with_callback(self, messages: List[dict], plan: dict, improve_plan: bool = False, turn: int = 0) -> Tuple[dict, bool]:
-        """Update an existing plan using the provided LLM callback function."""
+    def update_plan(self, messages: List[dict], plan: dict, improve_plan: bool = False, turn: int = 0) -> Tuple[dict, bool]:
         try:
             messages_to_send = messages.copy()
             messages_to_send.append(self.reevaluate_plan_message(plan, improve_plan))
@@ -105,7 +104,7 @@ PLAN:
             if improve_plan:
                 return self.get_plan(raw_response)
             else:
-                return self.update_plan(plan, raw_response)
+                return self._update_plan(plan, raw_response)
         except ValueError:
             # Fallback to improved plan creation
             messages_to_send = messages.copy()
@@ -194,7 +193,7 @@ PLAN:
                     "{next_step_criteria}", cur_task.get('next_step_criteria', ''))
         return {"role": "system", "content": content_message}
 
-    def update_plan(self, plan: dict, raw_response: str) -> Tuple[dict, bool]:
+    def _update_plan(self, plan: dict, raw_response: str) -> Tuple[dict, bool]:
         node_id = self.logger.current_node().id
         try:
             parsed_json = json5.loads(raw_response)

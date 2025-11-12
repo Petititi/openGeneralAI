@@ -123,28 +123,23 @@ Readability:
             turn=turn,
             tags={"QUESTION": question}
         )
+        self.cur_trace.set_questions([{"role": "system", "content": self.core_prompt}, {"role": "user", "content": question}])
 
         while not is_done and turn < self.max_turn:
             turn += 1
             
-            # Prepare base messages
-            if len(self.cur_trace.nodes) > 1:
-                base_messages = self.clean_message_history(self.cur_trace.get_current_interaction(), max_size=8)
-            else:
-                base_messages = [
-                    {"role": "system", "content": self.core_prompt},
-                    {"role": "user", "content": question}
-                ]
+            # Prepare base messages, clean history to not have too much context
+            base_messages = self.clean_message_history(self.cur_trace.get_current_interaction(), max_size=8)
 
             # Handle planning phase
             if not plan:
-                plan, is_done = reasoning_agent.create_plan_with_callback(base_messages, turn)
+                plan, is_done = reasoning_agent.create_plan(base_messages, turn)
             else:
                 try:
-                    plan, is_done = reasoning_agent.update_plan_with_callback(base_messages, plan, turn=turn)
+                    plan, is_done = reasoning_agent.update_plan(base_messages, plan, turn=turn)
                 except ValueError:
                     # Recovery: try with improved plan
-                    plan, is_done = reasoning_agent.update_plan_with_callback(base_messages, plan, improve_plan=True, turn=turn)
+                    plan, is_done = reasoning_agent.update_plan(base_messages, plan, improve_plan=True, turn=turn)
 
             # Handle action phase
             if not is_done:
@@ -153,11 +148,7 @@ Readability:
                 action_messages = self.clean_message_history(base_messages + [step_msg], only_system=True, max_size=8)
                 
                 # Execute action
-                result_content, tool_name = action_agent.execute_action_with_callback(action_messages, turn)
-                
-                # Add result to trace for next iteration
-                self.cur_trace.get_current_interaction().append({"role": "user", "content": result_content})
-
+                action_agent.execute_action(action_messages, turn)
         try:
             in_cost, out_cost = cost_per_token(self.cfg.model, prompt_tokens=self.in_token, completion_tokens=self.out_token)
             interaction_cost = in_cost + out_cost

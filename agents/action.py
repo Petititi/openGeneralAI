@@ -38,7 +38,7 @@ TOOLS:
     def get_tool_message(self) -> dict:
         return {"role": "system", "content": self.core_prompt}
 
-    def execute_action_with_callback(self, messages: List[dict], turn: int = 0) -> Tuple[str, str]:
+    def execute_action(self, messages: List[dict], turn: int = 0):
         """Execute a tool action using the provided LLM callback function."""
         messages_to_send = messages.copy()
         tool_msg = self.get_tool_message()
@@ -52,14 +52,17 @@ TOOLS:
         )
         
         raw_response = self.ask_llm(messages_to_send)
-        
+        result_str = ""
         try:
-            result, tool_name = self.execute_tool(raw_response)
-            return json.dumps(result), tool_name
+            result, _ = self.execute_tool(raw_response)
+            result_str = json.dumps(result)
         except AgentError as e:
-            return str(e), e.tool_name
+            result_str = str(e)
         except Exception as e:
-            return str(e), "unknown"
+            result_str = str(e)
+                
+        # Add result to trace for next iteration
+        self.logger.get_current_interaction().append({"role": "user", "content": result_str})
     
     def safe_json_parsing(self, text: str) -> Tuple[str, dict]:
         try:
