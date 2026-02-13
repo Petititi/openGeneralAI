@@ -59,6 +59,17 @@ class AppConfig:
     def user_lang(self) -> str:
         """Configured user language (or default user language if missing)."""
         return self._cfg.get("user_lang", "English")
+    
+    @property
+    def db_path(self) -> str:
+        """Configured database path (or default path if missing)."""
+        return self._cfg.get("db_path", "storage/memory.sqlite")
+    
+    @property
+    def faiss_index_path(self) -> str:
+        """Configured FAISS index path (or default path if missing)."""
+        return self._cfg.get("faiss_index_path", "storage/faiss.index")
+    
     @property
     def provider(self) -> str:
         """Configured provider name (or default provider if missing)."""
@@ -92,7 +103,13 @@ class AppConfig:
         default_provider = "mistral" if "mistral" in providers else (providers[0] if providers else "mistral")
         model_list = provider_to_models.get(default_provider, [])
         default_model = model_list[0] if model_list else "mistral/devstral-small-2505"
-        return {"provider": default_provider, "model": default_model, "user_lang": "English"}
+        return {
+            "provider": default_provider,
+            "model": default_model,
+            "user_lang": "English",
+            "db_path": "storage/memory.sqlite",
+            "faiss_index_path": "storage/faiss.index"
+        }
 
     def reload_config(self) -> Dict[str, str]:
         """

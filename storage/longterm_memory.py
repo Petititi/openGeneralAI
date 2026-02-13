@@ -47,6 +47,13 @@ SUPPORTED_CODE_EXT = {
     ".hs": "haskell",
 }
 
+RESERVED_KEYWORD_CODE = [
+    "def", "class", "function", "var", "let", "const", "import", "from",
+    "public", "private", "protected", "interface", "struct", "enum", "package",
+    "return", "if", "else", "switch", "case", "for", "while", "do", "try",
+    "catch", "finally", "throw", "new", "this", "super", "extends", "implements",
+]
+
 TEXT_EXT = {".md", ".txt", ".rst", ".log", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".json"}
 
 def sha256_bytes(b: bytes) -> str:
@@ -79,6 +86,112 @@ def extract_name_from_node(node, source: bytes) -> Optional[str]:
             return source[child.start_byte:child.end_byte].decode("utf-8")
     return None
 
+def extract_class_attributes(root_node, source: bytes, language: str) -> List[Tuple[int, int, str, Dict]]:
+    """
+    Extrait les attributs de classe (variables de classe, propriétés, fields, etc.).
+    Retourne une liste de tuples (start_line, end_line, text, metadata).
+    """
+    attributes = []
+    
+    # Types de noeuds pour les attributs selon le langage
+    ATTRIBUTE_TYPES = {
+        "python": {"assignment", "expression_statement"},
+        "javascript": {"field_definition", "public_field_definition"},
+        "typescript": {"field_definition", "public_field_definition", "property_signature"},
+        "tsx": {"field_definition", "public_field_definition", "property_signature"},
+        "java": {"field_declaration"},
+        "c_sharp": {"field_declaration", "property_declaration"},
+        "cpp": {"field_declaration"},
+        "c": {"field_declaration"},
+        "go": {"field_declaration"},
+        "rust": {"field_declaration"},
+        "php": {"property_declaration"},
+        "ruby": {"assignment", "instance_variable"},
+        "kotlin": {"property_declaration"},
+        "swift": {"property_declaration"},
+    }
+    
+    CLASS_TYPES = {
+        "class_definition",
+        "class_declaration",
+        "interface_declaration",
+        "struct_specifier",
+    }
+    
+    attribute_types = ATTRIBUTE_TYPES.get(language, set())
+    if not attribute_types:
+        return []
+    
+    def is_class_level_attribute(node, parent_class_node):
+        """Vérifie si un noeud est un attribut au niveau de la classe (pas dans une méthode)."""
+        if parent_class_node is None:
+            return False
+        
+        # Remonter pour vérifier qu'on est directement dans le corps de la classe
+        current = node.parent
+        while current and current != parent_class_node:
+            # Si on traverse une fonction/méthode, ce n'est pas un attribut de classe
+            if current.type in {"function_definition", "method_definition", "function_declaration"}:
+                return False
+            current = current.parent
+        
+        return current == parent_class_node
+    
+    def walk_for_attributes(node, parent_class_node=None):
+        # Détecter si c'est une classe
+        if node.type in CLASS_TYPES:
+            parent_class_node = node
+            class_name = extract_name_from_node(node, source)
+        
+        # Vérifier si c'est un attribut de classe
+        if node.type in attribute_types and parent_class_node:
+            if is_class_level_attribute(node, parent_class_node):
+                # Extraire les informations
+                start = node.start_point[0] + 1
+                end = node.end_point[0] + 1
+                text = source[node.start_byte:node.end_byte].decode("utf-8").strip()
+                
+                if text:
+                    # Extraire le nom de l'attribut
+                    attr_name = None
+                    if language == "python":
+                        # Pour Python: chercher pattern "name = value"
+                        for child in node.children:
+                            if child.type == "assignment":
+                                left = child.child_by_field_name("left")
+                                if left and left.type == "identifier":
+                                    attr_name = source[left.start_byte:left.end_byte].decode("utf-8")
+                                    break
+                            elif child.type == "identifier":
+                                attr_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                                break
+                    else:
+                        # Pour les autres langages: chercher identifier ou declarator
+                        for child in node.children:
+                            if child.type in {"identifier", "variable_declarator", "property_identifier"}:
+                                if child.type == "variable_declarator":
+                                    name_node = child.child_by_field_name("name")
+                                    if name_node:
+                                        attr_name = source[name_node.start_byte:name_node.end_byte].decode("utf-8")
+                                else:
+                                    attr_name = source[child.start_byte:child.end_byte].decode("utf-8")
+                                break
+                    
+                    parent_class_name = extract_name_from_node(parent_class_node, source)
+                    metadata = {
+                        "type": "class_attribute",
+                        "name": attr_name,
+                        "parent_class": parent_class_name
+                    }
+                    attributes.append((start, end, text, metadata))
+        
+        # Continuer la traversée
+        for child in node.children:
+            walk_for_attributes(child, parent_class_node)
+    
+    walk_for_attributes(root_node)
+    return attributes
+
 def extract_imports(root_node, source: bytes, _language: str) -> List[str]:
     """Extrait tous les imports/includes d'un fichier."""
     imports = []
@@ -103,12 +216,12 @@ def extract_imports(root_node, source: bytes, _language: str) -> List[str]:
 
 def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, int, str, Dict]], List[str], Dict[str, List[int]]]:
     """
-    Retourne des chunks (start_line, end_line, text, metadata) pour fonctions/classes.
+    Retourne des chunks (start_line, end_line, text, metadata) pour fonctions/classes/attributs.
     metadata contient: {type, name, class_name, parent_class}
     Si rien de structuré trouvé, fallback: chunk par ~120 lignes.
     
     Retourne: (chunks, imports, class_methods_map)
-    class_methods_map: Dict[class_name, List[chunk_index]] pour lier classes et méthodes
+    class_methods_map: Dict[class_name, List[chunk_index]] pour lier classes et méthodes/attributs
     """
     try:
         parser = get_parser(language)
@@ -121,13 +234,16 @@ def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, i
         for i in range(0, len(lines), step):
             part = "\n".join(lines[i:i+step])
             if part.strip():
-                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "block"}))
+                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "text"}))
         return chunks, [], {}
     tree = parser.parse(source)
     root = tree.root_node
 
     # Extraire les imports une fois pour tout le fichier
     imports = extract_imports(root, source, language)
+    
+    # Extraire les attributs de classe
+    class_attributes = extract_class_attributes(root, source, language)
 
     # Noms de noeuds typiques par langage
     FUNCTION_TYPES = {
@@ -179,16 +295,12 @@ def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, i
         elif node.type in METHOD_TYPES:
             chunk_type = "method"
         elif node.type in FUNCTION_TYPES:
-            # Différencier méthode (dans une classe) de fonction (standalone)
             if parent_class:
                 chunk_type = "method"
             else:
                 chunk_type = "function"
         elif node.type in MODULE_TYPES:
             chunk_type = "module"
-        elif node.type == "comment":
-            if is_docstring(node):
-                print('found ' + source[node.start_byte:node.end_byte].decode("utf-8"))
         
         if chunk_type:
             start = node.start_point[0] + 1
@@ -220,6 +332,18 @@ def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, i
             walk(c, parent_class)
 
     walk(root)
+    
+    # Ajouter les attributs de classe extraits aux chunks
+    for start, end, text, metadata in class_attributes:
+        chunk_index = len(chunks)
+        chunks.append((start, end, text, metadata))
+        
+        # Ajouter l'attribut à la map de sa classe parente
+        parent_class = metadata.get("parent_class")
+        if parent_class:
+            if parent_class not in class_methods_map:
+                class_methods_map[parent_class] = []
+            class_methods_map[parent_class].append(chunk_index)
 
     if not chunks:
         # fallback: grands blocs
@@ -311,9 +435,15 @@ class LongTermMemory:
         self.storage_dir = Path(storage_dir)  # Conservé pour compatibilité
         self.hybrid_alpha = hybrid_alpha
 
+        need_consistency_check = not Path(db_path).exists()
         # Initialiser les managers
         self.db = DatabaseManager(db_path)
         self.embeddings = EmbeddingManager(faiss_index_path, model_name)
+
+        if need_consistency_check:
+            report = self.check_file_integrity()
+            if report["total_documents"] != report["existing_unchanged"]:
+                print(f"[INFO] LongTermMemory: Consistency check found issues: {report}", file=sys.stderr)
 
     # Propriétés de compatibilité pour accès legacy
     @property
@@ -334,17 +464,35 @@ class LongTermMemory:
 
     # ---------- API publique ----------
 
-    def add(self, path: str, rel_to: Optional[str] = None, extra: Optional[Dict] = None) -> str:
+    def add(self, path: str, rel_to: Optional[str] = None, extra: Optional[Dict] = None) -> Tuple[str, bool]:
         """
         Ajoute un document fichier : analyse le contenu, crée des chunks, indexe FTS + FAISS.
         Retourne document_id (sha256 du contenu).
+        
+        Si le document existe déjà avec le même hash, skip le traitement.
+        Si le document existe mais avec un hash différent, met à jour.
         """
+        should_update_FAISS = False
         p = Path(path)
         data = p.read_bytes()
         doc_id = sha256_bytes(data)
 
-        # Plus de copie dans storage_dir, on garde seulement le chemin d'accès original
-
+        # Vérifier si le document existe déjà avec le même contenu
+        existing_doc = self.db.get_document_info(doc_id)
+        if existing_doc:
+            # Document déjà indexé
+            return doc_id, should_update_FAISS
+        
+        # Vérifier si un document avec ce chemin existe déjà (mais hash différent)
+        # Dans ce cas, on doit le supprimer avant de réindexer
+        cursor = self.db.conn.cursor()
+        cursor.execute("SELECT id, sha256 FROM documents WHERE source_path = ?", (str(p.resolve()),))
+        old_doc = cursor.fetchone()
+        if old_doc and old_doc[1] != doc_id:
+            # Le fichier a été modifié - supprimer l'ancienne version
+            self.db.delete_document(old_doc[0])
+            should_update_FAISS = True
+        
         # Déterminer type/langue
         ext = p.suffix.lower()
         class_methods_map = {}
@@ -394,7 +542,7 @@ class LongTermMemory:
                 emb = self.embeddings.encode([content], normalize=True)
                 chunk_embeddings[i] = emb[0]
         
-        # Deuxième passe: calculer les embeddings des classes comme somme pondérée des méthodes
+        # Deuxième passe: calculer les embeddings des classes comme somme pondérée des méthodes et attributs
         for i, (start, end, content, metadata) in enumerate(chunks):
             chunk_type = metadata.get("type")
             chunk_name = metadata.get("name")
@@ -408,11 +556,11 @@ class LongTermMemory:
                 method_embeddings.append(class_emb[0])
                 method_weights.append(500) # arbitrary weight for class description
                 
-                # Collecter les embeddings des méthodes de cette classe avec leurs tailles
+                # Collecter les embeddings des méthodes et attributs de cette classe avec leurs tailles
                 for method_idx in method_indices:
                     if method_idx < len(chunk_embeddings) and chunk_embeddings[method_idx] is not None:
                         method_embeddings.append(chunk_embeddings[method_idx])
-                        # Poids basé sur la taille en bytes du contenu de la méthode
+                        # Poids basé sur la taille en bytes du contenu de la méthode/attribut
                         method_content = chunks[method_idx][2]
                         method_weights.append(len(method_content.encode('utf-8')))
                 
@@ -453,7 +601,7 @@ class LongTermMemory:
                 self.db.insert_faiss_mapping(faiss_ids[0], chunk_id)
 
         self.embeddings.persist()
-        return doc_id
+        return doc_id,should_update_FAISS
 
     def add_folder(self, folder: str):
         """
@@ -469,16 +617,21 @@ class LongTermMemory:
                 files.append(path)
 
         # Encodage batch possible, mais on garde simple & robuste (un par un)
+        should_update_FAISS = False
         for f in files:
             try:
-                self.add(str(f), rel_to=str(root))
+                _, updated = self.add(str(f), rel_to=str(root))
+                if updated:
+                    should_update_FAISS = True
             except Exception as e:  # type: ignore
                 print(f"[WARN] Skip {f}: {e}", file=sys.stderr)
+        if should_update_FAISS:
+            self._rebuild_faiss_index()
 
     def search(self, query: str, top_k: int = 8, mode: str = "hybrid") -> List[Dict]:
         """
         mode in {"keyword", "semantic", "hybrid"}
-        Retour: liste de dicts {chunk_id, document_id, score, start_line, end_line, content, source_path, language}
+        Retour: liste de dicts {chunk_id, document_id, score, start_line, end_line, chunk_type, chunk_name, content, source_path, language}
         """
         mode = mode.lower()
         if mode not in {"keyword", "semantic", "hybrid"}:
@@ -513,13 +666,15 @@ class LongTermMemory:
 
         def assemble(rows):
             out = []
-            for cid, did, s, e, content, score in rows:
+            for cid, did, s, e, chunk_type, name, content, score in rows:
                 d = self.db.get_document_info(did)
                 out.append({
                     "chunk_id": int(cid),
                     "document_id": did,
                     "start_line": int(s),
                     "end_line": int(e),
+                    "chunk_type": chunk_type,
+                    "chunk_name": name,
                     "content": content,
                     "score": float(score),
                     "source_path": d[0] if d else None,
@@ -635,24 +790,80 @@ class LongTermMemory:
         return deleted_count
 
     def _rebuild_faiss_index(self):
-        """Reconstruit l'index FAISS à partir des chunks restants."""
-        # Récupérer tous les chunks restants
-        chunks = self.db.get_all_chunks()
+        """
+        Reconstruit l'index FAISS et ne ré-encode que les chunks qui 
+        n'ont pas d'embedding dans FAISS.
+        Préserve les embeddings existants pour les chunks inchangés.
+        """
+        # Récupérer tous les chunks et leurs mappings FAISS actuels
+        all_chunk_data = self.db.get_all_chunks()
         
-        # Vider la table de mapping
-        self.db.clear_faiss_mappings()
+        if not all_chunk_data:
+            # nothing to do, empty database
+            return
         
-        # Réencoder et réindexer tous les chunks
-        if chunks:
-            contents = [chunk[1] for chunk in chunks]
-            embeddings = self.embeddings.encode(contents, normalize=True)
+        chunks_with_embeddings = []  # (chunk_id, content, old_faiss_id)
+        chunks_without_embeddings = []  # (chunk_id, content)
+        for chunk_id, content, faiss_id in all_chunk_data:
+            if faiss_id is not None:
+                chunks_with_embeddings.append((chunk_id, content, faiss_id))
+            else:
+                chunks_without_embeddings.append((chunk_id, content))
+        
+        # Récupérer les embeddings existants depuis FAISS
+        old_embeddings = {}
+        if chunks_with_embeddings and self.embeddings.ntotal > 0:
+            # Extraire les embeddings de l'ancien index
+            old_faiss_ids = [faiss_id for _, _, faiss_id in chunks_with_embeddings]
+            max_faiss_id = max(old_faiss_ids)
             
-            # Reconstruire l'index
-            self.embeddings.rebuild_index(embeddings)
+            if max_faiss_id < self.embeddings.ntotal:
+                # Récupérer les vecteurs de l'index actuel
+                dim = self.embeddings.dim if self.embeddings.dim else 1024
+                for chunk_id, content, old_faiss_id in chunks_with_embeddings:
+                    try:
+                        # Extraire le vecteur depuis FAISS
+                        vector = np.zeros(dim, dtype="float32")
+                        self.embeddings.index.reconstruct(int(old_faiss_id), vector)
+                        old_embeddings[chunk_id] = vector
+                    except Exception:
+                        # Si on ne peut pas récupérer le vecteur, on devra le ré-encoder
+                        chunks_without_embeddings.append((chunk_id, content))
+        
+        # Encoder uniquement les nouveaux chunks
+        new_embeddings = {}
+        if chunks_without_embeddings:
+            contents_to_encode = [content for _, content in chunks_without_embeddings]
+            encoded = self.embeddings.encode(contents_to_encode, normalize=True)
+            for i, (chunk_id, _) in enumerate(chunks_without_embeddings):
+                new_embeddings[chunk_id] = encoded[i]
+        
+        # Construire le nouvel index avec tous les embeddings
+        all_embeddings = []
+        chunk_id_order = []
+        
+        for chunk_id, content, _ in all_chunk_data:
+            if chunk_id in old_embeddings:
+                all_embeddings.append(old_embeddings[chunk_id])
+                chunk_id_order.append(chunk_id)
+            elif chunk_id in new_embeddings:
+                all_embeddings.append(new_embeddings[chunk_id])
+                chunk_id_order.append(chunk_id)
+        
+        # Reconstruire l'index FAISS
+        if all_embeddings:
+            embeddings_array = np.array(all_embeddings, dtype="float32")
+            self.embeddings.rebuild_index(embeddings_array)
             
             # Mettre à jour la table de mapping
-            for i, (chunk_id, _) in enumerate(chunks):
-                self.db.insert_faiss_mapping(i, chunk_id)
+            self.db.clear_faiss_mappings()
+            for new_faiss_id, chunk_id in enumerate(chunk_id_order):
+                self.db.insert_faiss_mapping(new_faiss_id, chunk_id)
+        else:
+            # Pas d'embeddings, créer un index vide
+            dim = self.embeddings.dim if self.embeddings.dim else 1024
+            self.embeddings.rebuild_index(np.array([], dtype="float32").reshape(0, dim))
+            self.db.clear_faiss_mappings()
         
         self.embeddings.persist()
 
@@ -662,6 +873,403 @@ class LongTermMemory:
 
     def get_class_code(self, class_name: str) -> List[Dict]:
         return self.db.get_class_code(class_name)
+    
+    def search_symbols(self, pattern: str, symbol_type: Optional[str] = None, 
+                      language: Optional[str] = None, case_sensitive: bool = False) -> List[Dict]:
+        """
+        Recherche flexible de symboles (classes, fonctions, méthodes) avec pattern matching.
+        
+        Args:
+            pattern: Pattern de recherche (supporte SQL LIKE avec % et _)
+            symbol_type: Type de symbole ('class', 'function', 'method', None pour tous)
+            language: Filtrer par langage (None pour tous)
+            case_sensitive: Recherche sensible à la casse
+        
+        Returns:
+            Liste de symboles trouvés avec métadonnées
+        """
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            
+            # Construire la requête dynamiquement
+            conditions = []
+            params = []
+            
+            if not case_sensitive:
+                pattern = pattern.lower()
+                name_expr = "LOWER(c.chunk_name)"
+            else:
+                name_expr = "c.chunk_name"
+            
+            conditions.append(f"{name_expr} LIKE ?")
+            params.append(f"%{pattern}%")
+            
+            if symbol_type:
+                conditions.append("c.chunk_type = ?")
+                params.append(symbol_type)
+            else:
+                conditions.append("c.chunk_type IN ('class', 'function', 'method')")
+            
+            if language:
+                conditions.append("d.language = ?")
+                params.append(language)
+            
+            conditions.append("c.chunk_name IS NOT NULL")
+            
+            query = f"""
+                SELECT c.chunk_name, c.chunk_type, c.parent_class, c.start_line, c.end_line,
+                       d.source_path, d.language, c.id, c.document_id
+                FROM chunks c
+                JOIN documents d ON c.document_id = d.id
+                WHERE {' AND '.join(conditions)}
+                ORDER BY c.chunk_name, c.start_line
+            """
+            
+            cur.execute(query, params)
+            
+            results = []
+            for row in cur.fetchall():
+                results.append({
+                    "name": row[0],
+                    "type": row[1],
+                    "parent_class": row[2],
+                    "start_line": row[3],
+                    "end_line": row[4],
+                    "source_path": row[5],
+                    "language": row[6],
+                    "chunk_id": row[7],
+                    "document_id": row[8]
+                })
+            return results
+
+    def get_class_with_members(self, class_name: str, include_code: bool = True) -> Optional[Dict]:
+        """
+        Récupère une classe avec TOUS ses membres (méthodes, attributs, etc.).
+        
+        Args:
+            class_name: Nom de la classe
+            include_code: Inclure le code complet ou seulement les signatures
+        
+        Returns:
+            Dict structuré avec class_definition, methods, attributes, etc.
+        """
+        class_defs = self.db.get_class_code(class_name)
+        if not class_defs:
+            return None
+        
+        class_def = class_defs[0]
+        
+        # Récupérer toutes les méthodes
+        methods = self.db.get_methods_by_class(class_name)
+        
+        # Récupérer les attributs
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            cur.execute("""
+                SELECT c.chunk_name, c.content, c.start_line, c.end_line, c.chunk_type
+                FROM chunks c
+                WHERE c.parent_class = ? AND c.chunk_type LIKE '%attribute%'
+                ORDER BY c.start_line
+            """, (class_name,))
+            attribute_rows = cur.fetchall()
+        
+        # Formater les résultats
+        result = {
+            "class_name": class_name,
+            "source_path": class_def["source_path"],
+            "language": class_def["language"],
+            "start_line": class_def["start_line"],
+            "end_line": class_def["end_line"],
+            "document_id": class_def["document_id"],
+        }
+        
+        if include_code:
+            result["class_definition"] = class_def["content"]
+            result["methods"] = [
+                {
+                    "name": m["method_name"],
+                    "code": m["content"],
+                    "start_line": m["start_line"],
+                    "end_line": m["end_line"]
+                } for m in methods
+            ]
+            result["attributes"] = [
+                {
+                    "name": attr[0],
+                    "code": attr[1],
+                    "start_line": attr[2],
+                    "end_line": attr[3],
+                    "type": attr[4]
+                } for attr in attribute_rows
+            ]
+        else:
+            # Seulement les signatures
+            result["class_signature"] = class_def["content"].split('\n')[0]
+            result["methods"] = [
+                {
+                    "name": m["method_name"],
+                    "signature": m["content"].split('\n')[0],
+                    "start_line": m["start_line"]
+                } for m in methods
+            ]
+            result["attributes"] = [
+                {
+                    "name": attr[0],
+                    "signature": attr[1].split('\n')[0],
+                    "start_line": attr[2]
+                } for attr in attribute_rows
+            ]
+        
+        return result
+
+    def get_dependencies_for_file(self, file_path: str) -> Dict:
+        """
+        Récupère les dépendances complètes d'un fichier : imports + symboles définis.
+        
+        Args:
+            file_path: Chemin vers le fichier
+        
+        Returns:
+            Dict avec imports, classes_defined, functions_defined
+        """
+        # Normaliser le chemin
+        file_path = str(Path(file_path).resolve())
+        
+        # Récupérer le document_id
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            cur.execute("SELECT id FROM documents WHERE source_path = ?", (file_path,))
+            doc_row = cur.fetchone()
+            if not doc_row:
+                return {"error": f"File not found: {file_path}"}
+            
+            doc_id = doc_row[0]
+        
+        # Imports
+        imports = self.db.get_document_imports(doc_id)
+        
+        # Symboles définis
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            
+            # Classes
+            cur.execute("""
+                SELECT chunk_name, start_line FROM chunks
+                WHERE document_id = ? AND chunk_type = 'class' AND chunk_name IS NOT NULL
+                ORDER BY start_line
+            """, (doc_id,))
+            classes = [{"name": r[0], "line": r[1]} for r in cur.fetchall()]
+            
+            # Fonctions (top-level seulement)
+            cur.execute("""
+                SELECT chunk_name, start_line FROM chunks
+                WHERE document_id = ? AND chunk_type = 'function' 
+                AND parent_class IS NULL AND chunk_name IS NOT NULL
+                ORDER BY start_line
+            """, (doc_id,))
+            functions = [{"name": r[0], "line": r[1]} for r in cur.fetchall()]
+        
+        return {
+            "file_path": file_path,
+            "document_id": doc_id,
+            "imports": imports,
+            "classes_defined": classes,
+            "functions_defined": functions
+        }
+
+    def find_symbol_usage(self, symbol_name: str, symbol_type: Optional[str] = None) -> Dict:
+        """
+        Trouve tous les endroits où un symbole est potentiellement utilisé.
+        Utilise la recherche full-text pour trouver les mentions du symbole.
+        
+        Args:
+            symbol_name: Nom du symbole à chercher
+            symbol_type: Type optionnel pour filtrer la définition
+        
+        Returns:
+            Dict avec definitions et usages
+        """
+        # D'abord, trouver la définition
+        definitions = self.search_symbols(symbol_name, symbol_type=symbol_type, case_sensitive=True)
+        
+        # Ensuite, chercher les usages via FTS
+        usage_results = self.db.keyword_search(symbol_name, top_k=100)
+        
+        usages = []
+        for chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content, score in usage_results:
+            # Exclure les définitions elles-mêmes
+            is_definition = any(
+                d["chunk_id"] == chunk_id for d in definitions
+            )
+            
+            if not is_definition:
+                doc_info = self.db.get_document_info(doc_id)
+                usages.append({
+                    "chunk_id": chunk_id,
+                    "document_id": doc_id,
+                    "source_path": doc_info[0] if doc_info else None,
+                    "language": doc_info[1] if doc_info else None,
+                    "start_line": start_line,
+                    "end_line": end_line,
+                    "chunk_type": chunk_type,
+                    "chunk_name": chunk_name,
+                    "score": score,
+                    "preview": content[:200] + "..." if len(content) > 200 else content
+                })
+        
+        return {
+            "symbol": symbol_name,
+            "definitions": definitions,
+            "usages": usages
+        }
+
+    def get_related_symbols(self, class_name: str) -> Dict:
+        """
+        Récupère tous les symboles liés à une classe : classes parentes, classes filles,
+        symboles importés dans le même fichier, etc.
+        
+        Args:
+            class_name: Nom de la classe
+        
+        Returns:
+            Dict avec related_classes, same_file_symbols, imports
+        """
+        class_defs = self.db.get_class_code(class_name)
+        if not class_defs:
+            return {"error": f"Class {class_name} not found"}
+        
+        class_def = class_defs[0]
+        doc_id = class_def["document_id"]
+        source_path = class_def["source_path"]
+        
+        # Imports du fichier
+        imports = self.db.get_document_imports(doc_id)
+        
+        # Autres symboles dans le même fichier
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT chunk_name, chunk_type, parent_class
+                FROM chunks
+                WHERE document_id = ? AND chunk_name IS NOT NULL AND chunk_name != ?
+                AND chunk_type IN ('class', 'function')
+                ORDER BY chunk_type, chunk_name
+            """, (doc_id, class_name))
+            
+            same_file = [{"name": r[0], "type": r[1], "parent": r[2]} for r in cur.fetchall()]
+        
+        # Chercher les références à cette classe dans d'autres fichiers
+        references = self.find_symbol_usage(class_name, symbol_type="class")
+        
+        return {
+            "class_name": class_name,
+            "source_path": source_path,
+            "imports": imports,
+            "same_file_symbols": same_file,
+            "references": references
+        }
+
+    def format_code_summary(self, name: str, code_type: str, parent_class: Optional[str] = None) -> str:
+        """
+        Formate un résumé de code pour le LLM.
+        
+        Args:
+            name: Nom de la classe/fonction/méthode
+            code_type: Type ('class', 'function', 'method')
+            parent_class: Nom de la classe parente (pour les méthodes)
+        
+        Returns:
+            Résumé formaté avec signature et structure
+        """
+        if code_type == 'class':
+            class_info = self.get_class_with_members(name, include_code=False)
+            if not class_info:
+                return f"Class `{name}` not found"
+            
+            language = class_info['language']
+            source_path = class_info['source_path']
+            
+            # Construire le résumé
+            summary = f"**{language} Class: `{name}`** (from `{source_path}`)"
+            summary += f"\n\n```{language}\n{class_info['class_signature']}\n```\n"
+            
+            # Lister les attributs
+            if class_info['attributes']:
+                summary += "\n**Attributes:**\n"
+                for attr in class_info['attributes'][:5]:
+                    summary += f"  - `{attr['name']}`: {attr['signature']}\n"
+                if len(class_info['attributes']) > 5:
+                    summary += f"  - ... and {len(class_info['attributes']) - 5} more\n"
+            
+            # Lister les méthodes
+            if class_info['methods']:
+                summary += "\n**Methods:**\n"
+                for method in class_info['methods'][:10]:
+                    summary += f"  - `{method['name']}`: {method['signature']}\n"
+                if len(class_info['methods']) > 10:
+                    summary += f"  - ... and {len(class_info['methods']) - 10} more methods\n"
+            
+            return summary
+        
+        elif code_type in ['function', 'method']:
+            # Récupérer le code de la fonction/méthode
+            if code_type == 'method' and parent_class:
+                code_defs = self.get_method_code(name, parent_class)
+            else:
+                code_defs = self.get_function_code(name)
+            
+            if not code_defs:
+                return f"{code_type.capitalize()} `{name}` not found"
+            
+            code_def = code_defs[0]
+            language = code_def.get('language', 'unknown')
+            source_path = code_def.get('source_path', 'unknown')
+            content = code_def['content']
+            
+            # Extraire la signature (première ligne + docstring si présent)
+            lines = content.split('\n')
+            signature = lines[0].strip()
+            
+            # Chercher une docstring
+            docstring = ""
+            if len(lines) > 1:
+                # Python docstring
+                if language == 'python' and lines[1].strip().startswith(('"""', "'''")):
+                    doc_lines = []
+                    in_doc = False
+                    for line in lines[1:]:
+                        if '"""' in line or "'''" in line:
+                            if not in_doc:
+                                in_doc = True
+                                doc_lines.append(line.strip())
+                            else:
+                                doc_lines.append(line.strip())
+                                break
+                        elif in_doc:
+                            doc_lines.append(line.strip())
+                    if doc_lines:
+                        docstring = " ".join(doc_lines)[:200]  # Max 200 chars
+                # JSDoc, JavaDoc, etc.
+                elif lines[1].strip().startswith(('/*', '//', '#')):
+                    doc_lines = [lines[1].strip()]
+                    for line in lines[2:5]:  # Max 3 lignes
+                        if line.strip().startswith(('*', '//', '#')):
+                            doc_lines.append(line.strip())
+                        else:
+                            break
+                    docstring = " ".join(doc_lines)[:200]
+            
+            prefix = f"Method of class `{parent_class}`" if parent_class else "Function"
+            summary = f"**{language} {prefix}: `{name}`** (from `{source_path}`)"
+            summary += f"\n\n```{language}\n{signature}\n```"
+            
+            if docstring:
+                summary += f"\n\n{docstring}"
+            
+            return summary
+        
+        else:
+            return f"Unknown code type: {code_type}"
 
     def get_method_code(self, method_name: str, class_name: Optional[str] = None) -> List[Dict]:
         return self.db.get_method_code(method_name, class_name)
@@ -731,6 +1339,18 @@ def _cmd_cleanup():
     ltm = LongTermMemory()
     deleted = ltm.cleanup_missing_files()
     print(f"Supprimé {deleted} documents avec fichiers manquants")
+    print(json.dumps(ltm.stats(), indent=2))
+    ltm.close()
+
+def _cmd_sync(verbose: bool = False):
+    ltm = LongTermMemory()
+    stats = ltm.sync_with_filesystem(verbose=verbose)
+    print(f"\nSynchronization completed:")
+    print(f"  Removed: {stats['removed']}")
+    print(f"  Updated: {stats['updated']}")
+    print(f"  Unchanged: {stats['unchanged']}")
+    print(f"  Failed: {stats['failed']}")
+    print(f"\nDatabase stats:")
     print(json.dumps(ltm.stats(), indent=2))
     ltm.close()
 
@@ -806,6 +1426,49 @@ def _cmd_get_imports(file_path: str):
             print(f"  {imp}")
     ltm.close()
 
+def _cmd_search_symbols(pattern: str, symbol_type: Optional[str] = None, language: Optional[str] = None):
+    ltm = LongTermMemory()
+    results = ltm.search_symbols(pattern, symbol_type=symbol_type, language=language)
+    print(f"Found {len(results)} symbols matching '{pattern}':")
+    for r in results:
+        parent = f" (in {r['parent_class']})" if r['parent_class'] else ""
+        print(f"  - {r['type']:10} {r['name']:30}{parent:30} @ {r['source_path']}:{r['start_line']}")
+    ltm.close()
+
+def _cmd_get_class_full(class_name: str, with_code: bool = False):
+    ltm = LongTermMemory()
+    result = ltm.get_class_with_members(class_name, include_code=with_code)
+    if not result:
+        print(f"Class {class_name} not found")
+    else:
+        print(json.dumps(result, indent=2))
+    ltm.close()
+
+def _cmd_get_dependencies(file_path: str):
+    ltm = LongTermMemory()
+    deps = ltm.get_dependencies_for_file(file_path)
+    print(json.dumps(deps, indent=2))
+    ltm.close()
+
+def _cmd_find_usage(symbol_name: str, symbol_type: Optional[str] = None):
+    ltm = LongTermMemory()
+    results = ltm.find_symbol_usage(symbol_name, symbol_type=symbol_type)
+    print(f"\nSymbol: {results['symbol']}")
+    print(f"\nDefinitions ({len(results['definitions'])})")
+    for d in results['definitions']:
+        print(f"  - {d['type']} in {d['source_path']}:{d['start_line']}")
+    print(f"\nUsages ({len(results['usages'])})")
+    for u in results['usages'][:20]:  # Limit to 20
+        print(f"  - {u['source_path']}:{u['start_line']} (score: {u['score']:.2f})")
+        print(f"    {u['preview'][:100]}")
+    ltm.close()
+
+def _cmd_get_related(class_name: str):
+    ltm = LongTermMemory()
+    related = ltm.get_related_symbols(class_name)
+    print(json.dumps(related, indent=2))
+    ltm.close()
+
 if __name__ == "__main__":
     import argparse
     ap = argparse.ArgumentParser()
@@ -821,6 +1484,9 @@ if __name__ == "__main__":
     ap_int = sub.add_parser("integrity", help="Vérifier l'intégrité des fichiers indexés")
     
     ap_clean = sub.add_parser("cleanup", help="Supprimer les références vers les fichiers manquants")
+    
+    ap_sync = sub.add_parser("sync", help="Synchroniser la base avec le système de fichiers (met à jour fichiers modifiés)")
+    ap_sync.add_argument("--verbose", "-v", action="store_true", help="Afficher les détails")
 
     ap_list_cls = sub.add_parser("list-classes", help="Lister toutes les classes indexées")
     
@@ -837,6 +1503,25 @@ if __name__ == "__main__":
     
     ap_get_imp = sub.add_parser("get-imports", help="Obtenir les imports d'un fichier")
     ap_get_imp.add_argument("file_path", type=str)
+    
+    ap_search_sym = sub.add_parser("search-symbols", help="Rechercher des symboles avec pattern")
+    ap_search_sym.add_argument("pattern", type=str)
+    ap_search_sym.add_argument("--type", type=str, choices=["class", "function", "method"], help="Type de symbole")
+    ap_search_sym.add_argument("--language", type=str, help="Filtrer par langage")
+    
+    ap_class_full = sub.add_parser("get-class-full", help="Obtenir une classe avec tous ses membres")
+    ap_class_full.add_argument("class_name", type=str)
+    ap_class_full.add_argument("--with-code", action="store_true", help="Inclure le code complet")
+    
+    ap_deps = sub.add_parser("get-dependencies", help="Obtenir les dépendances d'un fichier")
+    ap_deps.add_argument("file_path", type=str)
+    
+    ap_usage = sub.add_parser("find-usage", help="Trouver où un symbole est utilisé")
+    ap_usage.add_argument("symbol_name", type=str)
+    ap_usage.add_argument("--type", type=str, choices=["class", "function", "method"], help="Type de symbole")
+    
+    ap_related = sub.add_parser("get-related", help="Obtenir les symboles liés à une classe")
+    ap_related.add_argument("class_name", type=str)
 
     args = ap.parse_args()
     if args.cmd == "index":
@@ -847,6 +1532,8 @@ if __name__ == "__main__":
         _cmd_integrity()
     elif args.cmd == "cleanup":
         _cmd_cleanup()
+    elif args.cmd == "sync":
+        _cmd_sync(verbose=args.verbose)
     elif args.cmd == "list-classes":
         _cmd_list_classes()
     elif args.cmd == "list-functions":
@@ -859,5 +1546,15 @@ if __name__ == "__main__":
         _cmd_get_function(args.function_name)
     elif args.cmd == "get-imports":
         _cmd_get_imports(args.file_path)
+    elif args.cmd == "search-symbols":
+        _cmd_search_symbols(args.pattern, symbol_type=args.type, language=args.language)
+    elif args.cmd == "get-class-full":
+        _cmd_get_class_full(args.class_name, with_code=args.with_code)
+    elif args.cmd == "get-dependencies":
+        _cmd_get_dependencies(args.file_path)
+    elif args.cmd == "find-usage":
+        _cmd_find_usage(args.symbol_name, symbol_type=args.type)
+    elif args.cmd == "get-related":
+        _cmd_get_related(args.class_name)
     else:
         ap.print_help()

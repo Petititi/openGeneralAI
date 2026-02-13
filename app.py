@@ -9,13 +9,16 @@ import llm_interactions
 import configurator
 from agents.orchestrator import Orchestrator
 import agents.tools.ToolRegistry as tools_module
+import agents.tools.memory_tool as memory_tools_module
+from storage.longterm_memory import LongTermMemory
 
 # --- LiteLLM debug output
 litellm._turn_on_debug()
 
 # --- Various global config:
-CONFIG_PATH = Path(__file__).parent / "config.json"
-ENV_PATH = Path(__file__).parent / ".env"
+ROOT_FOLDER = Path(__file__).parent
+CONFIG_PATH = ROOT_FOLDER / "config.json"
+ENV_PATH = ROOT_FOLDER / ".env"
 
 # --- server config/init:
 app = Flask(__name__, static_folder="static", template_folder="templates")
@@ -25,8 +28,14 @@ CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 # --- Configuration creation
 cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
 
+ltm = LongTermMemory(
+    db_path=cfg.db_path,
+    faiss_index_path=cfg.faiss_index_path
+)
+ltm.add_folder(str(ROOT_FOLDER))
 tools_registry = tools_module.ToolRegistry()
 orchestrator = Orchestrator(cfg, tools_registry)
+tools_registry.register(memory_tools_module.SearchContext(ltm, ask_llm=orchestrator.safe_ask))
 
 
 @app.after_request

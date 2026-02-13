@@ -6,6 +6,7 @@ import configurator
 import graphviz
 import utils
 from agents.tools.ToolRegistry import ToolRegistry
+import re
 
 def test_file_editing():
 
@@ -57,8 +58,6 @@ def test_file_editing():
         assert step["status"] == "done"
     # the file should also be modified correctly:
     assert validation_lambda("python loader.py")[0] == True
-
-import re
 
 def parse_sed_expr(expr: str):
     r"""Parse l'expression à l'intérieur des quotes."""
@@ -250,3 +249,104 @@ def test_file_editing_only_bash():
         assert step["status"] == "done"
     # the file should also be modified correctly:
     assert validation_lambda("python loader.py")[0] == True
+
+
+def test_search_context_add_method():
+    """
+    Test fonctionnel qui utilise SearchContext avec le LLM pour ajouter
+    une méthode get_summary() à la classe SearchContext.
+    """
+    from pathlib import Path
+    from storage.longterm_memory import LongTermMemory
+    from agents.tools.memory_tool import SearchContext
+
+    # 1) Setup LongTermMemory (persistent pour avoir tout le repo indexé)
+    db_path = "test/datas/test_memory.sqlite"
+    faiss_index_path = "test/datas/test_faiss.index"
+    
+    CREATE_DB = not Path(db_path).exists()
+    
+    ltm = LongTermMemory(
+        db_path=str(db_path),
+        faiss_index_path=str(faiss_index_path)
+    )
+    
+    if CREATE_DB:
+        ltm.add_folder(str(Path(__file__).parent.parent))
+
+    # 2) Setup InMemoryFS avec le fichier memory_tool.py
+    memory_tool_path = Path(__file__).parent.parent / "agents" / "tools" / "memory_tool.py"
+    original_content = memory_tool_path.read_text(encoding='utf-8')
+    
+    fs = utils.InMemoryFS({"memory_tool.py": original_content})
+
+    # 3) Validation lambda pour vérifier que la méthode a été ajoutée
+    def validation_lambda(cmd):
+        program, params = cmd.split(" ")[0], cmd.split(" ")[1:]
+        
+        if "cat" in program:
+            try:
+                content = fs.read(params[0])
+                return True, content
+            except FileNotFoundError as e:
+                return False, f"{params[0]}: {str(e)}"
+        
+        if "python" in program and "-c" in params:
+            # Vérifier que le code Python peut s'exécuter
+            return True, "Method get_summary added successfully"
+        
+        if "grep" in program:
+            # Simuler grep pour vérifier la présence de get_summary
+            try:
+                content = fs.read("memory_tool.py")
+                if "get_summary" in content:
+                    lines = [l for l in content.split('\n') if 'get_summary' in l]
+                    return True, '\n'.join(lines)
+                return False, ""
+            except FileNotFoundError:
+                return False, "File not found"
+        
+        return False, "Invalid command"
+
+    # 4) Tools registry avec SearchContext et outils de manipulation de fichiers
+    tools_registry = ToolRegistry()
+
+    # 5) Configuration et orchestrator
+    CONFIG_PATH = os.getcwd() + "/config.json"
+    ENV_PATH = os.getcwd() + "/.env"
+    cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+
+    orchestrator = Orchestrator(cfg, tools_registry)
+
+    tools_registry.register(SearchContext(ltm, ask_llm=orchestrator.safe_ask))
+    tools_registry.register(utils.ReadFile(fs))
+    tools_registry.register(utils.EditFile(fs))
+    tools_registry.register(utils.RunProg(fs, validation_lambda))
+    
+    # 6) Demander au LLM d'ajouter une méthode get_summary
+    result, cost = orchestrator.process_user_message(
+        "Add a method 'get_summary' to the LongTermMemory class "
+        "that returns a summary of the memory statistics (documents, chunks, classes, functions)."
+    )
+
+    # 7) Sauvegarder la trace pour debug
+    with open("templates/dbg_search_context.html", "w", encoding="utf-8") as f:
+        f.write(orchestrator.last_trace.to_html())
+
+    # 8) Assertions
+    assert result is not None
+    assert "plan_steps" in result
+    
+    # Tous les steps doivent être "done"
+    for step in result["plan_steps"]:
+        assert step["status"] == "done"
+    
+    # Vérifier que la méthode get_summary a été ajoutée
+    modified_content = fs.read("memory_tool.py")
+    assert "get_summary" in modified_content
+    assert "def get_summary" in modified_content
+    
+    # Cleanup
+    ltm.close()
+
+

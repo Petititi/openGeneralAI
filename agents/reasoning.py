@@ -10,8 +10,9 @@ class ReasoningAgent:
         self.logger = logger
         self.ask_llm = ask_llm
 
-        self.core_prompt = """Operating principles:
+        self.core_prompt = """You are a planning agent:
 * Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a criteria needed to go to the next step.
+* **Identify context needs**: What classes, functions, or concepts are needed?
 * Keep outputs precise and minimal; follow formats exactly.
 * Use the status "done" only when proof exists and ensure the last step is a validation of success.
 
@@ -21,7 +22,7 @@ PLAN:
 "plan_steps": ["descr": "...", "status": done|todo, "next_step_criteria": "..."]
 }
 """
-        self.continue_plan_prompt = """Operating principles:
+        self.continue_plan_prompt = """You are a planning agent:
 * From the previous interactions choose whether to proceed to the NEXT_TASK or build a NEW_PLAN.
 * No elaboration.
 
@@ -36,7 +37,7 @@ OUTPUT SCHEMA:
 "status": "NEXT_TASK|NEW_PLAN"
 }
 """
-        self.last_plan_prompt = """Operating principles:
+        self.last_plan_prompt = """You are a planning agent:
 * From the previous interactions, evaluate if we succeeded, according to next step criteria.
 * Use either "NEW_PLAN" or "DONE" to indicate the status
 * If "DONE", add a description of the success in the output.
