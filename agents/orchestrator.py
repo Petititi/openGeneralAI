@@ -1,4 +1,3 @@
-
 import json
 from litellm import AuthenticationError, RateLimitError, APIConnectionError, Timeout, BadRequestError, cost_per_token
 from typing import Dict, List, Tuple, Any, Optional
@@ -10,15 +9,23 @@ import configurator
 import agents.tools.ToolRegistry as tools_module
 import agents.action as action
 import agents.reasoning as reasoning
+from storage.longterm_memory import LongTermMemory
+
+# Default max tokens for context (roughly 1000 words to limit costs)
+DEFAULT_CONTEXT_MAX_TOKENS = 2000
 
 class Orchestrator:
-    def __init__(self, cfg: configurator.AppConfig, tools: tools_module.ToolRegistry, max_turn=10):
+    def __init__(self, cfg: configurator.AppConfig, tools: tools_module.ToolRegistry, 
+                 ltm: Optional[LongTermMemory] = None, max_turn=10,
+                 max_context_tokens: int = DEFAULT_CONTEXT_MAX_TOKENS):
         self.last_trace: Optional[TrajectoryLogger] = None
         self.cur_trace: Optional[TrajectoryLogger] = None
 
         self.cfg = cfg
         self.tools = tools
         self.max_turn = max_turn
+        self.ltm = ltm
+        self.max_context_tokens = max_context_tokens
 
         self.token_count, self.in_token, self.out_token = 0, 0, 0
 
@@ -104,9 +111,101 @@ Readability:
         # always start with the main prompt:
         return [{"role": "system", "content": self.core_prompt}] + filtered_list
 
+    def _get_relevant_context(self, query: str) -> str:
+        """
+        Retrieve relevant context from long-term memory based on the query.
+        Returns a formatted string with relevant code/context, limited by max_context_tokens.
+        """
+        if self.ltm is None:
+            return ""
+        
+        try:
+            # Search the memory for relevant content
+            results = self.ltm.search(query, top_k=5, mode="hybrid")
+            
+            if not results:
+                return ""
+            
+            # Build context from results, respecting token limit
+            context_parts = []
+            total_chars = 0
+            # Rough estimate: 1 token \u2248 4 characters
+            max_chars = self.max_context_tokens * 4
+            
+            for result in results:
+                # Format the result as context
+                source = result.get('source_path', 'unknown')
+                lines = f"{result.get('start_line', 0)}-{result.get('end_line', 0)}"
+                chunk_type = result.get('chunk_type', 'code')
+                chunk_name = result.get('chunk_name', '')
+                
+                if chunk_name:
+                    header = f"[{chunk_type}] {chunk_name} @ {source}:{lines}"
+                else:
+                    header = f"[{chunk_type}] {source}:{lines}"
+                
+                content = result.get('content', '')
+                # Skip very short content
+                if len(content) < 20:
+                    continue
+                    
+                # Truncate very long content
+                if len(content) > 2000:
+                    content = content[:2000] + "..."
+                
+                part = f"{header}\
+```\
+{content}\
+```"
+                
+                # Check if adding this would exceed limit
+                if total_chars + len(part) > max_chars:
+                    # Try to fit what we can
+                    remaining = max_chars - total_chars
+                    if remaining > 200:  # Only add if meaningful space left
+                        context_parts.append(part[:remaining])
+                        total_chars += remaining
+                    break
+                
+                context_parts.append(part)
+                total_chars += len(part)
+            
+            if context_parts:
+                return "\
+\
+---\
+\
+".join(context_parts)
+            return ""
+            
+        except Exception as e:
+            # If anything goes wrong, return empty context to not break the flow
+            return ""
+
+    def _inject_memory_context(self, messages: List[dict], context: str) -> List[dict]:
+        """
+        Inject memory context into the messages.
+        If context is provided, add it as a system message before the last user message.
+        """
+        if not context:
+            return messages
+        
+        # Find the last user message and add context before it
+        context_msg = {
+            "role": "system",
+            "content": f"""Relevant context from the codebase (use this if relevant to the user's question):
+
+{context}"""
+        }
+        
+        # Insert context as second system message (after core_prompt)
+        result = [messages[0], context_msg] + messages[1:]
+        return result
+
     def process_user_message(self, question: str) -> Tuple[dict, float]:
         """
         Orchestrates the reasoning and action agents to process a user message.
+        Automatically retrieves relevant context from long-term memory to enhance responses.
         """
         self.cur_trace = TrajectoryLogger()
         self.last_trace = None
@@ -118,18 +217,36 @@ Readability:
         plan: Dict[str, Any] = {}
         turn = 0
 
+        # Retrieve relevant context from memory for the user's question
+        memory_context = self._get_relevant_context(question)
+        
+        # Log the memory context retrieval
+        if memory_context:
+            self.cur_trace.add_node(
+                phase="start",
+                turn=0,
+                tags={"MEMORY_CONTEXT": "Retrieved relevant context from memory", "CONTEXT_LENGTH": len(memory_context)}
+            )
+
         self.cur_trace.add_node(
             phase="start",
             turn=turn,
             tags={"QUESTION": question}
         )
-        self.cur_trace.set_questions([{"role": "system", "content": self.core_prompt}, {"role": "user", "content": question}])
+        
+        # Build initial messages with memory context
+        initial_messages = [{"role": "system", "content": self.core_prompt}, {"role": "user", "content": question}]
+        initial_messages = self._inject_memory_context(initial_messages, memory_context)
+        self.cur_trace.set_questions(initial_messages)
 
         while not is_done and turn < self.max_turn:
             turn += 1
             
             # Prepare base messages, clean history to not have too much context
             base_messages = self.clean_message_history(self.cur_trace.get_current_interaction(), max_size=8)
+            
+            # Inject memory context into base messages for each turn
+            base_messages = self._inject_memory_context(base_messages, memory_context)
 
             # Handle planning phase
             if not plan:
@@ -146,6 +263,9 @@ Readability:
                 # Add step description to messages
                 step_msg = reasoning_agent.get_step_description(plan)
                 action_messages = self.clean_message_history(base_messages + [step_msg], only_system=True, max_size=8)
+                
+                # Inject memory context into action messages
+                action_messages = self._inject_memory_context(action_messages, memory_context)
                 
                 # Execute action
                 action_agent.execute_action(action_messages, turn)

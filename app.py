@@ -34,7 +34,7 @@ ltm = LongTermMemory(
 )
 ltm.add_folder(str(ROOT_FOLDER))
 tools_registry = tools_module.ToolRegistry()
-orchestrator = Orchestrator(cfg, tools_registry)
+orchestrator = Orchestrator(cfg, tools_registry, ltm=ltm)
 tools_registry.register(memory_tools_module.SearchContext(ltm, ask_llm=orchestrator.safe_ask))
 
 
