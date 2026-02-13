@@ -112,75 +112,115 @@ Readability:
         return [{"role": "system", "content": self.core_prompt}] + filtered_list
 
     def _get_relevant_context(self, query: str) -> str:
-        """
-        Retrieve relevant context from long-term memory based on the query.
-        Returns a formatted string with relevant code/context, limited by max_context_tokens.
-        """
+        """Retrieve relevant context using LLM-enhanced query analysis."""
         if self.ltm is None:
             return ""
-        
+
         try:
-            # Search the memory for relevant content
-            results = self.ltm.search(query, top_k=5, mode="hybrid")
+            # Step 1: Use LLM to analyze if we should search memory and how
+            analysis = self._analyze_query_for_memory(query)
             
-            if not results:
+            if not analysis.get("should_search", True):
                 return ""
             
-            # Build context from results, respecting token limit
-            context_parts = []
-            total_chars = 0
-            # Rough estimate: 1 token \u2248 4 characters
-            max_chars = self.max_context_tokens * 4
+            search_queries = analysis.get("search_queries", [query])
+            search_type = analysis.get("search_type", "hybrid")
+            symbols_to_find = analysis.get("symbols", [])
             
-            for result in results:
-                # Format the result as context
-                source = result.get('source_path', 'unknown')
-                lines = f"{result.get('start_line', 0)}-{result.get('end_line', 0)}"
-                chunk_type = result.get('chunk_type', 'code')
-                chunk_name = result.get('chunk_name', '')
-                
-                if chunk_name:
-                    header = f"[{chunk_type}] {chunk_name} @ {source}:{lines}"
-                else:
-                    header = f"[{chunk_type}] {source}:{lines}"
-                
-                content = result.get('content', '')
-                # Skip very short content
-                if len(content) < 20:
-                    continue
-                    
-                # Truncate very long content
-                if len(content) > 2000:
-                    content = content[:2000] + "..."
-                
-                part = f"{header}\
-```\
-{content}\
-```"
-                
-                # Check if adding this would exceed limit
-                if total_chars + len(part) > max_chars:
-                    # Try to fit what we can
-                    remaining = max_chars - total_chars
-                    if remaining > 200:  # Only add if meaningful space left
-                        context_parts.append(part[:remaining])
-                        total_chars += remaining
-                    break
-                
-                context_parts.append(part)
-                total_chars += len(part)
+            all_results = []
+            seen_chunks = set()
             
-            if context_parts:
-                return "\
-\
----\
-\
-".join(context_parts)
-            return ""
+            # Step 2: Search for specific symbols
+            for symbol in symbols_to_find[:3]:
+                symbol_results = self._search_symbol(symbol)
+                for r in symbol_results:
+                    if r.get("chunk_id") not in seen_chunks:
+                        seen_chunks.add(r.get("chunk_id"))
+                        all_results.append(r)
+            
+            # Step 3: Execute enhanced search queries
+            for sq in search_queries[:2]:
+                mode = "semantic" if search_type == "semantic" else "hybrid"
+                results = self.ltm.search(sq, top_k=5, mode=mode)
+                for r in results:
+                    if r.get("chunk_id") not in seen_chunks:
+                        seen_chunks.add(r.get("chunk_id"))
+                        all_results.append(r)
+            
+            # Fallback
+            if not all_results:
+                results = self.ltm.search(query, top_k=5, mode="hybrid")
+                all_results = results
+            
+            if not all_results:
+                return ""
+            
+            return self._format_context_results(all_results)
             
         except Exception as e:
-            # If anything goes wrong, return empty context to not break the flow
+            print(f"Memory context error: {e}")
             return ""
+
+    def _analyze_query_for_memory(self, query: str) -> Dict[str, Any]:
+        """Use LLM to analyze query for memory search."""
+        prompt = "Analyze: " + query + ". JSON: {should_search:bool, search_queries:[], search_type:str, symbols:[]}"
+        messages = [{"role": "system", "content": "JSON only"}, {"role": "user", "content": prompt}]
+        try:
+            response = self.safe_ask(messages).strip()
+            if response.startswith("`" + "`" + "`"):
+                parts = response.split("`" + "`" + "`")
+                response = parts[1] if len(parts) > 1 else response
+                if response.startswith("json"):
+                    response = response[4:]
+                response = response.strip()
+            analysis = json.loads(response)
+            return {"should_search": analysis.get("should_search", True), "search_queries": analysis.get("search_queries", [query]), "search_type": analysis.get("search_type", "hybrid"), "symbols": analysis.get("symbols", []), "reasoning": analysis.get("reasoning", "")}
+        except Exception as e:
+            return {"should_search": True, "search_queries": [query], "search_type": "hybrid", "symbols": self._extract_symbols_from_query(query), "reasoning": "Fallback: " + str(e)}
+
+    def _extract_symbols_from_query(self, query: str) -> List[str]:
+        """Extract code symbols from query."""
+        from storage.longterm_memory import RESERVED_KEYWORD_CODE
+        camel = re.findall(r'\b[A-Z][a-zA-Z0-9_]*\b', query)
+        snake = re.findall(r'\b[a-z_][a-z0-9_]*\b', query)
+        return [s for s in camel + snake if s not in RESERVED_KEYWORD_CODE and len(s) > 2][:5]
+
+    def _search_symbol(self, symbol: str) -> List[Dict[str, Any]]:
+        """Search for code symbol."""
+        from storage.longterm_memory import RESERVED_KEYWORD_CODE
+        if symbol in RESERVED_KEYWORD_CODE:
+            return []
+        results = list(self.ltm.search(symbol, top_k=3, mode="keyword")) + list(self.ltm.search(symbol, top_k=3, mode="semantic"))
+        seen, unique = set(), []
+        for r in results:
+            cid = r.get("chunk_id")
+            if cid and cid not in seen:
+                seen.add(cid)
+                unique.append(r)
+        return unique[:5]
+
+    def _format_context_results(self, results: List[Dict[str, Any]]) -> str:
+        """Format search results."""
+        parts, total, max_chars = [], 0, self.max_context_tokens * 4
+        for r in results:
+            src = r.get("source_path", "unknown")
+            ln = f"{r.get('start_line', 0)}-{r.get('end_line', 0)}"
+            ct = r.get("chunk_type", "code")
+            cn = r.get("chunk_name", "")
+            header = f"[{ct}] {cn} @ {src}:{ln}" if cn else f"[{ct}] {src}:{ln}"
+            content = r.get("content", "")
+            if len(content) < 20:
+                continue
+            if len(content) > 2000:
+                content = content[:2000] + "..."
+            lang = r.get("language", "")
+            backtick = "`"
+            part = header + "\n" + backtick*3 + lang + "\n" + content + "\n" + backtick*3
+            if total + len(part) > max_chars:
+                break
+            parts.append(part)
+            total += len(part)
+        return "\n\n---\n\n".join(parts) if parts else ""
 
     def _inject_memory_context(self, messages: List[dict], context: str) -> List[dict]:
         """
