@@ -52,7 +52,7 @@ def standalone_function():
 @pytest.fixture
 def mock_ltm():
     """Create a mocked LongTermMemory instance"""
-    ltm = Mock(spec=LongTermMemory)
+    ltm = Mock()
     
     # Mock database lookups
     ltm.db = Mock()
