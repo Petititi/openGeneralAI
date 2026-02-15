@@ -1,30 +1,31 @@
 """
-Pytest configuration to mock heavy dependencies before imports.
+Pytest configuration for the project.
+Now uses real implementations since LongTermMemory works without heavy dependencies.
 """
 
 import sys
-from unittest.mock import Mock, MagicMock
+from pathlib import Path
 
-# Create mock modules before any imports that would load storage.longterm_memory
-# This avoids needing sentence_transformers and faiss for these tests
+# Ensure the project root is in the path
+project_root = str(Path(__file__).parent.parent)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
-def pytest_configure(config):
-    """Called before any tests run - set up mocks here"""
-    # Create mock for storage module
-    mock_storage = Mock()
-    mock_storage.longterm_memory = Mock()
-    mock_storage.DatabaseManagement = Mock()
-    mock_storage.EmbeddingManagement = Mock()
-    
-    # Add RESERVED_KEYWORD_CODE to the mock
-    mock_storage.longterm_memory.RESERVED_KEYWORD_CODE = [
-        "def", "class", "function", "var", "let", "const", "import", "from",
-        "public", "private", "protected", "interface", "struct", "enum", "package",
-        "return", "if", "else", "switch", "case", "for", "while", "do", "try",
-        "catch", "finally", "throw", "new", "this", "super", "extends", "implements",
-    ]
-    
-    sys.modules['storage'] = mock_storage
-    sys.modules['storage.longterm_memory'] = mock_storage.longterm_memory
-    sys.modules['storage.DatabaseManagement'] = mock_storage.DatabaseManagement
-    sys.modules['storage.EmbeddingManagement'] = mock_storage.EmbeddingManagement
+# Check if embeddings are available
+EMBEDDINGS_AVAILABLE = False
+try:
+    from storage.EmbeddingManagement import EmbeddingManager
+    EMBEDDINGS_AVAILABLE = True
+except ImportError:
+    pass
+
+import pytest
+
+# Skip tests that require embeddings if not available
+def pytest_collection_modifyitems(config, items):
+    """Skip tests that require embeddings if they're not available."""
+    if not EMBEDDINGS_AVAILABLE:
+        skip_embedding = pytest.mark.skip(reason="Embeddings not available (sentence_transformers not installed)")
+        for item in items:
+            if "semantic" in item.name.lower() or "embedding" in item.name.lower():
+                item.add_marker(skip_embedding)

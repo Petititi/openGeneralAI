@@ -8,10 +8,23 @@ from typing import List, Dict, Tuple, Optional
 
 import numpy as np
 
-from tree_sitter_language_pack import get_parser
+# Optional imports - handle gracefully if not available
+try:
+    from tree_sitter_language_pack import get_parser
+    TREE_SITTER_AVAILABLE = True
+except ImportError:
+    TREE_SITTER_AVAILABLE = False
+    get_parser = None
 
 from .DatabaseManagement import DatabaseManager
-from .EmbeddingManagement import EmbeddingManager
+
+# Try to import EmbeddingManager, but make it optional
+try:
+    from .EmbeddingManagement import EmbeddingManager
+    EMBEDDING_AVAILABLE = True
+except ImportError:
+    EMBEDDING_AVAILABLE = False
+    EmbeddingManager = None
 
 # --------------------------
 # Utilitaires
@@ -431,19 +444,34 @@ class LongTermMemory:
         faiss_index_path: str = "faiss.index",
         model_name: str = "mixedbread-ai/mxbai-embed-large-v1",
         hybrid_alpha: float = 0.5,
+        enable_embeddings: bool = True,
     ):
         self.storage_dir = Path(storage_dir)  # Conservé pour compatibilité
         self.hybrid_alpha = hybrid_alpha
+        self._embeddings = None
+        self._embedding_manager_class = EmbeddingManager
 
         need_consistency_check = not Path(db_path).exists()
         # Initialiser les managers
         self.db = DatabaseManager(db_path)
-        self.embeddings = EmbeddingManager(faiss_index_path, model_name)
+        
+        # Initialize embeddings only if available and enabled
+        if enable_embeddings and EMBEDDING_AVAILABLE and EmbeddingManager is not None:
+            try:
+                self._embeddings = EmbeddingManager(faiss_index_path, model_name)
+            except Exception as e:
+                print(f"[WARNING] LongTermMemory: Could not initialize embeddings: {e}", file=sys.stderr)
+                self._embeddings = None
 
         if need_consistency_check:
             report = self.check_file_integrity()
             if report["total_documents"] != report["existing_unchanged"]:
                 print(f"[INFO] LongTermMemory: Consistency check found issues: {report}", file=sys.stderr)
+
+    @property
+    def embeddings(self):
+        """Property to access embeddings, returns None if not available."""
+        return self._embeddings
 
     # Propriétés de compatibilité pour accès legacy
     @property
@@ -452,14 +480,20 @@ class LongTermMemory:
     
     @property
     def index(self):
+        if self.embeddings is None:
+            return None
         return self.embeddings.index
     
     @property
     def model(self):
+        if self.embeddings is None:
+            return None
         return self.embeddings.model
     
     @property
     def dim(self):
+        if self.embeddings is None:
+            return None
         return self.embeddings.dim
 
     # ---------- API publique ----------
@@ -537,70 +571,77 @@ class LongTermMemory:
             # Pour les classes, on ne calcule pas encore l'embedding
             if chunk_type == "class":
                 chunk_embeddings[i] = None  # Sera calculé plus tard
-            else:
-                # Embedding normal pour fonctions, méthodes, etc.
+            elif self.embeddings is not None:
+                # Embedding normal pour fonctions, méthodes, etc. (only if embeddings available)
                 emb = self.embeddings.encode([content], normalize=True)
                 chunk_embeddings[i] = emb[0]
+            else:
+                # No embeddings - skip embedding calculation
+                chunk_embeddings[i] = None
         
         # Deuxième passe: calculer les embeddings des classes comme somme pondérée des méthodes et attributs
-        for i, (start, end, content, metadata) in enumerate(chunks):
-            chunk_type = metadata.get("type")
-            chunk_name = metadata.get("name")
-            
-            if chunk_type == "class" and chunk_name in class_methods_map:
-                method_indices = class_methods_map[chunk_name]
-                method_embeddings = []
-                method_weights = []
-                # Classe sans méthodes ou non trouvée dans la map
-                class_emb = self.embeddings.encode([f"This is a {language} class named {chunk_name}"], normalize=True)
-                method_embeddings.append(class_emb[0])
-                method_weights.append(500) # arbitrary weight for class description
+        # Only do this if embeddings are available
+        if self.embeddings is not None:
+            for i, (start, end, content, metadata) in enumerate(chunks):
+                chunk_type = metadata.get("type")
+                chunk_name = metadata.get("name")
                 
-                # Collecter les embeddings des méthodes et attributs de cette classe avec leurs tailles
-                for method_idx in method_indices:
-                    if method_idx < len(chunk_embeddings) and chunk_embeddings[method_idx] is not None:
-                        method_embeddings.append(chunk_embeddings[method_idx])
-                        # Poids basé sur la taille en bytes du contenu de la méthode/attribut
-                        method_content = chunks[method_idx][2]
-                        method_weights.append(len(method_content.encode('utf-8')))
-                
-                if method_embeddings:
-                    # Calculer la moyenne pondérée par la taille (bytes) de chaque méthode
-                    method_embeddings_array = np.array(method_embeddings)
-                    method_weights_array = np.array(method_weights, dtype="float32")
+                if chunk_type == "class" and chunk_name in class_methods_map:
+                    method_indices = class_methods_map[chunk_name]
+                    method_embeddings = []
+                    method_weights = []
+                    # Classe sans méthodes ou non trouvée dans la map
+                    class_emb = self.embeddings.encode([f"This is a {language} class named {chunk_name}"], normalize=True)
+                    method_embeddings.append(class_emb[0])
+                    method_weights.append(500) # arbitrary weight for class description
                     
-                    # Normaliser les poids pour qu'ils somment à 1
-                    weights_sum = np.sum(method_weights_array)
-                    if weights_sum > 0:
-                        normalized_weights = method_weights_array / weights_sum
-                        # Moyenne pondérée: somme des embeddings multipliés par leurs poids
-                        class_emb = np.sum(method_embeddings_array * normalized_weights[:, np.newaxis], axis=0).astype("float32")
+                    # Collecter les embeddings des méthodes et attributs de cette classe avec leurs tailles
+                    for method_idx in method_indices:
+                        if method_idx < len(chunk_embeddings) and chunk_embeddings[method_idx] is not None:
+                            method_embeddings.append(chunk_embeddings[method_idx])
+                            # Poids basé sur la taille en bytes du contenu de la méthode/attribut
+                            method_content = chunks[method_idx][2]
+                            method_weights.append(len(method_content.encode('utf-8')))
+                    
+                    if method_embeddings:
+                        # Calculer la moyenne pondérée par la taille (bytes) de chaque méthode
+                        method_embeddings_array = np.array(method_embeddings)
+                        method_weights_array = np.array(method_weights, dtype="float32")
+                        
+                        # Normaliser les poids pour qu'ils somment à 1
+                        weights_sum = np.sum(method_weights_array)
+                        if weights_sum > 0:
+                            normalized_weights = method_weights_array / weights_sum
+                            # Moyenne pondérée: somme des embeddings multipliés par leurs poids
+                            class_emb = np.sum(method_embeddings_array * normalized_weights[:, np.newaxis], axis=0).astype("float32")
+                        else:
+                            # Fallback sur moyenne simple si problème avec les poids
+                            class_emb = np.mean(method_embeddings_array, axis=0).astype("float32")
+                        
+                        # Re-normaliser
+                        norm = np.linalg.norm(class_emb)
+                        if norm > 1e-12:
+                            class_emb = class_emb / norm
+                        chunk_embeddings[i] = class_emb
                     else:
-                        # Fallback sur moyenne simple si problème avec les poids
-                        class_emb = np.mean(method_embeddings_array, axis=0).astype("float32")
-                    
-                    # Re-normaliser
-                    norm = np.linalg.norm(class_emb)
-                    if norm > 1e-12:
-                        class_emb = class_emb / norm
-                    chunk_embeddings[i] = class_emb
-                else:
-                    # Pas de méthodes trouvées, utiliser l'embedding du contenu de la classe
+                        # Pas de méthodes trouvées, utiliser l'embedding du contenu de la classe
+                        emb = self.embeddings.encode([content], normalize=True)
+                        chunk_embeddings[i] = emb[0]
+                elif chunk_type == "class":
+                    # Classe sans méthodes ou non trouvée dans la map
                     emb = self.embeddings.encode([content], normalize=True)
                     chunk_embeddings[i] = emb[0]
-            elif chunk_type == "class":
-                # Classe sans méthodes ou non trouvée dans la map
-                emb = self.embeddings.encode([content], normalize=True)
-                chunk_embeddings[i] = emb[0]
         
-        # Troisième passe: ajouter tous les embeddings à FAISS
-        for i, chunk_id in enumerate(chunk_ids):
-            if i in chunk_embeddings and chunk_embeddings[i] is not None:
-                emb = chunk_embeddings[i].reshape(1, -1)
-                faiss_ids = self.embeddings.add_embeddings(emb)
-                self.db.insert_faiss_mapping(faiss_ids[0], chunk_id)
-
-        self.embeddings.persist()
+        # Troisième passe: ajouter tous les embeddings à FAISS (only if embeddings available)
+        if self.embeddings is not None:
+            for i, chunk_id in enumerate(chunk_ids):
+                if i in chunk_embeddings and chunk_embeddings[i] is not None:
+                    emb = chunk_embeddings[i].reshape(1, -1)
+                    faiss_ids = self.embeddings.add_embeddings(emb)
+                    self.db.insert_faiss_mapping(faiss_ids[0], chunk_id)
+            
+            self.embeddings.persist()
+        
         return doc_id,should_update_FAISS
 
     def add_folder(self, folder: str):
@@ -647,22 +688,29 @@ class LongTermMemory:
             kw_results = self.db.keyword_search(query, top_k * 3)
 
         if mode in {"semantic", "hybrid"}:
-            q_emb = self.embeddings.encode([query], normalize=True, prompt_name="query")
-            sims, ids = self.embeddings.search(q_emb, top_k * 3)
-            ids = ids[0]
-            sims = sims[0]
-            # map faiss_id -> chunk
-            if len(ids) > 0 and ids[0] != -1:
-                mapping = self.db.get_faiss_chunk_mapping([int(i) for i in ids])
-                for faiss_id, sim in zip(ids, sims):
-                    if faiss_id == -1: 
-                        continue
-                    chunk_id = mapping.get(int(faiss_id))
-                    if chunk_id is None:
-                        continue
-                    row = self.db.get_chunk_by_id(chunk_id)
-                    if row:
-                        sem_results.append((*row, float(sim)))
+            # Check if embeddings are available
+            if self.embeddings is None:
+                if mode == "semantic":
+                    # No embeddings available, return empty results for semantic-only
+                    pass
+                # Fall back to keyword-only for hybrid
+            else:
+                q_emb = self.embeddings.encode([query], normalize=True, prompt_name="query")
+                sims, ids = self.embeddings.search(q_emb, top_k * 3)
+                ids = ids[0]
+                sims = sims[0]
+                # map faiss_id -> chunk
+                if len(ids) > 0 and ids[0] != -1:
+                    mapping = self.db.get_faiss_chunk_mapping([int(i) for i in ids])
+                    for faiss_id, sim in zip(ids, sims):
+                        if faiss_id == -1: 
+                            continue
+                        chunk_id = mapping.get(int(faiss_id))
+                        if chunk_id is None:
+                            continue
+                        row = self.db.get_chunk_by_id(chunk_id)
+                        if row:
+                            sem_results.append((*row, float(sim)))
 
         def assemble(rows):
             out = []
@@ -763,11 +811,17 @@ class LongTermMemory:
 
     def stats(self) -> Dict:
         db_stats = self.db.get_stats()
-        return {
-            **db_stats,
-            "faiss_ntotal": self.embeddings.ntotal,
-            "embedding_dim": self.embeddings.embedding_dim
-        }
+        result = {**db_stats}
+        
+        # Handle case where embeddings are not available
+        if self.embeddings is not None:
+            result["faiss_ntotal"] = self.embeddings.ntotal
+            result["embedding_dim"] = self.embeddings.embedding_dim
+        else:
+            result["faiss_ntotal"] = 0
+            result["embedding_dim"] = 0
+            
+        return result
 
     def cleanup_missing_files(self) -> int:
         """
@@ -1296,7 +1350,8 @@ class LongTermMemory:
         return self.db.search_by_type(chunk_type, name_pattern)
 
     def close(self):
-        self.embeddings.persist()
+        if self.embeddings is not None:
+            self.embeddings.persist()
         self.db.close()
 
 # --------------------------

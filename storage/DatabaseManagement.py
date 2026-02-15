@@ -21,6 +21,7 @@ class DatabaseManager:
     def __init__(self, db_path: str = "memory.sqlite"):
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
+        self.conn.row_factory = sqlite3.Row  # Enable dict-like row access
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self._lock = threading.RLock()
@@ -39,7 +40,18 @@ class DatabaseManager:
             sha256 TEXT,
             size_bytes INTEGER,
             created_at TEXT,
+            category TEXT DEFAULT 'general',
             extra JSON
+            )""")
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT UNIQUE NOT NULL,
+            description TEXT,
+            color TEXT,
+            icon TEXT,
+            created_at TEXT,
+            is_system INTEGER DEFAULT 0
             )""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS document_imports (
@@ -98,18 +110,258 @@ class DatabaseManager:
             cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_parent_class ON chunks(parent_class)
             """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_document_category ON documents(category)
+            """)
+            
+            # Initialize default categories
+            self._init_default_categories()
+            
             self.conn.commit()
 
     def insert_document(self, doc_id: str, source_path: str, rel_path: Optional[str],
                        media_type: str, language: Optional[str], sha256: str,
-                       size_bytes: int, extra: Optional[Dict] = None) -> None:
+                       size_bytes: int, category: str = 'general', extra: Optional[Dict] = None) -> None:
         with self._lock:
             cur = self.conn.cursor()
             cur.execute("""
-            INSERT OR IGNORE INTO documents(id, source_path, rel_path, media_type, language, sha256, size_bytes, created_at, extra)
-            VALUES(?,?,?,?,?,?,?,?,?)
-        """, (doc_id, source_path, rel_path, media_type, language, sha256, size_bytes, now_iso(), json.dumps(extra or {})))
+            INSERT OR IGNORE INTO documents(id, source_path, rel_path, media_type, language, sha256, size_bytes, created_at, category, extra)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (doc_id, source_path, rel_path, media_type, language, sha256, size_bytes, now_iso(), category, json.dumps(extra or {})))
             self.conn.commit()
+    
+    def _init_default_categories(self):
+        """Initialize default system categories."""
+        cur = self.conn.cursor()
+        default_categories = [
+            {'name': 'general', 'description': 'General notes and memories', 'color': '#6B7280', 'icon': '📝', 'is_system': 1},
+            {'name': 'appointment', 'description': 'Appointments and scheduled events', 'color': '#3B82F6', 'icon': '📅', 'is_system': 1},
+            {'name': 'work', 'description': 'Work-related memories', 'color': '#10B981', 'icon': '💼', 'is_system': 1},
+            {'name': 'object', 'description': 'Objects and items', 'color': '#F59E0B', 'icon': '📦', 'is_system': 1},
+            {'name': 'person', 'description': 'People and contacts', 'color': '#EC4899', 'icon': '👤', 'is_system': 1},
+            {'name': 'location', 'description': 'Places and locations', 'color': '#8B5CF6', 'icon': '📍', 'is_system': 1},
+            {'name': 'idea', 'description': 'Ideas and thoughts', 'color': '#06B6D4', 'icon': '💡', 'is_system': 1},
+            {'name': 'travel', 'description': 'Travel and trips', 'color': '#EF4444', 'icon': '✈️', 'is_system': 1},
+        ]
+        
+        for cat in default_categories:
+            cur.execute("""
+                INSERT OR IGNORE INTO categories (name, description, color, icon, created_at, is_system)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (cat['name'], cat['description'], cat['color'], cat['icon'], now_iso(), cat['is_system']))
+        self.conn.commit()
+    
+    # ---------- Category Management ----------
+    
+    def create_category(self, name: str, description: str = '', color: str = '#6B7280', icon: str = '📂') -> int:
+        """Create a new category. Returns the category id."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT INTO categories (name, description, color, icon, created_at, is_system)
+                VALUES (?, ?, ?, ?, ?, 0)
+            """, (name, description, color, icon, now_iso()))
+            self.conn.commit()
+            return cur.lastrowid
+    
+    def get_category(self, name: str) -> Optional[Dict]:
+        """Get a category by name."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM categories WHERE name = ?", (name,))
+            row = cur.fetchone()
+            if row:
+                return dict(row)
+            return None
+    
+    def list_categories(self) -> List[Dict]:
+        """List all categories."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM categories ORDER BY is_system DESC, name")
+            results = []
+            for row in cur.fetchall():
+                # Handle both tuple and Row objects
+                if hasattr(row, 'keys'):
+                    results.append(dict(row))
+                else:
+                    # Get column names from cursor description
+                    columns = [desc[0] for desc in cur.description]
+                    results.append(dict(zip(columns, row)))
+            return results
+    
+    def update_category(self, name: str, description: str = None, color: str = None, icon: str = None) -> bool:
+        """Update a category. Returns True if successful."""
+        with self._lock:
+            cur = self.conn.cursor()
+            updates = []
+            params = []
+            if description is not None:
+                updates.append("description = ?")
+                params.append(description)
+            if color is not None:
+                updates.append("color = ?")
+                params.append(color)
+            if icon is not None:
+                updates.append("icon = ?")
+                params.append(icon)
+            
+            if not updates:
+                return False
+            
+            params.append(name)
+            cur.execute(f"UPDATE categories SET {', '.join(updates)} WHERE name = ? AND is_system = 0", params)
+            self.conn.commit()
+            return cur.rowcount > 0
+    
+    def delete_category(self, name: str) -> bool:
+        """Delete a category. Only non-system categories can be deleted."""
+        with self._lock:
+            cur = self.conn.cursor()
+            # First, move documents from this category to 'general'
+            cur.execute("UPDATE documents SET category = 'general' WHERE category = ?", (name,))
+            # Then delete the category
+            cur.execute("DELETE FROM categories WHERE name = ? AND is_system = 0", (name,))
+            self.conn.commit()
+            return cur.rowcount > 0
+    
+    # ---------- Souvenir/Document helpers ----------
+    
+    def insert_souvenir(self, doc_id: str, content: str, title: str = None, category: str = 'general', tags: List[str] = None) -> None:
+        """Insert a souvenir (convenience method)."""
+        extra = {'title': title, 'tags': tags or []}
+        self.insert_document(
+            doc_id=doc_id,
+            source_path=f"souvenir:{doc_id}",
+            rel_path=None,
+            media_type='text/plain',
+            language='en',
+            sha256='',
+            size_bytes=len(content),
+            category=category,
+            extra=extra
+        )
+        # Insert content as a single chunk
+        self.insert_chunk(doc_id, 0, 1, len(content.split('\n')), content, 'souvenir', title, None)
+    
+    def get_souvenir(self, doc_id: str) -> Optional[Dict]:
+        """Get a souvenir by ID."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            
+            doc = dict(row)
+            # Get the chunk content
+            cur.execute("SELECT content FROM chunks WHERE document_id = ?", (doc_id,))
+            chunk_row = cur.fetchone()
+            if chunk_row:
+                doc['content'] = chunk_row[0]
+            return doc
+    
+    def list_souvenirs(self, category: str = None, limit: int = 20) -> List[Dict]:
+        """List all souvenirs, optionally filtered by category."""
+        with self._lock:
+            cur = self.conn.cursor()
+            if category:
+                cur.execute("""
+                    SELECT d.*, c.content 
+                    FROM documents d
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE d.category = ?
+                    ORDER BY d.created_at DESC
+                    LIMIT ?
+                """, (category, limit))
+            else:
+                cur.execute("""
+                    SELECT d.*, c.content 
+                    FROM documents d
+                    JOIN chunks c ON d.id = c.document_id
+                    ORDER BY d.created_at DESC
+                    LIMIT ?
+                """, (limit,))
+            
+            results = []
+            for row in cur.fetchall():
+                # Handle both tuple and Row objects
+                if hasattr(row, 'keys'):
+                    doc = dict(row)
+                else:
+                    # Get column names from cursor description
+                    columns = [desc[0] for desc in cur.description]
+                    doc = dict(zip(columns, row))
+                results.append(doc)
+            return results
+    
+    def search_souvenirs(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
+        """Search souvenirs by content using simple LIKE search with OR logic."""
+        with self._lock:
+            cur = self.conn.cursor()
+            
+            # Split query into keywords and search with OR logic
+            keywords = query.lower().split()
+            
+            if len(keywords) == 1:
+                # Single keyword - simple search
+                if category:
+                    cur.execute("""
+                        SELECT d.*, c.content 
+                        FROM documents d
+                        JOIN chunks c ON d.id = c.document_id
+                        WHERE (c.content LIKE ? OR d.extra LIKE ?) AND d.category = ?
+                        ORDER BY d.created_at DESC
+                        LIMIT ?
+                    """, (f'%{query}%', f'%{query}%', category, limit))
+                else:
+                    cur.execute("""
+                        SELECT d.*, c.content 
+                        FROM documents d
+                        JOIN chunks c ON d.id = c.document_id
+                        WHERE c.content LIKE ? OR d.extra LIKE ?
+                        ORDER BY d.created_at DESC
+                        LIMIT ?
+                    """, (f'%{query}%', f'%{query}%', limit))
+            else:
+                # Multiple keywords - OR logic for any match
+                conditions = " OR ".join(["c.content LIKE ?" for _ in keywords]) + " OR " + " OR ".join(["d.extra LIKE ?" for _ in keywords])
+                params = [f'%{kw}%' for kw in keywords] + [f'%{kw}%' for kw in keywords]
+                
+                if category:
+                    sql = f"""
+                        SELECT d.*, c.content 
+                        FROM documents d
+                        JOIN chunks c ON d.id = c.document_id
+                        WHERE ({conditions}) AND d.category = ?
+                        ORDER BY d.created_at DESC
+                        LIMIT ?
+                    """
+                    params.extend([category, limit])
+                else:
+                    sql = f"""
+                        SELECT d.*, c.content 
+                        FROM documents d
+                        JOIN chunks c ON d.id = c.document_id
+                        WHERE {conditions}
+                        ORDER BY d.created_at DESC
+                        LIMIT ?
+                    """
+                    params.append(limit)
+                
+                cur.execute(sql, params)
+            
+            results = []
+            for row in cur.fetchall():
+                # Handle both tuple and Row objects
+                if hasattr(row, 'keys'):
+                    doc = dict(row)
+                else:
+                    # Get column names from cursor description
+                    columns = [desc[0] for desc in cur.description]
+                    doc = dict(zip(columns, row))
+                results.append(doc)
+            return results
 
     def insert_imports(self, doc_id: str, imports: List[str]) -> None:
         with self._lock:

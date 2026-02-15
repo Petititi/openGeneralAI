@@ -71,6 +71,16 @@ class AppConfig:
         return self._cfg.get("faiss_index_path", "storage/faiss.index")
     
     @property
+    def souvenir_db_path(self) -> str:
+        """Configured souvenir database path (or default path if missing)."""
+        return self._cfg.get("souvenir_db_path", "souvenir_memory.sqlite")
+    
+    @property
+    def enable_semantic_search(self) -> bool:
+        """Whether to enable semantic search in souvenir assistant."""
+        return self._cfg.get("enable_semantic_search", True)
+    
+    @property
     def provider(self) -> str:
         """Configured provider name (or default provider if missing)."""
         return self._cfg.get("provider", "")
@@ -108,7 +118,9 @@ class AppConfig:
             "model": default_model,
             "user_lang": "English",
             "db_path": "storage/memory.sqlite",
-            "faiss_index_path": "storage/faiss.index"
+            "faiss_index_path": "storage/faiss.index",
+            "souvenir_db_path": "souvenir_memory.sqlite",
+            "enable_semantic_search": True
         }
 
     def reload_config(self) -> Dict[str, str]:
@@ -140,11 +152,13 @@ class AppConfig:
                 if allowed_models:
                     logger.warning("Model %r is not allowed for provider %r — defaulting to first allowed model.",
                                    model, provider)
-                    return {"provider": provider, "model": allowed_models[0]}
+                    # Preserve other config settings
+                    return {**self._cfg, "provider": provider, "model": allowed_models[0]}
                 logger.warning("No allowed models for provider %r — using global default config.", provider)
                 return self.default_config()
 
-            return {"provider": provider, "model": model}
+            # Preserve all config settings
+            return self._cfg
         except Exception as exc:
             logger.exception("Failed to load/validate config (%s). Falling back to default.", exc)
             return self.default_config()
