@@ -6,3 +6,7 @@ faiss-cpu
 sentence-transformers
 tree_sitter
 tree_sitter_languages
+google-auth
+google-api-python-client
+google-auth-oauthlib
+google-auth-httplib2
