@@ -66,6 +66,10 @@ class GmailMemoryAssistant:
         # Check for environment variables first
         OAUTH_id = os.environ.get('GMAIL_OAUTH_CLIENT_ID')
         OAUTH_password = os.environ.get('GMAIL_OAUTH_CLIENT_SECRET')
+
+        prev_tocken = self._load_existing_token()
+        if prev_tocken is not None:
+            return prev_tocken
         
         if OAUTH_id and OAUTH_password:
             print("\n" + "="*60)
@@ -219,55 +223,6 @@ class GmailMemoryAssistant:
             print(f"❌ App password authentication failed: {e}")
             return None
     
-    def _authenticate_app_password_env(self, email: str, app_password: str) -> Optional[Credentials]:
-        """Authenticate using app password from environment variables."""
-        print("\n🔑 App Password Authentication (from environment)")
-        print("-" * 40)
-        
-        if not email or not app_password:
-            print("❌ Email and App Password are required")
-            return None
-        
-        # Validate email format
-        if '@gmail.com' not in email and '@googlemail.com' not in email:
-            print("⚠️  Warning: This doesn't look like a Gmail address")
-        
-        # Create credentials using OAuth2 with refresh token flow
-        try:
-            from google.oauth2.credentials import Credentials
-            
-            # For app passwords, we need to create a token manually
-            self.credentials = Credentials(
-                token=None,  # No access token yet
-                refresh_token=None,
-                token_uri='https://oauth2.googleapis.com/token',
-                client_id='desktop_client',  # Dummy for app password
-                client_secret=app_password,
-                scopes=SCOPES
-            )
-            
-            # Store email for later use
-            self.user_email = email
-            
-            # Try to build service to verify
-            try:
-                service = build('gmail', 'v1', credentials=self.credentials)
-                # Verify by getting profile
-                profile = service.users().getProfile(userId='me').execute()
-                self.user_email = profile.get('emailAddress', email)
-                print(f"✅ Authenticated as: {self.user_email}")
-                return self.credentials
-            except HttpError as e:
-                if e.resp.status == 401:
-                    print("❌ Invalid app password. Please check and try again.")
-                else:
-                    print(f"❌ Authentication error: {e}")
-                return None
-                
-        except Exception as e:
-            print(f"❌ App password authentication failed: {e}")
-            return None
-    
     def _load_existing_token(self) -> Optional[Credentials]:
         """Load existing OAuth token from file."""
         if not os.path.exists(TOKEN_FILE):
@@ -328,55 +283,217 @@ class GmailMemoryAssistant:
             print(f"❌ Failed to connect to Gmail: {e}")
             return False
     
-    def fetch_recent_emails(self, max_results: int = 50, days_back: int = 30) -> List[Dict]:
-        """Fetch recent emails from Gmail."""
+    def fetch_recent_emails(self, max_results: int = 200, days_back: int = 90) -> List[Dict]:
+        """Fetch recent emails from Gmail with increased history.
+        
+        Args:
+            max_results: Maximum number of emails to fetch (default: 200)
+            days_back: How many days back to fetch (default: 90 = 3 months)
+        
+        Returns:
+            List of email dictionaries with extracted information
+        """
+        return self._fetch_emails_from_multiple_sources(max_results, days_back)
+    
+    def _fetch_emails_from_multiple_sources(self, max_results: int = 200, days_back: int = 90) -> List[Dict]:
+        """Fetch emails from multiple Gmail labels/folders.
+        
+        Fetches from: INBOX, SENT, and important categories to get comprehensive history.
+        
+        Args:
+            max_results: Maximum emails per folder
+            days_back: Days back to search
+            
+        Returns:
+            Combined list of all emails
+        """
         if not self.service:
             print("❌ Not connected to Gmail")
             return []
+        
+        # Define which labels/folders to fetch from
+        sources = [
+            ('INBOX', 'inbox'),
+            ('SENT', 'sent'),
+            ('IMPORTANT', 'important'),
+            ('STARRED', 'starred'),
+        ]
+        
+        all_emails = []
+        seen_ids = set()  # Avoid duplicates
         
         try:
             # Calculate date filter
             date_since = (datetime.now() - timedelta(days=days_back)).strftime('%Y/%m/%d')
             
-            print(f"\n📬 Fetching emails from last {days_back} days...")
+            print(f"\n📬 Fetching emails from last {days_back} days ({max_results} per source)...")
             
-            # Get messages
-            results = self.service.users().messages().list(
-                userId='me',
-                maxResults=max_results,
-                q=f'after:{date_since}'
-            ).execute()
-            
-            messages = results.get('messages', [])
-            
-            if not messages:
-                print("📭 No recent emails found")
-                return []
-            
-            print(f"📧 Found {len(messages)} emails. Fetching details...")
-            
-            emails = []
-            for i, msg in enumerate(messages):
+            for label_id, label_name in sources:
                 try:
-                    message = self.service.users().messages().get(
+                    print(f"\n  📂 Fetching from {label_name}...")
+                    
+                    # Get messages for this label
+                    results = self.service.users().messages().list(
                         userId='me',
-                        id=msg['id'],
-                        format='full'
+                        maxResults=max_results,
+                        q=f'after:{date_since}',
+                        labelIds=[label_id] if label_id != 'INBOX' else None
                     ).execute()
                     
-                    # Extract key info
-                    email_data = self._extract_email_info(message)
-                    emails.append(email_data)
+                    messages = results.get('messages', [])
+                    print(f"     Found {len(messages)} emails in {label_name}")
                     
-                    if (i + 1) % 10 == 0:
-                        print(f"  Processed {i + 1}/{len(messages)} emails...")
+                    # Fetch details for each message
+                    for i, msg in enumerate(messages):
+                        if msg['id'] in seen_ids:
+                            continue
                         
+                        try:
+                            message = self.service.users().messages().get(
+                                userId='me',
+                                id=msg['id'],
+                                format='full'
+                            ).execute()
+                            
+                            # Extract key info
+                            email_data = self._extract_email_info(message)
+                            all_emails.append(email_data)
+                            seen_ids.add(msg['id'])
+                            
+                            if (i + 1) % 25 == 0:
+                                print(f"     Processed {i + 1}/{len(messages)}...")
+                                
+                        except HttpError as e:
+                            print(f"⚠️  Error fetching email {msg['id']}: {e}")
+                            continue
+                    
                 except HttpError as e:
-                    print(f"⚠️  Error fetching email {msg['id']}: {e}")
+                    print(f"⚠️  Error fetching {label_name}: {e}")
                     continue
             
-            print(f"✅ Successfully processed {len(emails)} emails")
-            return emails
+            # Sort all emails by date (newest first)
+            all_emails.sort(key=lambda e: e.get('date', ''), reverse=True)
+            
+            # Deduplicate by message ID, keeping first (newest)
+            seen_ids = set()
+            unique_emails = []
+            for email in all_emails:
+                msg_id = email.get('message_id', email.get('id', ''))
+                if msg_id not in seen_ids:
+                    unique_emails.append(email)
+                    seen_ids.add(msg_id)
+            
+            print(f"\n✅ Successfully processed {len(unique_emails)} unique emails")
+            return unique_emails
+            
+        except HttpError as e:
+            print(f"❌ Error fetching emails: {e}")
+            return []
+    
+    def fetch_comprehensive_history(self, max_results_per_source: int = 200, days_back: int = 365) -> List[Dict]:
+        """Fetch comprehensive email history across all major folders.
+        
+        This method fetches the maximum amount of email history for creating
+        rich memories. It pulls from:
+        - Inbox (personal communications)
+        - Sent (outgoing emails)  
+        - Important (marked important)
+        - Starred (starred messages)
+        - All Categories
+        
+        Args:
+            max_results_per_source: Maximum emails per folder (default: 200)
+            days_back: How far back to search (default: 365 = 1 year)
+            
+        Returns:
+            List of unique email dictionaries
+        """
+        if not self.service:
+            print("❌ Not connected to Gmail")
+            return []
+        
+        # Extended list of sources to fetch
+        sources = [
+            ('INBOX', 'inbox'),
+            ('SENT', 'sent'),
+            ('IMPORTANT', 'important'),
+            ('STARRED', 'starred'),
+            ('CATEGORY_PERSONAL', 'personal'),
+            ('CATEGORY_WORK', 'work'),
+            ('CATEGORY_SOCIAL', 'social'),
+            ('CATEGORY_UPDATES', 'updates'),
+        ]
+        
+        all_emails = []
+        seen_ids = set()
+        
+        try:
+            date_since = (datetime.now() - timedelta(days=days_back)).strftime('%Y/%m/%d')
+            
+            print(f"\n📬 Fetching comprehensive email history...")
+            print(f"   Max results per source: {max_results_per_source}")
+            print(f"   Days back: {days_back}")
+            print(f"   Sources: {[s[1] for s in sources]}")
+            
+            for label_id, label_name in sources:
+                try:
+                    print(f"\n  📂 Fetching from {label_name}...")
+                    
+                    query = f'after:{date_since}'
+                    # Use labelIds filter
+                    results = self.service.users().messages().list(
+                        userId='me',
+                        maxResults=max_results_per_source,
+                        q=query,
+                    ).execute()
+                    
+                    messages = results.get('messages', [])
+                    print(f"     Found {len(messages)} emails")
+                    
+                    # Fetch details (with batching for efficiency)
+                    batch_size = 25
+                    for i in range(0, len(messages), batch_size):
+                        batch = messages[i:i + batch_size]
+                        
+                        for msg in batch:
+                            if msg['id'] in seen_ids:
+                                continue
+                            
+                            try:
+                                message = self.service.users().messages().get(
+                                    userId='me',
+                                    id=msg['id'],
+                                    format='full'
+                                ).execute()
+                                
+                                email_data = self._extract_email_info(message)
+                                all_emails.append(email_data)
+                                seen_ids.add(msg['id'])
+                                
+                            except HttpError:
+                                continue
+                        
+                        if (i + batch_size) % 50 == 0:
+                            print(f"     Processed {min(i + batch_size, len(messages))}/{len(messages)}...")
+                    
+                except HttpError as e:
+                    print(f"⚠️  Error fetching {label_name}: {e}")
+                    continue
+            
+            # Sort by date
+            all_emails.sort(key=lambda e: e.get('date', ''), reverse=True)
+            
+            # Final deduplication
+            seen_msg_ids = set()
+            unique_emails = []
+            for email in all_emails:
+                msg_id = email.get('message_id', email.get('id', ''))
+                if msg_id and msg_id not in seen_msg_ids:
+                    unique_emails.append(email)
+                    seen_msg_ids.add(msg_id)
+            
+            print(f"\n✅ Total: {len(unique_emails)} unique emails fetched")
+            return unique_emails
             
         except HttpError as e:
             print(f"❌ Error fetching emails: {e}")
@@ -401,15 +518,33 @@ class GmailMemoryAssistant:
         # Get labels/categories
         labels = message.get('labelIds', [])
         
+        # Extract thread-related headers for conversation reconstruction
+        thread_id = message.get('threadId', '')
+        message_id = header_dict.get('message-id', '')
+        references = header_dict.get('references', '')
+        in_reply_to = header_dict.get('in-reply-to', '')
+        
+        # Extract additional meaningful headers
+        cc = header_dict.get('cc', '')
+        bcc = header_dict.get('bcc', '')
+        reply_to = header_dict.get('reply-to', '')
+        
         return {
             'id': message['id'],
+            'thread_id': thread_id,
             'subject': subject,
             'sender': sender,
             'to': to,
+            'cc': cc,
+            'bcc': bcc,
+            'reply_to': reply_to,
             'date': date,
             'body': body,
             'labels': labels,
-            'snippet': message.get('snippet', '')
+            'snippet': message.get('snippet', ''),
+            'message_id': message_id,
+            'references': references,
+            'in_reply_to': in_reply_to
         }
     
     def _extract_body(self, payload: Dict) -> str:
@@ -433,12 +568,129 @@ class GmailMemoryAssistant:
         
         return ''
     
+    def _build_email_thread_tree(self, emails: List[Dict]) -> Dict[str, Any]:
+        """
+        Build a tree structure of email threads from a list of emails.
+        Uses thread ID and References/In-Reply-To headers to reconstruct conversations.
+        """
+        from collections import defaultdict
+        
+        # Group emails by thread_id
+        thread_map = defaultdict(list)
+        for email in emails:
+            thread_id = email.get('thread_id', '')
+            if thread_id:
+                thread_map[thread_id].append(email)
+        
+        # Sort each thread by date
+        for thread_id in thread_map:
+            thread_map[thread_id].sort(key=lambda e: e.get('date', ''))
+        
+        # Build conversation trees for each thread
+        threads = {}
+        for thread_id, thread_emails in thread_map.items():
+            if len(thread_emails) > 1:
+                # This is a conversation thread - build tree structure
+                root_emails = []
+                replies = defaultdict(list)
+                
+                # Parse references to build parent-child relationships
+                for email in thread_emails:
+                    refs = email.get('references', '').split()
+                    in_reply_to = email.get('in_reply_to', '').strip('<>')
+                    
+                    # Find parent
+                    parent_found = False
+                    for ref in refs:
+                        ref = ref.strip('<>')
+                        if ref:
+                            for potential_parent in thread_emails:
+                                if potential_parent.get('message_id', '').strip('<>') == ref:
+                                    replies[potential_parent['id']].append(email)
+                                    parent_found = True
+                                    break
+                    
+                    if not parent_found:
+                        root_emails.append(email)
+                
+                # If no roots found by references, use first email as root
+                if not root_emails and thread_emails:
+                    root_emails = [thread_emails[0]]
+                    for email in thread_emails[1:]:
+                        replies[thread_emails[0]['id']].append(email)
+                
+                threads[thread_id] = {
+                    'emails': thread_emails,
+                    'root_emails': root_emails,
+                    'replies': dict(replies),
+                    'size': len(thread_emails)
+                }
+        
+        return threads
+    
+    def _format_thread_for_memory(self, thread: Dict, emails: List[Dict]) -> str:
+        """Format a thread of emails into a readable memory summary."""
+        if not thread or not emails:
+            return ""
+        
+        lines = []
+        root_emails = thread.get('root_emails', [])
+        replies = thread.get('replies', {})
+        
+        # Get conversation subject from first email
+        subject = emails[0].get('subject', '(No Subject)')
+        lines.append(f"📧 EMAIL CONVERSATION: {subject}")
+        lines.append(f"Thread size: {len(emails)} messages")
+        lines.append("")
+        
+        def format_email_tree(email, depth=0):
+            indent = "  " * depth
+            prefix = "└─ " if depth > 0 else ""
+            
+            sender = email.get('sender', 'Unknown')
+            date = email.get('date', '')
+            body = email.get('body', '')[:500]  # Limit body length
+            
+            # Extract first meaningful part of body
+            body_preview = body.split('\n')[0] if body else ''
+            
+            lines.append(f"{indent}{prefix}From: {sender}")
+            lines.append(f"{indent}{prefix}Date: {date}")
+            if body_preview:
+                lines.append(f"{indent}{prefix}Content: {body_preview}")
+            lines.append("")
+            
+            # Process replies
+            for reply in replies.get(email.get('id'), []):
+                format_email_tree(reply, depth + 1)
+        
+        # Format each root email and its replies
+        for root in root_emails:
+            format_email_tree(root)
+        
+        return "\n".join(lines)
+    
     def create_memories_from_emails(self, emails: List[Dict]) -> Dict[str, Any]:
-        """Create souvenirs from extracted email data."""
+        """Create souvenirs from extracted email data.
+        
+        Now uses the generic ThreadBuilder and LLMExtractor from SouvenirAssistant
+        to group related emails and extract meaningful information.
+        """
         if not emails:
             return {"ok": False, "error": "No emails to process"}
         
         print(f"\n📝 Creating memories from {len(emails)} emails...")
+        
+        # Use SouvenirAssistant's thread builder to group related emails
+        # This uses: thread_id, References/In-Reply-To, subject matching, and body similarity
+        print("🔍 Building email conversation threads...")
+        threads = self.souvenir_assistant.build_threads(
+            emails, 
+            use_subject_matching=True,
+            use_body_similarity=True
+        )
+        thread_count = sum(1 for t in threads.values() if t['size'] > 1)
+        print(f"   Found {thread_count} email conversations (threads with multiple messages)")
         
         memories_created = 0
         categories_map = {
@@ -456,7 +708,66 @@ class GmailMemoryAssistant:
             'CATEGORY_UPDATES': 'email_updates',
         }
         
+        # Track which emails have been processed as part of threads
+        processed_email_ids = set()
+        
+        # Process threads (conversations with multiple emails)
+        for thread_id, thread in threads.items():
+            if thread['size'] > 1:
+                thread_emails = thread['emails']
+                
+                # Use LLM to extract meaningful information from the conversation
+                conversation_info = self.souvenir_assistant.process_conversation_for_memory(thread_emails)
+                
+                # Format conversation for memory storage
+                thread_content = self._format_thread_for_memory(thread, thread_emails)
+                
+                # Get the main subject from the thread
+                subject = thread_emails[0].get('subject', 'Email Conversation')
+                
+                # Determine category based on labels from all emails in thread
+                category = 'email_conversation'
+                for email in thread_emails:
+                    for label in email.get('labels', []):
+                        if label in categories_map:
+                            category = categories_map[label]
+                            break
+                
+                # Use tags from LLM extraction, fallback to basic tags
+                tags = conversation_info.get("tags", ["conversation"])
+                
+                # Add labels from emails
+                for email in thread_emails:
+                    for label in email.get('labels', []):
+                        if label not in categories_map:
+                            tags.append(label.lower())
+                tags = list(set(tags))[:15]
+                
+                # Use LLM summary if available
+                memory_title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
+                if conversation_info.get("topic"):
+                    memory_title = f"📧 {conversation_info['topic'][:50]}"
+                
+                # Add thread memory
+                result = self.souvenir_assistant.add_souvenir(
+                    content=thread_content,
+                    title=memory_title,
+                    category=category,
+                    tags=tags
+                )
+                
+                if result.get('ok'):
+                    memories_created += 1
+                
+                # Mark emails as processed
+                for email in thread_emails:
+                    processed_email_ids.add(email['id'])
+        
+        # Process individual emails (not part of threads)
         for email in emails:
+            if email['id'] in processed_email_ids:
+                continue
+            
             # Determine category based on labels
             category = 'email_general'
             for label in email.get('labels', []):
@@ -464,22 +775,34 @@ class GmailMemoryAssistant:
                     category = categories_map[label]
                     break
             
-            # Extract key info for memory content
-            subject = email.get('subject', '')
-            sender = email.get('sender', '')
-            date = email.get('date', '')
-            snippet = email.get('snippet', '')
+            # Use LLM-based extraction from SouvenirAssistant
+            extracted_info = self.souvenir_assistant.process_email_for_memory(email)
             
-            # Create a concise memory content
-            memory_content = self._create_memory_content(email)
-            
-            # Extract tags from subject and sender
-            tags = self._extract_tags(email)
+            # Create memory content using extracted information
+            if extracted_info.get("ok"):
+                # Use LLM-generated summary
+                summary = extracted_info.get("summary", "")
+                sender = extracted_info.get("sender", email.get("sender", ""))
+                
+                memory_content = self._create_llm_memory_content(email, extracted_info)
+                tags = extracted_info.get("tags", [])
+                
+                # Add action items and dates from extraction
+                if extracted_info.get("action_items"):
+                    tags.append("action_required")
+                if extracted_info.get("dates"):
+                    tags.append("has_dates")
+                
+                tags = list(set(tags))[:15]
+            else:
+                # Fallback: use basic email info if LLM extraction fails
+                memory_content = self._create_basic_memory_content(email)
+                tags = self._create_basic_tags(email)
             
             # Add to souvenir assistant
             result = self.souvenir_assistant.add_souvenir(
                 content=memory_content,
-                title=f"Email: {subject[:50]}{'...' if len(subject) > 50 else ''}",
+                title=f"Email: {email.get('subject', '')[:50]}{'...' if len(email.get('subject', '')) > 50 else ''}",
                 category=category,
                 tags=tags
             )
@@ -491,29 +814,140 @@ class GmailMemoryAssistant:
             "ok": True,
             "memories_created": memories_created,
             "emails_processed": len(emails),
-            "message": f"Created {memories_created} memories from {len(emails)} emails"
+            "threads_processed": thread_count,
+            "message": f"Created {memories_created} memories from {len(emails)} emails ({thread_count} conversation threads)"
         }
     
-    def _create_memory_content(self, email: Dict) -> str:
-        """Create formatted memory content from email."""
-        subject = email.get('subject', '')
-        sender = email.get('sender', '')
-        date = email.get('date', '')
-        snippet = email.get('snippet', '')
+    def _create_llm_memory_content(self, email: Dict, extracted_info: Dict) -> str:
+        """Create memory content using LLM-extracted information.
         
-        # Create a summary
-        content = f"Email from {sender}"
-        if date:
-            content += f" on {date}"
-        content += f"\n\nSubject: {subject}"
+        Args:
+            email: The email dictionary
+            extracted_info: Information extracted by LLM (summary, topics, action_items, etc.)
+            
+        Returns:
+            Formatted memory content string
+        """
+        lines = []
         
-        if snippet:
-            content += f"\n\nPreview: {snippet}"
+        # Header
+        lines.append("📧 EMAIL")
         
-        return content
+        # Use LLM summary if available
+        if extracted_info.get("summary"):
+            lines.append("")
+            lines.append("📝 Summary:")
+            lines.append(extracted_info["summary"])
+        
+        # Sender and recipients
+        if extracted_info.get("sender"):
+            lines.append(f"From: {extracted_info['sender']}")
+        else:
+            lines.append(f"From: {email.get('sender', 'Unknown')}")
+        
+        if email.get("to"):
+            lines.append(f"To: {email.get('to')}")
+        
+        if email.get("date"):
+            lines.append(f"Date: {email.get('date')}")
+        
+        # Topics
+        topics = extracted_info.get("topics", [])
+        if topics:
+            lines.append("")
+            lines.append("🏷️  Topics:")
+            for topic in topics[:5]:
+                lines.append(f"  - {topic}")
+        
+        # Action items from LLM
+        action_items = extracted_info.get("action_items", [])
+        if action_items:
+            lines.append("")
+            lines.append("🎯 Action Items:")
+            for item in action_items[:5]:
+                lines.append(f"  - {item}")
+        
+        # Important dates from LLM
+        dates = extracted_info.get("dates", [])
+        if dates:
+            lines.append("")
+            lines.append("📅 Important Dates:")
+            for date in dates[:3]:
+                lines.append(f"  - {date}")
+        
+        # Entities
+        entities = extracted_info.get("entities", {})
+        if entities:
+            people = entities.get("people", [])
+            orgs = entities.get("organizations", [])
+            projects = entities.get("projects", [])
+            
+            if people or orgs or projects:
+                lines.append("")
+                lines.append("👥 Entities:")
+                for p in people[:3]:
+                    lines.append(f"  - Person: {p}")
+                for o in orgs[:3]:
+                    lines.append(f"  - Organization: {o}")
+                for pj in projects[:3]:
+                    lines.append(f"  - Project: {pj}")
+        
+        # Sentiment and urgency
+        sentiment = extracted_info.get("sentiment", "neutral")
+        urgency = extracted_info.get("urgency", "medium")
+        if sentiment != "neutral" or urgency != "medium":
+            lines.append("")
+            lines.append(f"💭 Sentiment: {sentiment} | Urgency: {urgency}")
+        
+        # Original body snippet
+        body = email.get("body", "")
+        if body:
+            lines.append("")
+            lines.append("--- Original Content ---")
+            lines.append(body[:1000])
+        
+        return "\n".join(lines)
     
-    def _extract_tags(self, email: Dict) -> List[str]:
-        """Extract relevant tags from email."""
+    def _create_basic_memory_content(self, email: Dict) -> str:
+        """Create basic memory content from email (fallback when LLM unavailable).
+        
+        Args:
+            email: The email dictionary
+            
+        Returns:
+            Formatted memory content string
+        """
+        lines = []
+        
+        lines.append("📧 EMAIL")
+        
+        if email.get("sender"):
+            lines.append(f"From: {email['sender']}")
+        if email.get("to"):
+            lines.append(f"To: {email['to']}")
+        if email.get("date"):
+            lines.append(f"Date: {email['date']}")
+        
+        if email.get("subject"):
+            lines.append(f"Subject: {email['subject']}")
+        
+        body = email.get("body", "")
+        if body:
+            lines.append("")
+            lines.append("Content:")
+            lines.append(body[:2000])
+        
+        return "\n".join(lines)
+    
+    def _create_basic_tags(self, email: Dict) -> List[str]:
+        """Create basic tags from email (fallback when LLM unavailable).
+        
+        Args:
+            email: The email dictionary
+            
+        Returns:
+            List of tags
+        """
         tags = []
         
         # Add sender domain as tag
@@ -532,12 +966,81 @@ class GmailMemoryAssistant:
             if label.startswith('CATEGORY_'):
                 tags.append(label.replace('CATEGORY_', '').lower())
         
-        # Add subject keywords as tags (first 3 words)
-        subject = email.get('subject', '').lower()
-        words = [w for w in subject.split() if len(w) > 3][:3]
-        tags.extend(words)
+        return list(set(tags))[:10]
+    
+    def analyze_email_memories(self) -> Dict[str, Any]:
+        """Analyze all email memories to extract high-level insights.
         
-        return list(set(tags))[:10]  # Limit to 10 tags
+        Now uses LLM-based analysis from SouvenirAssistant instead of hard-coded patterns.
+        
+        Returns:
+            Dictionary containing analysis results
+        """
+        print("\n🔍 Analyzing email memories with LLM...")
+        
+        # Use LLM-based insights extraction
+        result = self.souvenir_assistant.extract_insights_from_memories(
+            category_filter='email',
+            limit=100
+        )
+        
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": result.get("error", "Failed to analyze memories")
+            }
+        
+        insights = result.get("insights", {})
+        
+        return {
+            "ok": True,
+            "analysis": {
+                "total_memories_analyzed": result.get("memories_analyzed", 0),
+                "key_themes": insights.get("key_themes", []),
+                "important_contacts": insights.get("important_contacts", []),
+                "pending_actions": insights.get("pending_actions", []),
+                "upcoming_events": insights.get("upcoming_events", []),
+                "summary": insights.get("summary", "")
+            }
+        }
+    
+    def answer_email_question(self, question: str) -> Dict[str, Any]:
+        """Answer high-level questions about email memories using LLM.
+        
+        Uses LLM-based analysis from SouvenirAssistant.
+        
+        Examples:
+        - "Which person sends me the most emails?"
+        - "Which companies send me emails?"
+        - "What pending appointments do I have?"
+        - "What action items are there?"
+        
+        Args:
+            question: Natural language question about emails
+            
+        Returns:
+            Answer dictionary with results
+        """
+        print(f"\n🔍 Answering: {question}")
+        
+        # Use LLM-based analysis from SouvenirAssistant
+        result = self.souvenir_assistant.analyze_memories(
+            question=question,
+            category_filter='email',
+            limit=50
+        )
+        
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": result.get("error", "Failed to answer question")
+            }
+        
+        return {
+            "ok": True,
+            "answer": result.get("answer", ""),
+            "sources": result.get("sources", [])
+        }
     
     def browse_emails_interactive(self) -> List[Dict]:
         """Browse and select emails interactively."""
@@ -688,13 +1191,15 @@ class GmailMemoryAssistant:
             print("📋 Menu")
             print("="*60)
             print("  1. Browse and select emails to save")
-            print("  2. Fetch recent emails (last 30 days)")
-            print("  3. Search emails and save")
-            print("  4. View current memories")
-            print("  5. Ask about memories")
-            print("  6. Quit")
+            print("  2. Fetch recent emails (last 90 days, 200 emails)")
+            print("  3. Fetch comprehensive history (1 year, all folders)")
+            print("  4. Search emails and save")
+            print("  5. View current memories")
+            print("  6. Ask about memories")
+            print("  7. Analyze email insights (who sends emails, companies, appointments, etc.)")
+            print("  8. Quit")
             
-            choice = input("\nEnter choice (1-6): ").strip()
+            choice = input("\nEnter choice (1-8): ").strip()
             
             if choice == "1":
                 # Browse and select
@@ -704,8 +1209,8 @@ class GmailMemoryAssistant:
                     print(f"\n✅ {result.get('message', 'Done')}")
             
             elif choice == "2":
-                # Fetch recent emails
-                emails = self.fetch_recent_emails(max_results=50, days_back=30)
+                # Fetch recent emails (new improved method)
+                emails = self.fetch_recent_emails(max_results=200, days_back=90)
                 if emails:
                     # Ask if user wants to save all or select
                     print(f"\n📧 Found {len(emails)} recent emails")
@@ -715,13 +1220,31 @@ class GmailMemoryAssistant:
                         print(f"\n✅ {result.get('message', 'Done')}")
             
             elif choice == "3":
+                # Fetch comprehensive history (new option)
+                print("\n📬 This will fetch emails from all your Gmail folders")
+                print("   (Inbox, Sent, Important, Starred, Categories)")
+                print("   Going back up to 1 year...")
+                confirm = input("Continue? (y/n): ").strip().lower()
+                if confirm == 'y':
+                    emails = self.fetch_comprehensive_history(
+                        max_results_per_source=200, 
+                        days_back=365
+                    )
+                    if emails:
+                        print(f"\n📧 Found {len(emails)} unique emails")
+                        save_choice = input("Save all as memories? (y/n): ").strip().lower()
+                        if save_choice == 'y':
+                            result = self.create_memories_from_emails(emails)
+                            print(f"\n✅ {result.get('message', 'Done')}")
+            
+            elif choice == "4":
                 # Search and save
                 selected_emails = self.browse_emails_interactive()
                 if selected_emails:
                     result = self.create_memories_from_emails(selected_emails)
                     print(f"\n✅ {result.get('message', 'Done')}")
             
-            elif choice == "4":
+            elif choice == "5":
                 # View memories
                 souvenirs = self.souvenir_assistant.list_souvenirs(limit=20)
                 print(f"\n📋 Stored Memories ({len(souvenirs)}):\n")
@@ -731,8 +1254,8 @@ class GmailMemoryAssistant:
                     print(f"   🏷️  {', '.join(s.get('tags', []))}")
                     print()
             
-            elif choice == "5":
-                # Ask about memories
+            elif choice == "6":
+                # Ask about memories (general)
                 question = input("\n❓ Ask a question about your memories: ").strip()
                 if question:
                     result = self.souvenir_assistant.ask_about_souvenirs(question)
@@ -741,7 +1264,26 @@ class GmailMemoryAssistant:
                         if result.get('sources'):
                             print(f"\n📚 Sources: {', '.join(result.get('sources', []))}")
             
-            elif choice == "6":
+            elif choice == "7":
+                # NEW: Analyze email insights
+                print("\n" + "="*60)
+                print("🔍 Email Insights Analysis")
+                print("="*60)
+                print("\nYou can ask questions like:")
+                print("  • 'Who sends me the most emails?'")
+                print("  • 'Which companies send me emails?'")
+                print("  • 'What pending action items do I have?'")
+                print("  • 'What appointments are scheduled?'")
+                print("  • 'What topics are most common?'")
+                print("  • 'Show me email statistics'")
+                
+                question = input("\n❓ Ask a question: ").strip()
+                if question:
+                    result = self.answer_email_question(question)
+                    if result.get('ok'):
+                        print(f"\n💡 {result.get('answer', 'No answer')}")
+            
+            elif choice == "8":
                 print("\n👋 Goodbye!")
                 break
             
@@ -767,22 +1309,56 @@ def main():
     parser.add_argument(
         "--quick",
         action="store_true",
-        help="Quick mode: fetch recent emails and create memories"
+        help="Quick mode: fetch recent emails (last 90 days, 200 emails) and create memories"
+    )
+    parser.add_argument(
+        "--comprehensive",
+        action="store_true",
+        help="Comprehensive mode: fetch 1 year of emails from all folders for maximum memory creation"
+    )
+    parser.add_argument(
+        "--max-results",
+        type=int,
+        default=200,
+        help="Maximum number of emails to fetch per source (default: 200)"
+    )
+    parser.add_argument(
+        "--days-back",
+        type=int,
+        default=90,
+        help="How many days back to fetch emails (default: 90)"
     )
     
     args = parser.parse_args()
     
     assistant = GmailMemoryAssistant(souvenir_db=args.db)
     
-    if args.quick:
-        # Quick mode: connect and fetch
+    if args.quick or args.comprehensive:
+        # Quick or comprehensive mode: connect and fetch
         assistant.credentials = assistant.get_credentials_interactive()
         if assistant.credentials:
             assistant.connect()
-            emails = assistant.fetch_recent_emails(max_results=30)
+            
+            if args.comprehensive:
+                # Fetch comprehensive history (1 year, all folders)
+                print("\n📬 Running comprehensive mode - fetching 1 year of email history...")
+                emails = assistant.fetch_comprehensive_history(
+                    max_results_per_source=args.max_results,
+                    days_back=365
+                )
+            else:
+                # Quick mode: fetch recent emails with better defaults
+                emails = assistant.fetch_recent_emails(
+                    max_results=args.max_results,
+                    days_back=args.days_back
+                )
+            
             if emails:
                 result = assistant.create_memories_from_emails(emails)
                 print(f"\n✅ {result.get('message', 'Done')}")
+            else:
+                print("No emails found to process")
+                
         assistant.souvenir_assistant.close()
     else:
         # Interactive mode

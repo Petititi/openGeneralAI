@@ -27,6 +27,484 @@ import configurator
 import litellm
 from storage.longterm_memory import LongTermMemory
 from storage.DatabaseManagement import DatabaseManager
+from typing import Optional, List, Dict, Any, Callable
+import re
+import json
+
+
+class LLMExtractor:
+    """Generic LLM-based information extractor for any text content.
+    
+    This class uses an LLM to extract structured, meaningful information from
+    unstructured text like emails, messages, or documents.
+    """
+    
+    def __init__(self, cfg: Optional[Any] = None):
+        """Initialize LLM extractor.
+        
+        Args:
+            cfg: Optional configuration object with 'model' attribute. 
+                 If not provided, uses default litellm settings.
+        """
+        self.cfg = cfg
+        self.model = cfg.model if cfg else "gpt-4o-mini"
+    
+    def extract(self, content: str, extraction_type: str = "general", 
+                custom_prompt: Optional[str] = None) -> Dict[str, Any]:
+        """Extract meaningful information from content using LLM.
+        
+        Args:
+            content: The text content to extract information from
+            extraction_type: Type of extraction ('general', 'email', 'conversation', 'meeting')
+            custom_prompt: Optional custom prompt for specialized extraction
+            
+        Returns:
+            Dictionary with extracted information fields
+        """
+        if not content or not content.strip():
+            return {"ok": False, "error": "Empty content"}
+        
+        # Build extraction prompt based on type
+        if custom_prompt:
+            prompt = custom_prompt
+        else:
+            prompt = self._build_extraction_prompt(content, extraction_type)
+        
+        try:
+            response = litellm.completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert information extraction assistant. Extract structured, meaningful information from the given content. Return valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = response.choices[0].message.content
+            
+            # Parse JSON response
+            try:
+                extracted = json.loads(result)
+                return {"ok": True, "data": extracted}
+            except json.JSONDecodeError:
+                # Try to extract JSON from the response
+                json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                if json_match:
+                    extracted = json.loads(json_match.group())
+                    return {"ok": True, "data": extracted}
+                return {"ok": False, "error": "Could not parse JSON from LLM response"}
+                
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    
+    def _build_extraction_prompt(self, content: str, extraction_type: str) -> str:
+        """Build extraction prompt based on type."""
+        
+        base_prompt = f"""Extract the following information from the content below:
+
+Content:
+---
+{content[:3000]}  # Limit content length
+---
+
+Return a JSON object with these fields:
+"""
+        
+        if extraction_type == "email":
+            prompt = base_prompt + """{
+    "summary": "2-3 sentence summary of the email purpose",
+    "sender": "email address or name of sender",
+    "recipients": ["list of recipients"],
+    "key_topics": ["list of main topics discussed"],
+    "action_items": ["any action items or requests mentioned"],
+    "important_dates": ["any dates or deadlines mentioned (YYYY-MM-DD format)"],
+    "entities": {"people": [], "organizations": [], "projects": []},
+    "sentiment": "positive, neutral, or negative",
+    "urgency": "high, medium, or low",
+    "category": "one word category like: work, personal, billing, meeting, newsletter, etc."
+}"""
+        elif extraction_type == "conversation":
+            prompt = base_prompt + """{
+    "topic": "main topic of the conversation",
+    "participants": ["list of participants"],
+    "key_points": ["main points discussed"],
+    "decisions": ["any decisions made"],
+    "action_items": ["tasks assigned or requested"],
+    "follow_ups": ["items that need follow-up"],
+    "sentiment": "overall tone of conversation"
+}"""
+        elif extraction_type == "meeting":
+            prompt = base_prompt + """{
+    "agenda": "meeting agenda or purpose",
+    "attendees": ["list of attendees"],
+    "decisions": ["decisions made"],
+    "action_items": [{"task": "task description", "owner": "person responsible", "due": "due date if mentioned"}],
+    "next_meeting": "next meeting date if mentioned",
+    "key_discussions": ["main discussion points"]
+}"""
+        else:  # general
+            prompt = base_prompt + """{
+    "summary": "brief summary of the content",
+    "main_topics": ["list of main topics"],
+    "key_points": ["important points to remember"],
+    "entities": {"people": [], "organizations": [], "locations": []},
+    "action_items": ["any tasks or actions mentioned"],
+    "dates_deadlines": ["important dates or deadlines"]
+}"""
+        
+        return prompt
+    
+    def extract_batch(self, contents: List[str], extraction_type: str = "general",
+                      progress_callback: Optional[Callable[[int, int], None]] = None) -> List[Dict[str, Any]]:
+        """Extract information from multiple contents.
+        
+        Args:
+            contents: List of text contents to process
+            extraction_type: Type of extraction
+            progress_callback: Optional callback(current, total) for progress
+            
+        Returns:
+            List of extraction results
+        """
+        results = []
+        total = len(contents)
+        
+        for i, content in enumerate(contents):
+            result = self.extract(content, extraction_type)
+            results.append(result)
+            
+            if progress_callback:
+                progress_callback(i + 1, total)
+        
+        return results
+
+
+class ThreadBuilder:
+    """Generic message thread builder that reconstructs conversations.
+    
+    Supports multiple strategies for linking messages:
+    - References/In-Reply-To headers (email)
+    - Subject line matching (Re:, Fwd:, etc.)
+    - Content similarity (body text appears in other messages)
+    """
+    
+    def __init__(self, id_field: str = "id", parent_id_field: str = "parent_id",
+                 date_field: str = "date", subject_field: str = "subject",
+                 body_field: str = "body", references_field: str = "references",
+                 in_reply_to_field: str = "in_reply_to", message_id_field: str = "message_id"):
+        """Initialize thread builder.
+        
+        Args:
+            id_field: Field name for message ID
+            parent_id_field: Field name for parent message ID
+            date_field: Field name for message date
+            subject_field: Field name for subject
+            body_field: Field name for message body
+            references_field: Field name for References header
+            in_reply_to_field: Field name for In-Reply-To header
+            message_id_field: Field name for Message-ID header
+        """
+        self.id_field = id_field
+        self.parent_id_field = parent_id_field
+        self.date_field = date_field
+        self.subject_field = subject_field
+        self.body_field = body_field
+        self.references_field = references_field
+        self.in_reply_to_field = in_reply_to_field
+        self.message_id_field = message_id_field
+    
+    def build_threads(self, messages: List[Dict], 
+                     use_subject_matching: bool = True,
+                     use_body_similarity: bool = True,
+                     similarity_threshold: float = 0.3) -> Dict[str, Dict]:
+        """Build thread structure from a list of messages.
+        
+        Args:
+            messages: List of message dictionaries
+            use_subject_matching: Whether to use subject matching for threading
+            use_body_similarity: Whether to detect quoted/forwarded content
+            similarity_threshold: Threshold for body similarity detection
+            
+        Returns:
+            Dictionary mapping thread_id -> thread data
+        """
+        if not messages:
+            return {}
+        
+        # First, group by thread_id (Gmail's thread ID for emails)
+        thread_map = self._group_by_thread_id(messages)
+        
+        # For messages without thread_id, try to link using other methods
+        unthreaded = [m for m in messages if not m.get('thread_id')]
+        
+        if use_subject_matching:
+            subject_threads = self._group_by_subject(unthreaded)
+            thread_map = self._merge_thread_maps(thread_map, subject_threads)
+            unthreaded = [m for m in messages 
+                         if not m.get('thread_id') and not m.get('_linked_by_subject')]
+        
+        if use_body_similarity and unthreaded:
+            body_threads = self._group_by_body_similarity(unthreaded, similarity_threshold)
+            thread_map = self._merge_thread_maps(thread_map, body_threads)
+        
+        # Now merge small threads (<=2 messages) that share subject or body content
+        thread_map = self._merge_small_threads(
+            thread_map, 
+            use_subject_matching=use_subject_matching,
+            use_body_similarity=use_body_similarity,
+            similarity_threshold=similarity_threshold
+        )
+        
+        # Sort messages within each thread by date
+        for thread_id in thread_map:
+            thread_map[thread_id]['emails'].sort(key=lambda m: m.get(self.date_field, ''))
+        
+        return thread_map
+    
+    def _merge_small_threads(self, thread_map: Dict[str, Dict],
+                            use_subject_matching: bool = True,
+                            use_body_similarity: bool = True,
+                            similarity_threshold: float = 0.3) -> Dict[str, Dict]:
+        """Merge small threads (<=2 messages) that share subject or body content.
+        
+        Args:
+            thread_map: Current thread mapping
+            use_subject_matching: Whether to use subject matching
+            use_body_similarity: Whether to use body similarity
+            similarity_threshold: Threshold for body similarity
+            
+        Returns:
+            Updated thread mapping with merged threads
+        """
+        # Find small threads (1 or 2 messages)
+        small_threads = []
+        for thread_id, thread_data in thread_map.items():
+            if thread_data.get('size', 0) <= 2:
+                small_threads.append((thread_id, thread_data))
+        
+        if not small_threads:
+            return thread_map
+        
+        # Collect all messages from small threads
+        all_small_messages = []
+        for thread_id, thread_data in small_threads:
+            all_small_messages.extend(thread_data.get('emails', []))
+        
+        # Remove small threads from map
+        for thread_id, _ in small_threads:
+            del thread_map[thread_id]
+        
+        # Re-group small messages using subject and body similarity
+        if all_small_messages:
+            # Group by subject first
+            if use_subject_matching:
+                subject_groups = self._group_by_subject(all_small_messages)
+                # Add these as threads
+                for thread_id, thread_data in subject_groups.items():
+                    thread_map[thread_id] = thread_data
+                
+                # Get remaining ungrouped messages
+                remaining = [m for m in all_small_messages 
+                           if not m.get('_linked_by_subject')]
+            else:
+                remaining = all_small_messages
+            
+            # Then group remaining by body similarity
+            if use_body_similarity and remaining:
+                body_groups = self._group_by_body_similarity(remaining, similarity_threshold)
+                for thread_id, thread_data in body_groups.items():
+                    thread_map[thread_id] = thread_data
+            
+            # Any remaining messages become single-message threads
+            used_ids = set()
+            for thread_data in thread_map.values():
+                for email in thread_data.get('emails', []):
+                    used_ids.add(email.get(self.id_field))
+            
+            for msg in remaining:
+                msg_id = msg.get(self.id_field)
+                if msg_id not in used_ids:
+                    thread_id = f"orphan_{msg_id}"
+                    thread_map[thread_id] = {
+                        'emails': [msg],
+                        'size': 1,
+                        'method': 'remaining'
+                    }
+                    used_ids.add(msg_id)
+        
+        return thread_map
+    
+    def _group_by_thread_id(self, messages: List[Dict]) -> Dict[str, Dict]:
+        """Group messages by native thread ID."""
+        from collections import defaultdict
+        
+        thread_map = defaultdict(list)
+        for msg in messages:
+            thread_id = msg.get('thread_id', '')
+            if thread_id:
+                thread_map[thread_id].append(msg)
+        
+        # Convert to proper format
+        threads = {}
+        for thread_id, msgs in thread_map.items():
+            threads[thread_id] = {
+                'emails': msgs,
+                'size': len(msgs),
+                'method': 'thread_id'
+            }
+        
+        return threads
+    
+    def _group_by_subject(self, messages: List[Dict]) -> Dict[str, Dict]:
+        """Group messages by subject line patterns (Re:, Fwd:, etc.)."""
+        from collections import defaultdict
+        
+        # Normalize subjects by removing Re:, Fwd:, etc.
+        def normalize_subject(subject: str) -> str:
+            if not subject:
+                return ""
+            # Remove common prefixes
+            normalized = re.sub(r'^(Re:|Fwd:|Re\[?\d*\]?:?)\s*', '', subject, flags=re.IGNORECASE)
+            return normalized.strip().lower()
+        
+        # Group by normalized subject
+        subject_map = defaultdict(list)
+        for msg in messages:
+            subject = msg.get(self.subject_field, '')
+            if subject:
+                normalized = normalize_subject(subject)
+                if normalized:
+                    subject_map[normalized].append(msg)
+        
+        # Filter to only subjects with multiple messages
+        threads = {}
+        for subject, msgs in subject_map.items():
+            if len(msgs) > 1:
+                # Create unique thread ID from subject
+                thread_id = f"subject_{hash(subject)}"
+                
+                # Build parent-child relationships
+                roots, replies = self._build_tree_from_references(msgs)
+                
+                threads[thread_id] = {
+                    'emails': msgs,
+                    'root_emails': roots,
+                    'replies': replies,
+                    'size': len(msgs),
+                    'method': 'subject'
+                }
+                
+                # Mark messages as linked
+                for m in msgs:
+                    m['_linked_by_subject'] = True
+        
+        return threads
+    
+    def _group_by_body_similarity(self, messages: List[Dict], 
+                                   threshold: float = 0.3) -> Dict[str, Dict]:
+        """Group messages by body text similarity (quoted/forwarded content)."""
+        from collections import defaultdict
+        
+        # Simple similarity: check if one message's body contains 
+        # significant portion of another message's body
+        threads = []
+        used = set()
+        
+        for i, msg in enumerate(messages):
+            if msg.get(self.id_field) in used:
+                continue
+            
+            body = msg.get(self.body_field, '')
+            if not body or len(body) < 50:
+                continue
+            
+            # Find similar messages
+            similar = [msg]
+            for j, other in enumerate(messages):
+                if i == j or other.get(self.id_field) in used:
+                    continue
+                
+                other_body = other.get(self.body_field, '')
+                if not other_body:
+                    continue
+                
+                # Check if one contains the other
+                if len(body) > 100 and len(other_body) > 100:
+                    # Simple containment check
+                    smaller, larger = (body, other_body) if len(body) < len(other_body) else (other_body, body)
+                    
+                    # Check for significant overlap (at least 30% of smaller)
+                    if smaller in larger or self._calculate_similarity(smaller, larger) > threshold:
+                        similar.append(other)
+            
+            if len(similar) > 1:
+                thread_id = f"body_sim_{msg.get(self.id_field, i)}"
+                threads.append({
+                    'id': thread_id,
+                    'emails': similar,
+                    'size': len(similar),
+                    'method': 'body_similarity'
+                })
+                for m in similar:
+                    used.add(m.get(self.id_field))
+        
+        # Convert to dict
+        return {t['id']: {k: v for k, v in t.items() if k != 'id'} for t in threads}
+    
+    def _calculate_similarity(self, text1: str, text2: str) -> float:
+        """Calculate simple similarity between two texts."""
+        # Tokenize and compute Jaccard similarity
+        def tokenize(text):
+            return set(text.lower().split())
+        
+        set1, set2 = tokenize(text1), tokenize(text2)
+        if not set1 or not set2:
+            return 0.0
+        
+        intersection = len(set1 & set2)
+        union = len(set1 | set2)
+        return intersection / union if union > 0 else 0.0
+    
+    def _build_tree_from_references(self, messages: List[Dict]) -> tuple:
+        """Build parent-child tree from References/In-Reply-To headers."""
+        from collections import defaultdict
+        
+        roots = []
+        replies = defaultdict(list)
+        
+        for msg in messages:
+            refs = msg.get(self.references_field, '').split()
+            in_reply_to = msg.get(self.in_reply_to_field, '').strip('<>')
+            
+            parent_found = False
+            for ref in refs:
+                ref = ref.strip('<>')
+                if ref:
+                    for potential_parent in messages:
+                        parent_msg_id = potential_parent.get(self.message_id_field, '').strip('<>')
+                        if parent_msg_id == ref:
+                            replies[potential_parent.get(self.id_field)].append(msg)
+                            parent_found = True
+                            break
+            
+            if not parent_found:
+                roots.append(msg)
+        
+        # If no roots found, use first message as root
+        if not roots and messages:
+            roots = [messages[0]]
+            for msg in messages[1:]:
+                replies[messages[0].get(self.id_field)].append(msg)
+        
+        return roots, dict(replies)
+    
+    def _merge_thread_maps(self, base: Dict, additional: Dict) -> Dict:
+        """Merge two thread maps."""
+        for thread_id, thread_data in additional.items():
+            if thread_id not in base:
+                base[thread_id] = thread_data
+        return base
 
 
 class SouvenirAssistant:
@@ -60,6 +538,345 @@ class SouvenirAssistant:
         
         if self.cfg.need_configuration:
             print("Warning: LLM not configured. Some features may not work.")
+        
+        # Initialize LLM extractor for rich information extraction
+        self.extractor = LLMExtractor(self.cfg)
+        
+        # Initialize thread builder for conversation reconstruction
+        self.thread_builder = ThreadBuilder()
+    
+    def extract_information(self, content: str, extraction_type: str = "general") -> Dict[str, Any]:
+        """Extract meaningful information from content using LLM.
+        
+        This method uses an LLM to intelligently extract structured information
+        from unstructured text like emails, messages, or documents.
+        
+        Args:
+            content: The text content to extract information from
+            extraction_type: Type of extraction ('general', 'email', 'conversation', 'meeting')
+            
+        Returns:
+            Dictionary with extracted information fields (summary, topics, entities, etc.)
+        """
+        return self.extractor.extract(content, extraction_type)
+    
+    def build_threads(self, messages: List[Dict], 
+                      use_subject_matching: bool = True,
+                      use_body_similarity: bool = True) -> Dict[str, Dict]:
+        """Build thread structure from a list of messages.
+        
+        Uses multiple strategies:
+        - Native thread ID (e.g., Gmail thread ID)
+        - Subject line matching (Re:, Fwd:, etc.)
+        - Body text similarity (quoted/forwarded content)
+        
+        Args:
+            messages: List of message dictionaries
+            use_subject_matching: Whether to use subject matching for threading
+            use_body_similarity: Whether to detect quoted/forwarded content
+            
+        Returns:
+            Dictionary mapping thread_id -> thread data with 'emails', 'size', etc.
+        """
+        return self.thread_builder.build_threads(
+            messages, 
+            use_subject_matching=use_subject_matching,
+            use_body_similarity=use_body_similarity
+        )
+    
+    def process_email_for_memory(self, email: Dict) -> Dict[str, Any]:
+        """Process an email and extract meaningful information using LLM.
+        
+        Args:
+            email: Dictionary with email fields (subject, body, sender, etc.)
+            
+        Returns:
+            Dictionary with extracted info: summary, topics, action_items, tags, etc.
+        """
+        # Build email content for extraction
+        email_content = self._format_email_for_extraction(email)
+        
+        # Use LLM to extract information
+        result = self.extractor.extract(email_content, extraction_type="email")
+        
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": result.get("error", "Extraction failed"),
+                "summary": email.get("snippet", "")[:200],
+                "tags": [],
+                "action_items": []
+            }
+        
+        data = result.get("data", {})
+        
+        # Build tags from extracted information
+        tags = []
+        tags.extend(data.get("key_topics", []))
+        
+        if data.get("action_items"):
+            tags.append("action_required")
+        
+        if data.get("urgency") == "high":
+            tags.append("urgent")
+        
+        category = data.get("category", "email")
+        if category:
+            tags.append(category)
+        
+        # Build action items
+        action_items = data.get("action_items", [])
+        
+        return {
+            "ok": True,
+            "summary": data.get("summary", ""),
+            "sender": data.get("sender", email.get("sender", "")),
+            "topics": data.get("key_topics", []),
+            "action_items": action_items,
+            "dates": data.get("important_dates", []),
+            "entities": data.get("entities", {}),
+            "sentiment": data.get("sentiment", "neutral"),
+            "urgency": data.get("urgency", "medium"),
+            "category": category,
+            "tags": list(set(tags))[:15]
+        }
+    
+    def process_conversation_for_memory(self, messages: List[Dict]) -> Dict[str, Any]:
+        """Process a conversation/thread and extract meaningful information using LLM.
+        
+        Args:
+            messages: List of message dictionaries in chronological order
+            
+        Returns:
+            Dictionary with extracted info: topic, participants, key_points, etc.
+        """
+        if not messages:
+            return {"ok": False, "error": "No messages provided"}
+        
+        # Build conversation content
+        conversation_content = self._format_conversation_for_extraction(messages)
+        
+        # Use LLM to extract information
+        result = self.extractor.extract(conversation_content, extraction_type="conversation")
+        
+        if not result.get("ok"):
+            return {
+                "ok": False,
+                "error": result.get("error", "Extraction failed"),
+                "topic": "",
+                "participants": [],
+                "key_points": [],
+                "tags": ["conversation"]
+            }
+        
+        data = result.get("data", {})
+        
+        # Build tags
+        tags = ["conversation"]
+        tags.extend(data.get("key_points", [])[:5])
+        
+        if data.get("action_items"):
+            tags.append("action_required")
+        
+        return {
+            "ok": True,
+            "topic": data.get("topic", ""),
+            "participants": data.get("participants", []),
+            "key_points": data.get("key_points", []),
+            "decisions": data.get("decisions", []),
+            "action_items": data.get("action_items", []),
+            "follow_ups": data.get("follow_ups", []),
+            "sentiment": data.get("sentiment", "neutral"),
+            "tags": list(set(tags))[:15]
+        }
+    
+    def _format_email_for_extraction(self, email: Dict) -> str:
+        """Format an email for LLM extraction."""
+        lines = []
+        
+        if email.get("subject"):
+            lines.append(f"Subject: {email['subject']}")
+        
+        if email.get("sender"):
+            lines.append(f"From: {email['sender']}")
+        
+        if email.get("to"):
+            lines.append(f"To: {email['to']}")
+        
+        if email.get("date"):
+            lines.append(f"Date: {email['date']}")
+        
+        lines.append("")
+        lines.append("Content:")
+        lines.append(email.get("body", "")[:3000])
+        
+        return "\n".join(lines)
+    
+    def _format_conversation_for_extraction(self, messages: List[Dict]) -> str:
+        """Format a conversation for LLM extraction."""
+        lines = []
+        
+        for i, msg in enumerate(messages):
+            lines.append(f"--- Message {i+1} ---")
+            
+            if msg.get("sender"):
+                lines.append(f"From: {msg['sender']}")
+            
+            if msg.get("date"):
+                lines.append(f"Date: {msg['date']}")
+            
+            if msg.get("subject"):
+                lines.append(f"Subject: {msg['subject']}")
+            
+            lines.append("")
+            lines.append(msg.get("body", "")[:1000])
+            lines.append("")
+        
+        return "\n".join(lines)
+    
+    def analyze_memories(self, question: str, category_filter: Optional[str] = None, 
+                        limit: int = 50) -> Dict[str, Any]:
+        """Analyze stored memories to answer high-level questions using LLM.
+        
+        This method retrieves relevant memories and uses LLM to analyze them
+        and answer questions about the stored information.
+        
+        Args:
+            question: The question to answer about the memories
+            category_filter: Optional category to filter memories
+            limit: Maximum number of memories to retrieve
+            
+        Returns:
+            Dictionary with answer and sources
+        """
+        # Get relevant memories
+        souvenirs = self.list_souvenirs(category=category_filter, limit=limit)
+        
+        if not souvenirs:
+            return {
+                "ok": True,
+                "answer": "No memories found to analyze.",
+                "sources": []
+            }
+        
+        # Format memories for LLM analysis
+        context = self._format_memories_for_analysis(souvenirs)
+        
+        # Build prompt for analysis
+        prompt = f"""Based on the following stored memories, answer this question: {question}
+
+Memories:
+---
+{context}
+---
+
+Provide a detailed answer based on the information available in these memories. If the information is not available, say so clearly.
+"""
+        
+        try:
+            response = litellm.completion(
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": "You are a helpful assistant that analyzes personal memories and emails. Answer questions based on the stored information. Be specific and reference the sources when possible."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.7
+            )
+            
+            answer = response.choices[0].message.content
+            
+            return {
+                "ok": True,
+                "answer": answer,
+                "sources": [s.get("id", "unknown") for s in souvenirs]
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+    
+    def _format_memories_for_analysis(self, souvenirs: List[Dict]) -> str:
+        """Format memories for LLM analysis."""
+        lines = []
+        
+        for i, s in enumerate(souvenirs):
+            lines.append(f"--- Memory {i+1} ---")
+            lines.append(f"Title: {s.get('title', 'Untitled')}")
+            lines.append(f"Category: {s.get('category', 'general')}")
+            lines.append(f"Tags: {', '.join(s.get('tags', []))}")
+            lines.append(f"Content: {s.get('content', '')[:500]}")
+            lines.append("")
+        
+        return "\n".join(lines)
+    
+    def extract_insights_from_memories(self, category_filter: Optional[str] = None,
+                                        limit: int = 100) -> Dict[str, Any]:
+        """Extract high-level insights from stored memories using LLM.
+        
+        Analyzes memories to find:
+        - Common themes and topics
+        - Key contacts and their frequency
+        - Pending action items
+        - Upcoming events/dates
+        
+        Args:
+            category_filter: Optional category to filter memories
+            limit: Maximum number of memories to analyze
+            
+        Returns:
+            Dictionary with extracted insights
+        """
+        souvenirs = self.list_souvenirs(category=category_filter, limit=limit)
+        
+        if not souvenirs:
+            return {"ok": False, "error": "No memories found"}
+        
+        # Format memories
+        context = self._format_memories_for_analysis(souvenirs)
+        
+        prompt = f"""Analyze the following memories and extract high-level insights.
+
+Provide a JSON response with these fields:
+{{
+    "key_themes": ["list of main themes/topics found"],
+    "important_contacts": [{{"name": "name", "role": "role", "frequency": number}}],
+    "pending_actions": ["list of action items found"],
+    "upcoming_events": ["list of events/dates mentioned"],
+    "summary": "brief overall summary of what these memories reveal"
+}}
+
+Memories:
+---
+{context}
+---
+"""
+        
+        try:
+            response = litellm.completion(
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert at analyzing personal memories and communications. Extract meaningful insights and return structured JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = response.choices[0].message.content
+            
+            try:
+                insights = json.loads(result)
+                return {"ok": True, "insights": insights, "memories_analyzed": len(souvenirs)}
+            except json.JSONDecodeError:
+                json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                if json_match:
+                    insights = json.loads(json_match.group())
+                    return {"ok": True, "insights": insights, "memories_analyzed": len(souvenirs)}
+                return {"ok": False, "error": "Could not parse JSON from LLM response"}
+                
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
     
     def add_souvenir(self, content: str, title: Optional[str] = None, category: str = 'general', tags: Optional[List[str]] = None) -> Dict[str, Any]:
         """Add a new souvenir/memory to the storage."""
