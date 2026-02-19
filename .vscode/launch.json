@@ -13,6 +13,13 @@
       "justMyCode": false
     },
     {
+      "name": "Run gmail",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gmail_memory_assistant",
+      "justMyCode": false
+    },
+    {
       "name": "Python: Debug dernier test pytest",
       "type": "python",
       "request": "launch",

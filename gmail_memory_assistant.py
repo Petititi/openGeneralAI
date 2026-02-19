@@ -15,7 +15,7 @@ Usage:
 
 import os
 import sys
-import json
+import base64
 import pickle
 from pathlib import Path
 from datetime import datetime, timedelta
@@ -412,18 +412,6 @@ class GmailMemoryAssistant:
             print("❌ Not connected to Gmail")
             return []
         
-        # Extended list of sources to fetch
-        sources = [
-            ('INBOX', 'inbox'),
-            ('SENT', 'sent'),
-            ('IMPORTANT', 'important'),
-            ('STARRED', 'starred'),
-            ('CATEGORY_PERSONAL', 'personal'),
-            ('CATEGORY_WORK', 'work'),
-            ('CATEGORY_SOCIAL', 'social'),
-            ('CATEGORY_UPDATES', 'updates'),
-        ]
-        
         all_emails = []
         seen_ids = set()
         
@@ -433,52 +421,52 @@ class GmailMemoryAssistant:
             print(f"\n📬 Fetching comprehensive email history...")
             print(f"   Max results per source: {max_results_per_source}")
             print(f"   Days back: {days_back}")
-            print(f"   Sources: {[s[1] for s in sources]}")
             
-            for label_id, label_name in sources:
-                try:
-                    print(f"\n  📂 Fetching from {label_name}...")
+            try:
+                print(f"\n  📂 Fetching...")
+                
+                query = f'after:{date_since}'
+                # Use labelIds filter
+                results = self.service.users().messages().list(
+                    userId='me',
+                    maxResults=max_results_per_source,
+                    q=query,
+                ).execute()
+                
+                messages = results.get('messages', [])
+                print(f"     Found {len(messages)} emails")
+                
+                # Fetch details (with batching for efficiency)
+                batch_size = 25
+                for i in range(0, len(messages), batch_size):
+                    batch = messages[i:i + batch_size]
                     
-                    query = f'after:{date_since}'
-                    # Use labelIds filter
-                    results = self.service.users().messages().list(
-                        userId='me',
-                        maxResults=max_results_per_source,
-                        q=query,
-                    ).execute()
-                    
-                    messages = results.get('messages', [])
-                    print(f"     Found {len(messages)} emails")
-                    
-                    # Fetch details (with batching for efficiency)
-                    batch_size = 25
-                    for i in range(0, len(messages), batch_size):
-                        batch = messages[i:i + batch_size]
+                    for msg in batch:
+                        if msg['id'] in seen_ids:
+                            continue
                         
-                        for msg in batch:
-                            if msg['id'] in seen_ids:
-                                continue
+                        try:
+                            message = self.service.users().messages().get(
+                                userId='me',
+                                id=msg['id'],
+                                format='full'
+                            ).execute()
                             
-                            try:
-                                message = self.service.users().messages().get(
-                                    userId='me',
-                                    id=msg['id'],
-                                    format='full'
-                                ).execute()
-                                
-                                email_data = self._extract_email_info(message)
-                                all_emails.append(email_data)
-                                seen_ids.add(msg['id'])
-                                
-                            except HttpError:
-                                continue
-                        
-                        if (i + batch_size) % 50 == 0:
-                            print(f"     Processed {min(i + batch_size, len(messages))}/{len(messages)}...")
+                            email_data = self._extract_email_info(message)
+                            msg_body = email_data.get('body')
+                            assert len(msg_body) > 0
+                            all_emails.append(email_data)
+                            seen_ids.add(msg['id'])
+                            
+                        except HttpError:
+                            continue
                     
-                except HttpError as e:
-                    print(f"⚠️  Error fetching {label_name}: {e}")
-                    continue
+                    if (i + batch_size) % 50 == 0:
+                        print(f"     Processed {min(i + batch_size, len(messages))}/{len(messages)}...")
+                
+            except HttpError as e:
+                print(f"⚠️  Error fetching mails: {e}")
+                pass
             
             # Sort by date
             all_emails.sort(key=lambda e: e.get('date', ''), reverse=True)
@@ -546,27 +534,32 @@ class GmailMemoryAssistant:
             'references': references,
             'in_reply_to': in_reply_to
         }
-    
+    def _decode_data(self, data):
+        return base64.urlsafe_b64decode(data).decode('utf-8')
+
     def _extract_body(self, payload: Dict) -> str:
-        """Extract email body from payload."""
-        # Try to get body from parts
-        if 'parts' in payload:
-            for part in payload['parts']:
-                if part.get('mimeType') == 'text/plain':
-                    if 'data' in part.get('body', {}):
-                        import base64
-                        return base64.urlsafe_b64decode(
-                            part['body']['data']
-                        ).decode('utf-8', errors='ignore')
-        
-        # Try direct body
-        if 'body' in payload and 'data' in payload['body']:
-            import base64
-            return base64.urlsafe_b64decode(
-                payload['body']['data']
-            ).decode('utf-8', errors='ignore')
-        
-        return ''
+        def walk(parts):
+            for part in parts:
+                mime_type = part.get('mimeType')
+                
+                # priority to plain text:
+                if mime_type == 'text/plain':
+                    body = self._decode_data(part['body']['data'])
+                    if len(body) > 0:
+                        return body
+                
+                if mime_type == 'text/html':
+                    body = self._decode_data(part['body']['data'])
+                    if len(body) > 0:
+                        return body
+
+                if 'parts' in part:
+                    body = walk(part['parts'])
+                    if len(body) > 0:
+                        return body
+            return ""
+            
+        return walk([payload])
     
     def _build_email_thread_tree(self, emails: List[Dict]) -> Dict[str, Any]:
         """

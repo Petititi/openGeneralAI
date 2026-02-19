@@ -15,7 +15,9 @@ Usage:
 
 import argparse
 import sys
-import os
+from typing import List, Dict
+import hashlib
+from email_reply_parser import EmailReplyParser
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 import json
@@ -74,7 +76,7 @@ class LLMExtractor:
             response = litellm.completion(
                 model=self.model,
                 messages=[
-                    {"role": "system", "content": "You are an expert information extraction assistant. Extract structured, meaningful information from the given content. Return valid JSON only."},
+                    {"role": "system", "content": "You are an expert information extraction assistant. Extract structured, meaningful information from the given content. Return valid JSON only. Respect language of content."},
                     {"role": "user", "content": prompt}
                 ],
                 temperature=0.3,
@@ -101,59 +103,27 @@ class LLMExtractor:
     def _build_extraction_prompt(self, content: str, extraction_type: str) -> str:
         """Build extraction prompt based on type."""
         
-        base_prompt = f"""Extract the following information from the content below:
-
+        base_prompt = f"""
 Content:
 ---
-{content[:3000]}  # Limit content length
+{content[:3000]}
 ---
 
 Return a JSON object with these fields:
 """
-        
-        if extraction_type == "email":
-            prompt = base_prompt + """{
-    "summary": "2-3 sentence summary of the email purpose",
-    "sender": "email address or name of sender",
-    "recipients": ["list of recipients"],
-    "key_topics": ["list of main topics discussed"],
-    "action_items": ["any action items or requests mentioned"],
-    "important_dates": ["any dates or deadlines mentioned (YYYY-MM-DD format)"],
-    "entities": {"people": [], "organizations": [], "projects": []},
+        base_prompt = base_prompt + """
+{
+    "summary": "2-3 sentence summary of the content, same language as content",
+    "participants": ["list of participants"],
+    "entities": {"people": [], "organizations": [], "locations": []},
+    "key_points": ["main points discussed"],
+    "action_items": ["any tasks or actions mentioned"],
+    "important_dates": ["any dates or deadlines mentioned (DD-MM-YYYY hh:mm format)"],
     "sentiment": "positive, neutral, or negative",
     "urgency": "high, medium, or low",
-    "category": "one word category like: work, personal, billing, meeting, newsletter, etc."
+    "follow_ups": ["items that need follow-up"]
 }"""
-        elif extraction_type == "conversation":
-            prompt = base_prompt + """{
-    "topic": "main topic of the conversation",
-    "participants": ["list of participants"],
-    "key_points": ["main points discussed"],
-    "decisions": ["any decisions made"],
-    "action_items": ["tasks assigned or requested"],
-    "follow_ups": ["items that need follow-up"],
-    "sentiment": "overall tone of conversation"
-}"""
-        elif extraction_type == "meeting":
-            prompt = base_prompt + """{
-    "agenda": "meeting agenda or purpose",
-    "attendees": ["list of attendees"],
-    "decisions": ["decisions made"],
-    "action_items": [{"task": "task description", "owner": "person responsible", "due": "due date if mentioned"}],
-    "next_meeting": "next meeting date if mentioned",
-    "key_discussions": ["main discussion points"]
-}"""
-        else:  # general
-            prompt = base_prompt + """{
-    "summary": "brief summary of the content",
-    "main_topics": ["list of main topics"],
-    "key_points": ["important points to remember"],
-    "entities": {"people": [], "organizations": [], "locations": []},
-    "action_items": ["any tasks or actions mentioned"],
-    "dates_deadlines": ["important dates or deadlines"]
-}"""
-        
-        return prompt
+        return base_prompt
     
     def extract_batch(self, contents: List[str], extraction_type: str = "general",
                       progress_callback: Optional[Callable[[int, int], None]] = None) -> List[Dict[str, Any]]:
@@ -236,18 +206,6 @@ class ThreadBuilder:
         thread_map = self._group_by_thread_id(messages)
         
         # For messages without thread_id, try to link using other methods
-        unthreaded = [m for m in messages if not m.get('thread_id')]
-        
-        if use_subject_matching:
-            subject_threads = self._group_by_subject(unthreaded)
-            thread_map = self._merge_thread_maps(thread_map, subject_threads)
-            unthreaded = [m for m in messages 
-                         if not m.get('thread_id') and not m.get('_linked_by_subject')]
-        
-        if use_body_similarity and unthreaded:
-            body_threads = self._group_by_body_similarity(unthreaded, similarity_threshold)
-            thread_map = self._merge_thread_maps(thread_map, body_threads)
-        
         # Now merge small threads (<=2 messages) that share subject or body content
         thread_map = self._merge_small_threads(
             thread_map, 
@@ -584,63 +542,6 @@ class SouvenirAssistant:
             use_body_similarity=use_body_similarity
         )
     
-    def process_email_for_memory(self, email: Dict) -> Dict[str, Any]:
-        """Process an email and extract meaningful information using LLM.
-        
-        Args:
-            email: Dictionary with email fields (subject, body, sender, etc.)
-            
-        Returns:
-            Dictionary with extracted info: summary, topics, action_items, tags, etc.
-        """
-        # Build email content for extraction
-        email_content = self._format_email_for_extraction(email)
-        
-        # Use LLM to extract information
-        result = self.extractor.extract(email_content, extraction_type="email")
-        
-        if not result.get("ok"):
-            return {
-                "ok": False,
-                "error": result.get("error", "Extraction failed"),
-                "summary": email.get("snippet", "")[:200],
-                "tags": [],
-                "action_items": []
-            }
-        
-        data = result.get("data", {})
-        
-        # Build tags from extracted information
-        tags = []
-        tags.extend(data.get("key_topics", []))
-        
-        if data.get("action_items"):
-            tags.append("action_required")
-        
-        if data.get("urgency") == "high":
-            tags.append("urgent")
-        
-        category = data.get("category", "email")
-        if category:
-            tags.append(category)
-        
-        # Build action items
-        action_items = data.get("action_items", [])
-        
-        return {
-            "ok": True,
-            "summary": data.get("summary", ""),
-            "sender": data.get("sender", email.get("sender", "")),
-            "topics": data.get("key_topics", []),
-            "action_items": action_items,
-            "dates": data.get("important_dates", []),
-            "entities": data.get("entities", {}),
-            "sentiment": data.get("sentiment", "neutral"),
-            "urgency": data.get("urgency", "medium"),
-            "category": category,
-            "tags": list(set(tags))[:15]
-        }
-    
     def process_conversation_for_memory(self, messages: List[Dict]) -> Dict[str, Any]:
         """Process a conversation/thread and extract meaningful information using LLM.
         
@@ -680,13 +581,15 @@ class SouvenirAssistant:
         
         return {
             "ok": True,
-            "topic": data.get("topic", ""),
+            "topic": data.get("summary", ""),
             "participants": data.get("participants", []),
+            "entities": data.get("entities", {'people':[], 'organizations':[], 'locations':[]}),
             "key_points": data.get("key_points", []),
-            "decisions": data.get("decisions", []),
             "action_items": data.get("action_items", []),
+            "important_dates": data.get("important_dates", []),
             "follow_ups": data.get("follow_ups", []),
             "sentiment": data.get("sentiment", "neutral"),
+            "urgency": data.get("urgency", ""),
             "tags": list(set(tags))[:15]
         }
     
@@ -712,7 +615,70 @@ class SouvenirAssistant:
         
         return "\n".join(lines)
     
+    def _strip_quoted_text(self, body: str) -> str:
+        return EmailReplyParser.parse_reply(body)
+
+    def _split_into_paragraphs(self, text: str) -> List[str]:
+        """
+        Split text into meaningful paragraphs.
+        """
+        paragraphs = re.split(r"\n\s*\n", text)
+        return [p.strip() for p in paragraphs if p.strip()]
+
+    def _hash_paragraph(self, text: str) -> str:
+        """
+        Generate stable hash for a paragraph (normalized).
+        """
+        normalized = re.sub(r"\s+", " ", text.strip().lower())
+        return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
+
     def _format_conversation_for_extraction(self, messages: List[Dict]) -> str:
+        """
+        Format conversation for LLM extraction.
+        Deduplicate content at paragraph level instead of message level.
+        """
+        lines = []
+        seen_paragraph_hashes = set()
+
+        for i, msg in enumerate(messages):
+            raw_body = msg.get("body", "")
+            clean_body = self._strip_quoted_text(raw_body)
+
+            paragraphs = self._split_into_paragraphs(clean_body)
+            new_paragraphs = []
+            old_messages = False
+            for paragraph in paragraphs:
+                p_hash = self._hash_paragraph(paragraph)
+
+                if p_hash not in seen_paragraph_hashes:
+                    seen_paragraph_hashes.add(p_hash)
+                    new_paragraphs.append(paragraph)
+                else:
+                    old_messages = True
+                    break
+
+
+            if not new_paragraphs:
+                continue
+
+            lines.append(f"--- Message {i+1} ---")
+
+            if msg.get("sender"):
+                lines.append(f"From: {msg['sender']}")
+
+            if msg.get("date"):
+                lines.append(f"Date: {msg['date']}")
+
+            if msg.get("subject"):
+                lines.append(f"Subject: {msg['subject']}")
+
+            lines.append("")
+            lines.append("\n\n".join(new_paragraphs)[:1000])
+            lines.append("")
+
+        return "\n".join(lines)
+
+    def _format_conversation_for_extraction_legacy(self, messages: List[Dict]) -> str:
         """Format a conversation for LLM extraction."""
         lines = []
         
