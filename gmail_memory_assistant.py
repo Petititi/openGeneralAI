@@ -666,8 +666,8 @@ class GmailMemoryAssistant:
     def create_memories_from_emails(self, emails: List[Dict]) -> Dict[str, Any]:
         """Create souvenirs from extracted email data.
         
-        Now uses the generic ThreadBuilder and LLMExtractor from SouvenirAssistant
-        to group related emails and extract meaningful information.
+        Only processes email threads (conversations with multiple messages).
+        Uses conversation_info from LLM extraction to build rich memory content.
         """
         if not emails:
             return {"ok": False, "error": "No emails to process"}
@@ -675,15 +675,25 @@ class GmailMemoryAssistant:
         print(f"\n📝 Creating memories from {len(emails)} emails...")
         
         # Use SouvenirAssistant's thread builder to group related emails
-        # This uses: thread_id, References/In-Reply-To, subject matching, and body similarity
         print("🔍 Building email conversation threads...")
         threads = self.souvenir_assistant.build_threads(
             emails, 
             use_subject_matching=True,
             use_body_similarity=True
         )
+        
+        # Only count threads with more than 1 email
         thread_count = sum(1 for t in threads.values() if t['size'] > 1)
         print(f"   Found {thread_count} email conversations (threads with multiple messages)")
+        
+        if thread_count == 0:
+            return {
+                "ok": True,
+                "memories_created": 0,
+                "emails_processed": len(emails),
+                "threads_processed": 0,
+                "message": f"No conversation threads found. Need threads with multiple messages to create memories."
+            }
         
         memories_created = 0
         categories_map = {
@@ -701,101 +711,45 @@ class GmailMemoryAssistant:
             'CATEGORY_UPDATES': 'email_updates',
         }
         
-        # Track which emails have been processed as part of threads
-        processed_email_ids = set()
-        
-        # Process threads (conversations with multiple emails)
+        # Process only threads (conversations with multiple emails)
         for thread_id, thread in threads.items():
-            if thread['size'] > 1:
-                thread_emails = thread['emails']
+            if thread['size'] <= 1:
+                continue  # Skip individual emails
                 
-                # Use LLM to extract meaningful information from the conversation
-                conversation_info = self.souvenir_assistant.process_conversation_for_memory(thread_emails)
-                
-                # Format conversation for memory storage
-                thread_content = self._format_thread_for_memory(thread, thread_emails)
-                
-                # Get the main subject from the thread
-                subject = thread_emails[0].get('subject', 'Email Conversation')
-                
-                # Determine category based on labels from all emails in thread
-                category = 'email_conversation'
-                for email in thread_emails:
-                    for label in email.get('labels', []):
-                        if label in categories_map:
-                            category = categories_map[label]
-                            break
-                
-                # Use tags from LLM extraction, fallback to basic tags
-                tags = conversation_info.get("tags", ["conversation"])
-                
-                # Add labels from emails
-                for email in thread_emails:
-                    for label in email.get('labels', []):
-                        if label not in categories_map:
-                            tags.append(label.lower())
-                tags = list(set(tags))[:15]
-                
-                # Use LLM summary if available
-                memory_title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
-                if conversation_info.get("topic"):
-                    memory_title = f"📧 {conversation_info['topic'][:50]}"
-                
-                # Add thread memory
-                result = self.souvenir_assistant.add_souvenir(
-                    content=thread_content,
-                    title=memory_title,
-                    category=category,
-                    tags=tags
-                )
-                
-                if result.get('ok'):
-                    memories_created += 1
-                
-                # Mark emails as processed
-                for email in thread_emails:
-                    processed_email_ids.add(email['id'])
-        
-        # Process individual emails (not part of threads)
-        for email in emails:
-            if email['id'] in processed_email_ids:
-                continue
+            thread_emails = thread['emails']
             
-            # Determine category based on labels
-            category = 'email_general'
-            for label in email.get('labels', []):
-                if label in categories_map:
-                    category = categories_map[label]
-                    break
+            # Use LLM to extract meaningful information from the conversation
+            conversation_info = self.souvenir_assistant.process_conversation_for_memory(thread_emails)
             
-            # Use LLM-based extraction from SouvenirAssistant
-            extracted_info = self.souvenir_assistant.process_email_for_memory(email)
+            # Determine category based on labels from all emails in thread
+            category = 'email_conversation'
+            for email in thread_emails:
+                for label in email.get('labels', []):
+                    if label in categories_map:
+                        category = categories_map[label]
+                        break
             
-            # Create memory content using extracted information
-            if extracted_info.get("ok"):
-                # Use LLM-generated summary
-                summary = extracted_info.get("summary", "")
-                sender = extracted_info.get("sender", email.get("sender", ""))
-                
-                memory_content = self._create_llm_memory_content(email, extracted_info)
-                tags = extracted_info.get("tags", [])
-                
-                # Add action items and dates from extraction
-                if extracted_info.get("action_items"):
-                    tags.append("action_required")
-                if extracted_info.get("dates"):
-                    tags.append("has_dates")
-                
-                tags = list(set(tags))[:15]
-            else:
-                # Fallback: use basic email info if LLM extraction fails
-                memory_content = self._create_basic_memory_content(email)
-                tags = self._create_basic_tags(email)
+            # Use tags from LLM extraction, add labels
+            tags = conversation_info.get("tags", ["conversation"])
+            for email in thread_emails:
+                for label in email.get('labels', []):
+                    if label not in categories_map:
+                        tags.append(label.lower())
+            tags = list(set(tags))[:15]
             
-            # Add to souvenir assistant
+            # Use LLM topic for title
+            subject = thread_emails[0].get('subject', 'Email Conversation')
+            memory_title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
+            if conversation_info.get("topic"):
+                memory_title = f"📧 {conversation_info['topic'][:50]}"
+            
+            # Build memory content from conversation_info
+            memory_content = self._create_conversation_memory_content(thread_emails, conversation_info)
+            
+            # Add thread memory
             result = self.souvenir_assistant.add_souvenir(
                 content=memory_content,
-                title=f"Email: {email.get('subject', '')[:50]}{'...' if len(email.get('subject', '')) > 50 else ''}",
+                title=memory_title,
                 category=category,
                 tags=tags
             )
@@ -810,6 +764,220 @@ class GmailMemoryAssistant:
             "threads_processed": thread_count,
             "message": f"Created {memories_created} memories from {len(emails)} emails ({thread_count} conversation threads)"
         }
+    
+    def _create_conversation_memory_content(self, thread_emails: List[Dict], conversation_info: Dict) -> str:
+        """Create memory content from conversation_info extracted by LLM.
+        
+        Args:
+            thread_emails: List of email dictionaries in the thread
+            conversation_info: Information extracted by LLM
+            
+        Returns:
+            Formatted memory content string
+        """
+        lines = []
+        
+        # Header
+        lines.append("📧 EMAIL CONVERSATION")
+        lines.append(f"Messages in thread: {len(thread_emails)}")
+        lines.append("")
+        
+        # Subject from first email
+        subject = thread_emails[0].get('subject', '(No Subject)')
+        lines.append(f"Subject: {subject}")
+        lines.append("")
+        
+        # LLM Summary
+        if conversation_info.get("topic"):
+            lines.append("📝 Summary:")
+            lines.append(conversation_info["topic"])
+            lines.append("")
+        
+        # Participants from LLM
+        participants = conversation_info.get("participants", [])
+        if participants:
+            lines.append("👥 Participants:")
+            for p in participants:
+                lines.append(f"  - {p}")
+            lines.append("")
+        
+        # Key points from LLM
+        key_points = conversation_info.get("key_points", [])
+        if key_points:
+            lines.append("💡 Key Points:")
+            for point in key_points:
+                lines.append(f"  - {point}")
+            lines.append("")
+        
+        # Action items from LLM
+        action_items = conversation_info.get("action_items", [])
+        if action_items:
+            lines.append("🎯 Action Items:")
+            for item in action_items:
+                lines.append(f"  - {item}")
+            lines.append("")
+        
+        # Important dates from LLM
+        important_dates = conversation_info.get("important_dates", [])
+        if important_dates:
+            lines.append("📅 Important Dates:")
+            for date in important_dates:
+                lines.append(f"  - {date}")
+            lines.append("")
+        
+        # Follow-ups from LLM
+        follow_ups = conversation_info.get("follow_ups", [])
+        if follow_ups:
+            lines.append("🔄 Follow-ups:")
+            for follow_up in follow_ups:
+                lines.append(f"  - {follow_up}")
+            lines.append("")
+        
+        # Entities from LLM
+        entities = conversation_info.get("entities", {})
+        if entities:
+            people = entities.get("people", [])
+            orgs = entities.get("organizations", [])
+            locations = entities.get("locations", [])
+            
+            if people or orgs or locations:
+                lines.append("🏢 Entities:")
+                for p in people[:5]:
+                    lines.append(f"  - Person: {p}")
+                for o in orgs[:5]:
+                    lines.append(f"  - Organization: {o}")
+                for loc in locations[:5]:
+                    lines.append(f"  - Location: {loc}")
+                lines.append("")
+        
+        # Sentiment and urgency
+        sentiment = conversation_info.get("sentiment", "neutral")
+        urgency = conversation_info.get("urgency", "")
+        if sentiment != "neutral" or urgency:
+            lines.append(f"💭 Sentiment: {sentiment}")
+            if urgency:
+                lines.append(f"⚡ Urgency: {urgency}")
+            lines.append("")
+        
+        # Original email details
+        lines.append("--- Email Details ---")
+        for i, email in enumerate(thread_emails[:5], 1):  # Show first 5 messages
+            lines.append(f"\nMessage {i}:")
+            lines.append(f"  From: {email.get('sender', 'Unknown')}")
+            lines.append(f"  Date: {email.get('date', 'Unknown')}")
+            body = email.get('body', '')
+            if body:
+                preview = body[:300].replace('\n', ' ')
+                lines.append(f"  Preview: {preview}...")
+        
+        return "\n".join(lines)
+    
+    def _create_conversation_memory_content(self, thread_emails: List[Dict], conversation_info: Dict) -> str:
+        """Create memory content from conversation_info extracted by LLM.
+        
+        Args:
+            thread_emails: List of email dictionaries in the thread
+            conversation_info: Information extracted by LLM
+            
+        Returns:
+            Formatted memory content string
+        """
+        lines = []
+        
+        # Header
+        lines.append("📧 EMAIL CONVERSATION")
+        lines.append(f"Messages in thread: {len(thread_emails)}")
+        lines.append("")
+        
+        # Subject from first email
+        subject = thread_emails[0].get('subject', '(No Subject)')
+        lines.append(f"Subject: {subject}")
+        lines.append("")
+        
+        # LLM Summary
+        if conversation_info.get("topic"):
+            lines.append("📝 Summary:")
+            lines.append(conversation_info["topic"])
+            lines.append("")
+        
+        # Participants from LLM
+        participants = conversation_info.get("participants", [])
+        if participants:
+            lines.append("👥 Participants:")
+            for p in participants:
+                lines.append(f"  - {p}")
+            lines.append("")
+        
+        # Key points from LLM
+        key_points = conversation_info.get("key_points", [])
+        if key_points:
+            lines.append("💡 Key Points:")
+            for point in key_points:
+                lines.append(f"  - {point}")
+            lines.append("")
+        
+        # Action items from LLM
+        action_items = conversation_info.get("action_items", [])
+        if action_items:
+            lines.append("🎯 Action Items:")
+            for item in action_items:
+                lines.append(f"  - {item}")
+            lines.append("")
+        
+        # Important dates from LLM
+        important_dates = conversation_info.get("important_dates", [])
+        if important_dates:
+            lines.append("📅 Important Dates:")
+            for date in important_dates:
+                lines.append(f"  - {date}")
+            lines.append("")
+        
+        # Follow-ups from LLM
+        follow_ups = conversation_info.get("follow_ups", [])
+        if follow_ups:
+            lines.append("🔄 Follow-ups:")
+            for follow_up in follow_ups:
+                lines.append(f"  - {follow_up}")
+            lines.append("")
+        
+        # Entities from LLM
+        entities = conversation_info.get("entities", {})
+        if entities:
+            people = entities.get("people", [])
+            orgs = entities.get("organizations", [])
+            locations = entities.get("locations", [])
+            
+            if people or orgs or locations:
+                lines.append("🏢 Entities:")
+                for p in people[:5]:
+                    lines.append(f"  - Person: {p}")
+                for o in orgs[:5]:
+                    lines.append(f"  - Organization: {o}")
+                for loc in locations[:5]:
+                    lines.append(f"  - Location: {loc}")
+                lines.append("")
+        
+        # Sentiment and urgency
+        sentiment = conversation_info.get("sentiment", "neutral")
+        urgency = conversation_info.get("urgency", "")
+        if sentiment != "neutral" or urgency:
+            lines.append(f"💭 Sentiment: {sentiment}")
+            if urgency:
+                lines.append(f"⚡ Urgency: {urgency}")
+            lines.append("")
+        
+        # Original email details
+        lines.append("--- Email Details ---")
+        for i, email in enumerate(thread_emails[:5], 1):
+            lines.append(f"\nMessage {i}:")
+            lines.append(f"  From: {email.get('sender', 'Unknown')}")
+            lines.append(f"  Date: {email.get('date', 'Unknown')}")
+            body = email.get('body', '')
+            if body:
+                preview = body[:300].replace('\n', ' ')
+                lines.append(f"  Preview: {preview}...")
+        
+        return "\n".join(lines)
     
     def _create_llm_memory_content(self, email: Dict, extracted_info: Dict) -> str:
         """Create memory content using LLM-extracted information.

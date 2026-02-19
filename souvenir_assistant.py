@@ -1015,7 +1015,74 @@ My question: {question}
 Please provide a detailed answer based on the souvenirs above:"""
     
     def _extract_keywords_from_question(self, question: str) -> str:
-        """Extract key terms from a question for searching."""
+        """Extract key terms from a question for searching using LLM.
+        
+        This method uses an LLM to intelligently extract meaningful keywords
+        from the question, supporting multiple languages and semantic understanding
+        rather than simple pattern matching.
+        
+        Args:
+            question: The user's question
+            
+        Returns:
+            Space-separated string of extracted keywords for search
+        """
+        try:
+            prompt = f"""Extract the most important keywords from the following question for searching a personal memory database.
+
+Question: {question}
+
+Return a JSON object with a "keywords" field containing an array of 3-7 important keywords or key phrases that would help find relevant memories. 
+- Include nouns, verbs, and important concepts
+- Skip very common question words (what, who, where, when, why, how)
+- Keep keywords in the same language as the question
+- Use singular forms when possible
+
+Example output format:
+{{"keywords": ["meeting", "project deadline", "team celebration"]}}"""
+
+            response = litellm.completion(
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": "You are a keyword extraction assistant. Extract meaningful search keywords from questions. Return valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = response.choices[0].message.content
+            
+            # Parse JSON response
+            try:
+                extracted = json.loads(result)
+                keywords = extracted.get("keywords", [])
+                if keywords:
+                    # Join keywords with spaces, multi-word phrases with underscores
+                    formatted = []
+                    for kw in keywords:
+                        # Convert spaces to underscores for multi-word key phrases
+                        formatted.append(kw.replace(" ", "_"))
+                    return " ".join(formatted[:7])
+            except json.JSONDecodeError:
+                # Fallback: try to extract JSON from the response
+                json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                if json_match:
+                    extracted = json.loads(json_match.group())
+                    keywords = extracted.get("keywords", [])
+                    if keywords:
+                        formatted = [kw.replace(" ", "_") for kw in keywords[:7]]
+                        return " ".join(formatted)
+        
+        except Exception as e:
+            # Log the error but don't crash - fall back to simple extraction
+            print(f"Warning: LLM keyword extraction failed: {e}")
+        
+        # Fallback to simple rule-based extraction if LLM fails
+        return self._fallback_keyword_extraction(question)
+    
+    def _fallback_keyword_extraction(self, question: str) -> str:
+        """Fallback rule-based keyword extraction for when LLM is unavailable."""
         import re
         # Remove question words, keep more content words (reduced stop words)
         stop_words = r'\b(what|who|where|when|why|how)\b'
