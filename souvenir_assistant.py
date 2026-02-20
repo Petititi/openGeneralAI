@@ -1305,13 +1305,245 @@ Memories:
             print(f"Search error: {e}")
             return []
     
-    def ask_about_souvenirs(self, question: str) -> Dict[str, Any]:
-        """Ask a question about souvenirs using LLM with context from memory."""
-        # Extract keywords from the question for better search
-        search_query = self._extract_keywords_from_question(question)
+    def search_by_chunk_type(self, chunk_types: List[str], query: Optional[str] = None, 
+                              top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for souvenirs by specific chunk types.
         
-        # Get relevant souvenirs as context
-        souvenirs = self.search_souvenirs(search_query, top_k=5)
+        Args:
+            chunk_types: List of chunk types to search (e.g., ['email_action_items', 'email_key_points'])
+            query: Optional text query to further filter results
+            top_k: Maximum number of results
+            
+        Returns:
+            List of souvenirs matching the criteria
+        """
+        try:
+            with self.ltm.db._lock:
+                cur = self.ltm.db.conn.cursor()
+                
+                placeholders = ','.join('?' * len(chunk_types))
+                sql = f"""
+                    SELECT d.id, d.source_path, d.category, d.created_at, d.extra, c.content, c.chunk_type, c.chunk_name
+                    FROM documents d
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE c.chunk_type IN ({placeholders})
+                """
+                
+                params = list(chunk_types)
+                
+                if query:
+                    sql += " AND c.content LIKE ?"
+                    params.append(f'%{query}%')
+                
+                sql += " ORDER BY d.created_at DESC LIMIT ?"
+                params.append(top_k)
+                
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            
+            # Group results by document
+            doc_results = {}
+            for row in rows:
+                doc_id = row[0]
+                if doc_id not in doc_results:
+                    extra = json.loads(row[4] or '{}') if row[4] else {}
+                    doc_results[doc_id] = {
+                        "id": doc_id,
+                        "title": extra.get('title', 'Untitled'),
+                        "content": row[5],  # First chunk content
+                        "category": row[2],
+                        "tags": extra.get('tags', []),
+                        "created_at": row[3],
+                        "matching_chunks": []
+                    }
+                doc_results[doc_id]["matching_chunks"].append({
+                    "content": row[5],
+                    "chunk_type": row[6],
+                    "chunk_name": row[7]
+                })
+            
+            return list(doc_results.values())
+        except Exception as e:
+            print(f"Search by chunk type error: {e}")
+            return []
+    
+    def search_semantic(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Search for souvenirs using semantic embeddings.
+        
+        Args:
+            query: The search query
+            top_k: Maximum number of results
+            
+        Returns:
+            List of souvenirs with similarity scores
+        """
+        if self.ltm.embeddings is None:
+            return []
+        
+        try:
+            # Encode the query
+            query_emb = self.ltm.embeddings.encode([query], normalize=True)
+            
+            # Search in FAISS index
+            distances, indices = self.ltm.embeddings.search(query_emb, top_k)
+            
+            # Get chunk information
+            results = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx >= 0:
+                    chunk_info = self.ltm.db.get_chunk_by_id(int(idx))
+                    if chunk_info:
+                        chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
+                        doc_details = self.ltm.db.get_document_details(doc_id)
+                        if doc_details:
+                            extra = doc_details["document"].get("extra", {})
+                            results.append({
+                                "id": doc_id,
+                                "title": extra.get("title", "Untitled"),
+                                "content": content,
+                                "category": doc_details["document"].get("category", "general"),
+                                "tags": extra.get("tags", []),
+                                "created_at": doc_details["document"].get("created_at", ""),
+                                "chunk_type": chunk_type,
+                                "similarity_score": float(dist)
+                            })
+            
+            return results
+        except Exception as e:
+            print(f"Semantic search error: {e}")
+            return []
+    
+    def _analyze_question_for_search(self, question: str) -> Dict[str, Any]:
+        """Analyze a question to determine the best search strategy.
+        
+        Uses LLM to understand what type of information is being requested
+        and how to best search for it in the database.
+        
+        Args:
+            question: The user's question
+            
+        Returns:
+            Dictionary with search strategy and parameters
+        """
+        # First, check if we have embeddings for semantic search
+        has_embeddings = self.ltm.embeddings is not None and self.ltm.embeddings.ntotal > 0
+        
+        # Define chunk types that can be searched
+        chunk_type_info = {
+            "email_topic": "Main topic/theme of email conversations",
+            "email_participants": "People involved in email conversations", 
+            "email_key_points": "Main points discussed in emails",
+            "email_action_items": "Tasks, todos, and action items from emails",
+            "email_dates": "Important dates and deadlines mentioned in emails",
+            "email_entities": "People, organizations, locations from emails",
+            "email_follow_ups": "Items needing follow-up from emails",
+            "email_original": "Original email content"
+        }
+        
+        chunk_types_json = json.dumps(chunk_type_info, indent=2)
+        
+        try:
+            prompt = f"""Analyze this question to determine the best way to search a personal memory database.
+
+Question: {question}
+
+The database has the following chunk types (each document is split into multiple chunks):
+{chunk_types_json}
+
+Return a JSON object with:
+{{
+    "search_strategy": "semantic" or "keyword" or "chunk_type" or "hybrid",
+    "chunk_types": ["list of relevant chunk types if chunk_type or hybrid strategy"],
+    "keywords": ["important keywords for search"],
+    "reasoning": "brief explanation of why this strategy was chosen"
+}}
+
+Choose "chunk_type" or "hybrid" if the question specifically asks about:
+- action items, tasks, todos -> email_action_items
+- dates, deadlines, when -> email_dates  
+- participants, who -> email_participants
+- key points, main points -> email_key_points
+- topic, about -> email_topic
+- follow-ups -> email_follow_ups
+- entities, people, organizations -> email_entities
+
+Choose "semantic" if the question is conversational/natural language and embeddings are available ({has_embeddings}).
+Choose "keyword" for simple factual queries or if no embeddings."""
+
+            response = litellm.completion(
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": "You are a search strategy assistant. Analyze questions to determine optimal database search approaches. Return valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = response.choices[0].message.content
+            strategy = json.loads(result)
+            
+            # Ensure required fields exist
+            return {
+                "search_strategy": strategy.get("search_strategy", "hybrid"),
+                "chunk_types": strategy.get("chunk_types", []),
+                "keywords": strategy.get("keywords", []),
+                "reasoning": strategy.get("reasoning", ""),
+                "has_embeddings": has_embeddings
+            }
+            
+        except Exception as e:
+            print(f"Question analysis error: {e}")
+            # Fallback to simple keyword extraction
+            keywords = question.lower().split()
+            return {
+                "search_strategy": "keyword" if not has_embeddings else "semantic",
+                "chunk_types": [],
+                "keywords": keywords,
+                "reasoning": "Fallback due to error",
+                "has_embeddings": has_embeddings
+            }
+    
+    def ask_about_souvenirs(self, question: str) -> Dict[str, Any]:
+        """Ask a question about souvenirs using intelligent search based on question analysis."""
+        # Analyze the question to determine best search strategy
+        search_strategy = self._analyze_question_for_search(question)
+        
+        all_results = []
+        
+        # Execute search based on strategy
+        if search_strategy["search_strategy"] in ["semantic", "hybrid"]:
+            semantic_results = self.search_semantic(question, top_k=5)
+            all_results.extend(semantic_results)
+        
+        if search_strategy["search_strategy"] in ["keyword", "hybrid"]:
+            keywords = search_strategy.get("keywords", [])
+            if keywords:
+                keyword_query = " ".join(keywords[:5])
+                keyword_results = self.search_souvenirs(keyword_query, top_k=5)
+                all_results.extend(keyword_results)
+        
+        if search_strategy["search_strategy"] == "chunk_type":
+            chunk_types = search_strategy.get("chunk_types", [])
+            if chunk_types:
+                # Combine keywords if any
+                query = " ".join(search_strategy.get("keywords", []))
+                chunk_results = self.search_by_chunk_type(chunk_types, query=query if query else None, top_k=5)
+                all_results.extend(chunk_results)
+        
+        # Deduplicate results by document ID
+        seen_ids = set()
+        unique_results = []
+        for r in all_results:
+            if r["id"] not in seen_ids:
+                seen_ids.add(r["id"])
+                unique_results.append(r)
+        
+        # Re-rank by similarity score if available
+        if any("similarity_score" in r for r in unique_results):
+            unique_results.sort(key=lambda x: x.get("similarity_score", 0), reverse=True)
+        
+        souvenirs = unique_results[:5]
         
         if not souvenirs:
             return {
@@ -1320,11 +1552,11 @@ Memories:
                 "sources": []
             }
         
-        # Build context from souvenirs
-        context = self._format_souvenirs_for_llm(souvenirs)
+        # Build context with information about data structure
+        context = self._format_souvenirs_for_llm_enhanced(souvenirs, search_strategy)
         
-        # Create prompt for LLM
-        prompt = self._build_question_prompt(question, context)
+        # Create prompt for LLM with database structure info
+        prompt = self._build_question_prompt_enhanced(question, context, search_strategy)
         
         try:
             response = litellm.completion(
@@ -1348,6 +1580,80 @@ Memories:
                 "ok": False,
                 "error": str(e)
             }
+    
+    def _format_souvenirs_for_llm_enhanced(self, souvenirs: List[Dict[str, Any]], 
+                                           search_strategy: Dict[str, Any]) -> str:
+        """Format souvenirs for inclusion in LLM prompt with chunk type info."""
+        chunk_type_labels = {
+            "email_topic": "Topic",
+            "email_participants": "Participants",
+            "email_key_points": "Key Points",
+            "email_action_items": "Action Items",
+            "email_dates": "Important Dates",
+            "email_entities": "Entities",
+            "email_follow_ups": "Follow-ups",
+            "email_original": "Original Content"
+        }
+        
+        formatted = []
+        for i, s in enumerate(souvenirs, 1):
+            created = s.get('created_at', 'Unknown date')
+            title = s.get('title', 'Untitled')
+            category = s.get('category', 'general')
+            chunk_type = s.get('chunk_type', 'unknown')
+            chunk_label = chunk_type_labels.get(chunk_type, chunk_type)
+            
+            formatted.append(f"""
+--- Memory {i} ---
+Title: {title}
+Category: {category}
+Type: {chunk_label}
+Date: {created}
+Content:
+{s['content']}
+""")
+            
+            # Include matching chunks if available
+            if "matching_chunks" in s and s["matching_chunks"]:
+                formatted.append("Additional matching sections:")
+                for mc in s["matching_chunks"][:3]:  # Limit to 3 additional chunks
+                    mc_type = mc.get("chunk_type", "unknown")
+                    mc_label = chunk_type_labels.get(mc_type, mc_type)
+                    formatted.append(f"  [{mc_label}]: {mc.get('content', '')[:200]}")
+        
+        return "\n".join(formatted)
+    
+    def _build_question_prompt_enhanced(self, question: str, context: str, 
+                                       search_strategy: Dict[str, Any]) -> str:
+        """Build enhanced prompt with database structure information."""
+        chunk_type_info = """
+The memories are stored with different types of information:
+- Topic: Main theme/subject of the memory
+- Participants: People involved
+- Key Points: Main discussion points
+- Action Items: Tasks and todos
+- Important Dates: Deadlines and dates mentioned
+- Entities: People, organizations, locations mentioned
+- Follow-ups: Items needing follow-up
+- Original Content: Raw content of the memory
+"""
+        
+        reasoning = search_strategy.get("reasoning", "")
+        strategy = search_strategy.get("search_strategy", "hybrid")
+        
+        return f"""Based on the following souvenirs/memories, please answer my question.
+
+The search was performed using: {strategy} strategy
+Reasoning: {reasoning}
+
+{chunk_type_info}
+
+Memories:
+{context}
+
+My question: {question}
+
+Please provide a detailed answer based on the memories above. If the question asks about specific types of information (like action items, dates, participants), prioritize those sections in your answer:"""
     
     def list_souvenirs(self, category: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
         """List all stored souvenirs, optionally filtered by category."""
