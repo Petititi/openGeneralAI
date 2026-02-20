@@ -51,6 +51,24 @@ class LLMExtractor:
         self.cfg = cfg
         self.model = cfg.model if cfg else "gpt-4o-mini"
     
+    def clean_email_thread(self, text):
+        text = re.sub(r'\[cid:.*?\]', '', text)
+        text = re.sub(r'\[https?://.*?\]', '', text)
+        
+        text = re.sub(r'<mailto:.*?>', '', text)
+        
+        text = re.sub(r'[ \t]+', ' ', text)
+        
+        text = re.sub(r'\n{2,}', '\n\n', text)
+        
+        text = re.sub(r'.*Office 365.*', '', text)
+        text = re.sub(r'.*Unknown To address.*', '', text)
+        text = re.sub(r'.*Action Required.*', '', text)
+        
+        text = text.strip()
+        
+        return text
+    
     def extract(self, content: str, extraction_type: str = "general", 
                 custom_prompt: Optional[str] = None) -> Dict[str, Any]:
         """Extract meaningful information from content using LLM.
@@ -63,14 +81,15 @@ class LLMExtractor:
         Returns:
             Dictionary with extracted information fields
         """
-        if not content or not content.strip():
+        reduced_content = self.clean_email_thread(content)
+        if not reduced_content:
             return {"ok": False, "error": "Empty content"}
         
         # Build extraction prompt based on type
         if custom_prompt:
             prompt = custom_prompt
         else:
-            prompt = self._build_extraction_prompt(content, extraction_type)
+            prompt = self._build_extraction_prompt(reduced_content, extraction_type)
         
         try:
             response = litellm.completion(
@@ -574,8 +593,6 @@ class SouvenirAssistant:
         
         # Build tags
         tags = ["conversation"]
-        tags.extend(data.get("key_points", [])[:5])
-        
         if data.get("action_items"):
             tags.append("action_required")
         
@@ -590,7 +607,7 @@ class SouvenirAssistant:
             "follow_ups": data.get("follow_ups", []),
             "sentiment": data.get("sentiment", "neutral"),
             "urgency": data.get("urgency", ""),
-            "tags": list(set(tags))[:15]
+            "tags": list(set(tags))
         }
     
     def _format_email_for_extraction(self, email: Dict) -> str:
@@ -639,22 +656,19 @@ class SouvenirAssistant:
         """
         lines = []
         seen_paragraph_hashes = set()
-
         for i, msg in enumerate(messages):
             raw_body = msg.get("body", "")
             clean_body = self._strip_quoted_text(raw_body)
 
             paragraphs = self._split_into_paragraphs(clean_body)
             new_paragraphs = []
-            old_messages = False
             for paragraph in paragraphs:
                 p_hash = self._hash_paragraph(paragraph)
 
-                if p_hash not in seen_paragraph_hashes:
+                if p_hash not in seen_paragraph_hashes or len(paragraph) < 15:
                     seen_paragraph_hashes.add(p_hash)
                     new_paragraphs.append(paragraph)
                 else:
-                    old_messages = True
                     break
 
 
@@ -663,8 +677,8 @@ class SouvenirAssistant:
 
             lines.append(f"--- Message {i+1} ---")
 
-            if msg.get("sender"):
-                lines.append(f"From: {msg['sender']}")
+            if msg.get("sender") and msg.get("to"):
+                lines.append(f"From: {msg['sender']} To: {msg['to']}")
 
             if msg.get("date"):
                 lines.append(f"Date: {msg['date']}")
@@ -867,6 +881,267 @@ Memories:
                 "title": title or "Untitled Memory",
                 "category": category,
                 "message": f"Souvenir added successfully! (ID: {souvenir_id})"
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+
+    def add_email_memory(
+        self,
+        thread_emails: List[Dict],
+        conversation_info: Dict,
+        category: str = 'email_conversation',
+        tags: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """Add an email thread as a memory with multiple chunks.
+        
+        Instead of flattening all information into a single content string,
+        this method stores different aspects of the email conversation as
+        separate chunks, enabling better retrieval and search.
+        
+        Args:
+            thread_emails: List of email dictionaries in the thread
+            conversation_info: Information extracted by LLM (topic, participants, key_points, etc.)
+            category: Category for the memory
+            tags: Optional tags for the memory
+            
+        Returns:
+            Dictionary with operation result
+        """
+        try:
+            import uuid
+            import hashlib
+            
+            # Generate a unique ID for the email memory
+            memory_id = str(uuid.uuid4())[:8]
+            
+            # Build title from topic or subject
+            if conversation_info.get("topic"):
+                title = f"📧 {conversation_info['topic']}"
+            else:
+                subject = thread_emails[0].get('subject', 'Email Conversation')
+                title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
+            
+            # Prepare extra metadata
+            extra = {
+                'title': title,
+                'tags': tags or [],
+                'email_thread': {
+                    'subject': thread_emails[0].get('subject', ''),
+                    'message_count': len(thread_emails),
+                    'participants': conversation_info.get('participants', []),
+                }
+            }
+            
+            # Insert the document
+            content_preview = conversation_info.get('topic', '')[:500]
+            self.ltm.db.insert_document(
+                doc_id=memory_id,
+                source_path=f"email_memory:{memory_id}",
+                rel_path=None,
+                media_type='text/plain',
+                language='en',
+                sha256='',
+                size_bytes=len(content_preview),
+                category=category,
+                extra=extra
+            )
+            
+            # Create multiple chunks for different aspects of the email thread
+            chunk_ordinal = 0
+            
+            # Chunk 1: Topic/Summary
+            if conversation_info.get("topic"):
+                topic_content = f"Topic: {conversation_info['topic']}"
+                topic_chunk_id = self.ltm.db.insert_chunk(
+                    memory_id, chunk_ordinal, 1, len(topic_content.split('\n')),
+                    topic_content, 'email_topic', conversation_info['topic'][:50], None
+                )
+                chunk_ordinal += 1
+                
+                # Add embedding for topic
+                if self.ltm.embeddings is not None:
+                    emb = self.ltm.embeddings.encode([topic_content], normalize=True)
+                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], topic_chunk_id)
+            
+            # Chunk 2: Participants
+            participants = conversation_info.get("participants", [])
+            if participants:
+                participants_content = "Participants:\n" + "\n".join(f"  - {p}" for p in participants)
+                participants_chunk_id = self.ltm.db.insert_chunk(
+                    memory_id, chunk_ordinal, 1, len(participants_content.split('\n')),
+                    participants_content, 'email_participants', None, None
+                )
+                chunk_ordinal += 1
+            
+            # Chunk 3: Key Points
+            key_points = conversation_info.get("key_points", [])
+            if key_points:
+                key_points_content = "Key Points:\n" + "\n".join(f"  - {point}" for point in key_points)
+                key_points_chunk_id = self.ltm.db.insert_chunk(
+                    memory_id, chunk_ordinal, 1, len(key_points_content.split('\n')),
+                    key_points_content, 'email_key_points', None, None
+                )
+                chunk_ordinal += 1
+                
+                # Add embedding for key points
+                if self.ltm.embeddings is not None:
+                    emb = self.ltm.embeddings.encode([key_points_content], normalize=True)
+                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], key_points_chunk_id)
+            
+            # Chunk 4: Action Items
+            action_items = conversation_info.get("action_items", [])
+            if action_items:
+                action_items_content = "Action Items:\n" + "\n".join(f"  - {item}" for item in action_items)
+                action_items_chunk_id = self.ltm.db.insert_chunk(
+                    memory_id, chunk_ordinal, 1, len(action_items_content.split('\n')),
+                    action_items_content, 'email_action_items', None, None
+                )
+                chunk_ordinal += 1
+                
+                # Add embedding for action items
+                if self.ltm.embeddings is not None:
+                    emb = self.ltm.embeddings.encode([action_items_content], normalize=True)
+                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], action_items_chunk_id)
+            
+            # Chunk 5: Important Dates
+            important_dates = conversation_info.get("important_dates", [])
+            if important_dates:
+                dates_content = "Important Dates:\n" + "\n".join(f"  - {date}" for date in important_dates)
+                dates_chunk_id = self.ltm.db.insert_chunk(
+                    memory_id, chunk_ordinal, 1, len(dates_content.split('\n')),
+                    dates_content, 'email_dates', None, None
+                )
+                chunk_ordinal += 1
+            
+            # Chunk 6: Entities (people, organizations, locations)
+            entities = conversation_info.get("entities", {})
+            if entities:
+                entities_lines = []
+                people = entities.get("people", [])
+                orgs = entities.get("organizations", [])
+                locations = entities.get("locations", [])
+                
+                if people:
+                    entities_lines.append("People:")
+                    for p in people:
+                        entities_lines.append(f"  - {p}")
+                if orgs:
+                    entities_lines.append("Organizations:")
+                    for o in orgs:
+                        entities_lines.append(f"  - {o}")
+                if locations:
+                    entities_lines.append("Locations:")
+                    for loc in locations:
+                        entities_lines.append(f"  - {loc}")
+                
+                if entities_lines:
+                    entities_content = "\n".join(entities_lines)
+                    entities_chunk_id = self.ltm.db.insert_chunk(
+                        memory_id, chunk_ordinal, 1, len(entities_content.split('\n')),
+                        entities_content, 'email_entities', None, None
+                    )
+                    chunk_ordinal += 1
+            
+            # Chunk 7: Follow-ups
+            follow_ups = conversation_info.get("follow_ups", [])
+            if follow_ups:
+                follow_ups_content = "Follow-ups:\n" + "\n".join(f"  - {follow_up}" for follow_up in follow_ups)
+                follow_ups_chunk_id = self.ltm.db.insert_chunk(
+                    memory_id, chunk_ordinal, 1, len(follow_ups_content.split('\n')),
+                    follow_ups_content, 'email_follow_ups', None, None
+                )
+                chunk_ordinal += 1
+                
+                # Add embedding for follow-ups
+                if self.ltm.embeddings is not None:
+                    emb = self.ltm.embeddings.encode([follow_ups_content], normalize=True)
+                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], follow_ups_chunk_id)
+            
+            # Chunk 8: Original Email Content (truncated for each email)
+            if thread_emails:
+                for i, email in enumerate(thread_emails):
+                    email_details = []
+                    email_details.append(f"Message {i}:")
+                    email_details.append(f"  From: {email.get('sender', 'Unknown')}")
+                    email_details.append(f"  Date: {email.get('date', 'Unknown')}")
+                    body = email.get('body', '')
+                    if body:
+                        preview =self.extractor.clean_email_thread(body)
+                        email_details.append(preview)
+                
+                    email_content = "\n".join(email_details)
+                    email_chunk_id = self.ltm.db.insert_chunk(
+                        memory_id, chunk_ordinal, 1, len(email_content.split('\n')),
+                        email_content, 'email_original', thread_emails[0].get('subject', '')[:50], None
+                    )
+                    chunk_ordinal += 1
+                    
+                    # Add embedding for original emails
+                    if self.ltm.embeddings is not None:
+                        emb = self.ltm.embeddings.encode([email_content], normalize=True)
+                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], email_chunk_id)
+            
+            # Persist embeddings if available
+            if self.ltm.embeddings is not None:
+                self.ltm.embeddings.persist()
+            
+            return {
+                "ok": True,
+                "id": memory_id,
+                "title": title,
+                "category": category,
+                "chunks_created": chunk_ordinal,
+                "message": f"Email memory added successfully with {chunk_ordinal} chunks! (ID: {memory_id})"
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+    
+    def get_email_memory(self, memory_id: str) -> Optional[Dict[str, Any]]:
+        """Get an email memory by ID with all its chunks.
+        
+        Args:
+            memory_id: The ID of the email memory
+            
+        Returns:
+            Dictionary with memory details and all chunks, or None if not found
+        """
+        try:
+            details = self.ltm.db.get_document_details(memory_id)
+            if not details:
+                return None
+            
+            doc = details["document"]
+            chunks = details["chunks"]
+            
+            # Organize chunks by type for easier access
+            chunks_by_type = {}
+            for chunk in chunks:
+                chunk_type = chunk.get("chunk_type", "unknown")
+                if chunk_type not in chunks_by_type:
+                    chunks_by_type[chunk_type] = []
+                chunks_by_type[chunk_type].append(chunk)
+            
+            return {
+                "ok": True,
+                "id": memory_id,
+                "title": doc.get("extra", {}).get("title", ""),
+                "category": doc.get("category", "general"),
+                "tags": doc.get("extra", {}).get("tags", []),
+                "email_thread": doc.get("extra", {}).get("email_thread", {}),
+                "chunks": chunks,
+                "chunks_by_type": chunks_by_type,
+                "created_at": doc.get("created_at", "")
             }
         except Exception as e:
             return {

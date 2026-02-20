@@ -4,3 +4,5 @@ __pycache__/*
 *.pyc
 /*.sqlite*
 gmail_token.pickle
+mails.pickle
+faiss.index

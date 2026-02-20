@@ -500,11 +500,12 @@ class DatabaseManager:
             file_exists = source_path.exists()
             
             cur.execute("""
-            SELECT id, ord, start_line, end_line, content FROM chunks WHERE document_id=?
+            SELECT id, ord, start_line, end_line, content, chunk_type, chunk_name FROM chunks WHERE document_id=?
             ORDER BY ord ASC
         """, (document_id,))
             chunks = [{
-                "chunk_id": r[0], "ord": r[1], "start_line": r[2], "end_line": r[3], "content": r[4]
+                "chunk_id": r[0], "ord": r[1], "start_line": r[2], "end_line": r[3], 
+                "content": r[4], "chunk_type": r[5], "chunk_name": r[6]
             } for r in cur.fetchall()]
             
             return {

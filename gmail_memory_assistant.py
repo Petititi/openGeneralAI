@@ -45,6 +45,7 @@ SCOPES = [
 
 TOKEN_FILE = 'gmail_token.pickle'
 CREDS_FILE = 'gmail_credentials.json'
+MAILS_FILE = 'mails.pickle'
 
 
 class GmailMemoryAssistant:
@@ -54,7 +55,7 @@ class GmailMemoryAssistant:
         """Initialize Gmail memory assistant."""
         self.service = None
         self.credentials = None
-        self.souvenir_assistant = SouvenirAssistant(db_path=souvenir_db)
+        self.souvenir_assistant = SouvenirAssistant(db_path=souvenir_db, enable_embeddings=True)
         self.user_email = None
     
     def get_credentials_interactive(self) -> Optional[Credentials]:
@@ -678,8 +679,8 @@ class GmailMemoryAssistant:
         print("🔍 Building email conversation threads...")
         threads = self.souvenir_assistant.build_threads(
             emails, 
-            use_subject_matching=True,
-            use_body_similarity=True
+            use_subject_matching=False,
+            use_body_similarity=False
         )
         
         # Only count threads with more than 1 email
@@ -713,43 +714,36 @@ class GmailMemoryAssistant:
         
         # Process only threads (conversations with multiple emails)
         for thread_id, thread in threads.items():
-            if thread['size'] <= 1:
-                continue  # Skip individual emails
-                
             thread_emails = thread['emails']
             
             # Use LLM to extract meaningful information from the conversation
             conversation_info = self.souvenir_assistant.process_conversation_for_memory(thread_emails)
             
             # Determine category based on labels from all emails in thread
-            category = 'email_conversation'
+            category = ''
             for email in thread_emails:
+                if category:
+                    break
                 for label in email.get('labels', []):
                     if label in categories_map:
                         category = categories_map[label]
                         break
+            if not category:
+                category = 'email_conversation'
             
             # Use tags from LLM extraction, add labels
             tags = conversation_info.get("tags", ["conversation"])
             for email in thread_emails:
                 for label in email.get('labels', []):
-                    if label not in categories_map:
-                        tags.append(label.lower())
+                    low_label = label.lower()
+                    if low_label not in tags:
+                        tags.append(low_label)
             tags = list(set(tags))[:15]
             
-            # Use LLM topic for title
-            subject = thread_emails[0].get('subject', 'Email Conversation')
-            memory_title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
-            if conversation_info.get("topic"):
-                memory_title = f"📧 {conversation_info['topic'][:50]}"
-            
-            # Build memory content from conversation_info
-            memory_content = self._create_conversation_memory_content(thread_emails, conversation_info)
-            
-            # Add thread memory
-            result = self.souvenir_assistant.add_souvenir(
-                content=memory_content,
-                title=memory_title,
+            # Add thread memory using new multi-chunk method
+            result = self.souvenir_assistant.add_email_memory(
+                thread_emails=thread_emails,
+                conversation_info=conversation_info,
                 category=category,
                 tags=tags
             )
@@ -764,370 +758,6 @@ class GmailMemoryAssistant:
             "threads_processed": thread_count,
             "message": f"Created {memories_created} memories from {len(emails)} emails ({thread_count} conversation threads)"
         }
-    
-    def _create_conversation_memory_content(self, thread_emails: List[Dict], conversation_info: Dict) -> str:
-        """Create memory content from conversation_info extracted by LLM.
-        
-        Args:
-            thread_emails: List of email dictionaries in the thread
-            conversation_info: Information extracted by LLM
-            
-        Returns:
-            Formatted memory content string
-        """
-        lines = []
-        
-        # Header
-        lines.append("📧 EMAIL CONVERSATION")
-        lines.append(f"Messages in thread: {len(thread_emails)}")
-        lines.append("")
-        
-        # Subject from first email
-        subject = thread_emails[0].get('subject', '(No Subject)')
-        lines.append(f"Subject: {subject}")
-        lines.append("")
-        
-        # LLM Summary
-        if conversation_info.get("topic"):
-            lines.append("📝 Summary:")
-            lines.append(conversation_info["topic"])
-            lines.append("")
-        
-        # Participants from LLM
-        participants = conversation_info.get("participants", [])
-        if participants:
-            lines.append("👥 Participants:")
-            for p in participants:
-                lines.append(f"  - {p}")
-            lines.append("")
-        
-        # Key points from LLM
-        key_points = conversation_info.get("key_points", [])
-        if key_points:
-            lines.append("💡 Key Points:")
-            for point in key_points:
-                lines.append(f"  - {point}")
-            lines.append("")
-        
-        # Action items from LLM
-        action_items = conversation_info.get("action_items", [])
-        if action_items:
-            lines.append("🎯 Action Items:")
-            for item in action_items:
-                lines.append(f"  - {item}")
-            lines.append("")
-        
-        # Important dates from LLM
-        important_dates = conversation_info.get("important_dates", [])
-        if important_dates:
-            lines.append("📅 Important Dates:")
-            for date in important_dates:
-                lines.append(f"  - {date}")
-            lines.append("")
-        
-        # Follow-ups from LLM
-        follow_ups = conversation_info.get("follow_ups", [])
-        if follow_ups:
-            lines.append("🔄 Follow-ups:")
-            for follow_up in follow_ups:
-                lines.append(f"  - {follow_up}")
-            lines.append("")
-        
-        # Entities from LLM
-        entities = conversation_info.get("entities", {})
-        if entities:
-            people = entities.get("people", [])
-            orgs = entities.get("organizations", [])
-            locations = entities.get("locations", [])
-            
-            if people or orgs or locations:
-                lines.append("🏢 Entities:")
-                for p in people[:5]:
-                    lines.append(f"  - Person: {p}")
-                for o in orgs[:5]:
-                    lines.append(f"  - Organization: {o}")
-                for loc in locations[:5]:
-                    lines.append(f"  - Location: {loc}")
-                lines.append("")
-        
-        # Sentiment and urgency
-        sentiment = conversation_info.get("sentiment", "neutral")
-        urgency = conversation_info.get("urgency", "")
-        if sentiment != "neutral" or urgency:
-            lines.append(f"💭 Sentiment: {sentiment}")
-            if urgency:
-                lines.append(f"⚡ Urgency: {urgency}")
-            lines.append("")
-        
-        # Original email details
-        lines.append("--- Email Details ---")
-        for i, email in enumerate(thread_emails[:5], 1):  # Show first 5 messages
-            lines.append(f"\nMessage {i}:")
-            lines.append(f"  From: {email.get('sender', 'Unknown')}")
-            lines.append(f"  Date: {email.get('date', 'Unknown')}")
-            body = email.get('body', '')
-            if body:
-                preview = body[:300].replace('\n', ' ')
-                lines.append(f"  Preview: {preview}...")
-        
-        return "\n".join(lines)
-    
-    def _create_conversation_memory_content(self, thread_emails: List[Dict], conversation_info: Dict) -> str:
-        """Create memory content from conversation_info extracted by LLM.
-        
-        Args:
-            thread_emails: List of email dictionaries in the thread
-            conversation_info: Information extracted by LLM
-            
-        Returns:
-            Formatted memory content string
-        """
-        lines = []
-        
-        # Header
-        lines.append("📧 EMAIL CONVERSATION")
-        lines.append(f"Messages in thread: {len(thread_emails)}")
-        lines.append("")
-        
-        # Subject from first email
-        subject = thread_emails[0].get('subject', '(No Subject)')
-        lines.append(f"Subject: {subject}")
-        lines.append("")
-        
-        # LLM Summary
-        if conversation_info.get("topic"):
-            lines.append("📝 Summary:")
-            lines.append(conversation_info["topic"])
-            lines.append("")
-        
-        # Participants from LLM
-        participants = conversation_info.get("participants", [])
-        if participants:
-            lines.append("👥 Participants:")
-            for p in participants:
-                lines.append(f"  - {p}")
-            lines.append("")
-        
-        # Key points from LLM
-        key_points = conversation_info.get("key_points", [])
-        if key_points:
-            lines.append("💡 Key Points:")
-            for point in key_points:
-                lines.append(f"  - {point}")
-            lines.append("")
-        
-        # Action items from LLM
-        action_items = conversation_info.get("action_items", [])
-        if action_items:
-            lines.append("🎯 Action Items:")
-            for item in action_items:
-                lines.append(f"  - {item}")
-            lines.append("")
-        
-        # Important dates from LLM
-        important_dates = conversation_info.get("important_dates", [])
-        if important_dates:
-            lines.append("📅 Important Dates:")
-            for date in important_dates:
-                lines.append(f"  - {date}")
-            lines.append("")
-        
-        # Follow-ups from LLM
-        follow_ups = conversation_info.get("follow_ups", [])
-        if follow_ups:
-            lines.append("🔄 Follow-ups:")
-            for follow_up in follow_ups:
-                lines.append(f"  - {follow_up}")
-            lines.append("")
-        
-        # Entities from LLM
-        entities = conversation_info.get("entities", {})
-        if entities:
-            people = entities.get("people", [])
-            orgs = entities.get("organizations", [])
-            locations = entities.get("locations", [])
-            
-            if people or orgs or locations:
-                lines.append("🏢 Entities:")
-                for p in people[:5]:
-                    lines.append(f"  - Person: {p}")
-                for o in orgs[:5]:
-                    lines.append(f"  - Organization: {o}")
-                for loc in locations[:5]:
-                    lines.append(f"  - Location: {loc}")
-                lines.append("")
-        
-        # Sentiment and urgency
-        sentiment = conversation_info.get("sentiment", "neutral")
-        urgency = conversation_info.get("urgency", "")
-        if sentiment != "neutral" or urgency:
-            lines.append(f"💭 Sentiment: {sentiment}")
-            if urgency:
-                lines.append(f"⚡ Urgency: {urgency}")
-            lines.append("")
-        
-        # Original email details
-        lines.append("--- Email Details ---")
-        for i, email in enumerate(thread_emails[:5], 1):
-            lines.append(f"\nMessage {i}:")
-            lines.append(f"  From: {email.get('sender', 'Unknown')}")
-            lines.append(f"  Date: {email.get('date', 'Unknown')}")
-            body = email.get('body', '')
-            if body:
-                preview = body[:300].replace('\n', ' ')
-                lines.append(f"  Preview: {preview}...")
-        
-        return "\n".join(lines)
-    
-    def _create_llm_memory_content(self, email: Dict, extracted_info: Dict) -> str:
-        """Create memory content using LLM-extracted information.
-        
-        Args:
-            email: The email dictionary
-            extracted_info: Information extracted by LLM (summary, topics, action_items, etc.)
-            
-        Returns:
-            Formatted memory content string
-        """
-        lines = []
-        
-        # Header
-        lines.append("📧 EMAIL")
-        
-        # Use LLM summary if available
-        if extracted_info.get("summary"):
-            lines.append("")
-            lines.append("📝 Summary:")
-            lines.append(extracted_info["summary"])
-        
-        # Sender and recipients
-        if extracted_info.get("sender"):
-            lines.append(f"From: {extracted_info['sender']}")
-        else:
-            lines.append(f"From: {email.get('sender', 'Unknown')}")
-        
-        if email.get("to"):
-            lines.append(f"To: {email.get('to')}")
-        
-        if email.get("date"):
-            lines.append(f"Date: {email.get('date')}")
-        
-        # Topics
-        topics = extracted_info.get("topics", [])
-        if topics:
-            lines.append("")
-            lines.append("🏷️  Topics:")
-            for topic in topics[:5]:
-                lines.append(f"  - {topic}")
-        
-        # Action items from LLM
-        action_items = extracted_info.get("action_items", [])
-        if action_items:
-            lines.append("")
-            lines.append("🎯 Action Items:")
-            for item in action_items[:5]:
-                lines.append(f"  - {item}")
-        
-        # Important dates from LLM
-        dates = extracted_info.get("dates", [])
-        if dates:
-            lines.append("")
-            lines.append("📅 Important Dates:")
-            for date in dates[:3]:
-                lines.append(f"  - {date}")
-        
-        # Entities
-        entities = extracted_info.get("entities", {})
-        if entities:
-            people = entities.get("people", [])
-            orgs = entities.get("organizations", [])
-            projects = entities.get("projects", [])
-            
-            if people or orgs or projects:
-                lines.append("")
-                lines.append("👥 Entities:")
-                for p in people[:3]:
-                    lines.append(f"  - Person: {p}")
-                for o in orgs[:3]:
-                    lines.append(f"  - Organization: {o}")
-                for pj in projects[:3]:
-                    lines.append(f"  - Project: {pj}")
-        
-        # Sentiment and urgency
-        sentiment = extracted_info.get("sentiment", "neutral")
-        urgency = extracted_info.get("urgency", "medium")
-        if sentiment != "neutral" or urgency != "medium":
-            lines.append("")
-            lines.append(f"💭 Sentiment: {sentiment} | Urgency: {urgency}")
-        
-        # Original body snippet
-        body = email.get("body", "")
-        if body:
-            lines.append("")
-            lines.append("--- Original Content ---")
-            lines.append(body[:1000])
-        
-        return "\n".join(lines)
-    
-    def _create_basic_memory_content(self, email: Dict) -> str:
-        """Create basic memory content from email (fallback when LLM unavailable).
-        
-        Args:
-            email: The email dictionary
-            
-        Returns:
-            Formatted memory content string
-        """
-        lines = []
-        
-        lines.append("📧 EMAIL")
-        
-        if email.get("sender"):
-            lines.append(f"From: {email['sender']}")
-        if email.get("to"):
-            lines.append(f"To: {email['to']}")
-        if email.get("date"):
-            lines.append(f"Date: {email['date']}")
-        
-        if email.get("subject"):
-            lines.append(f"Subject: {email['subject']}")
-        
-        body = email.get("body", "")
-        if body:
-            lines.append("")
-            lines.append("Content:")
-            lines.append(body[:2000])
-        
-        return "\n".join(lines)
-    
-    def _create_basic_tags(self, email: Dict) -> List[str]:
-        """Create basic tags from email (fallback when LLM unavailable).
-        
-        Args:
-            email: The email dictionary
-            
-        Returns:
-            List of tags
-        """
-        tags = []
-        
-        # Add sender domain as tag
-        sender = email.get('sender', '')
-        if '<' in sender:
-            email_addr = sender.split('<')[1].rstrip('>')
-        else:
-            email_addr = sender
-        
-        if '@' in email_addr:
-            domain = email_addr.split('@')[1].split('.')[0]
-            tags.append(domain)
-        
-        # Add label-based tags
-        for label in email.get('labels', []):
-            if label.startswith('CATEGORY_'):
-                tags.append(label.replace('CATEGORY_', '').lower())
-        
-        return list(set(tags))[:10]
     
     def analyze_email_memories(self) -> Dict[str, Any]:
         """Analyze all email memories to extract high-level insights.
@@ -1371,7 +1001,7 @@ class GmailMemoryAssistant:
             
             elif choice == "2":
                 # Fetch recent emails (new improved method)
-                emails = self.fetch_recent_emails(max_results=200, days_back=90)
+                emails = self.fetch_recent_emails(max_results=100, days_back=90)
                 if emails:
                     # Ask if user wants to save all or select
                     print(f"\n📧 Found {len(emails)} recent emails")
@@ -1387,10 +1017,18 @@ class GmailMemoryAssistant:
                 print("   Going back up to 1 year...")
                 confirm = input("Continue? (y/n): ").strip().lower()
                 if confirm == 'y':
-                    emails = self.fetch_comprehensive_history(
-                        max_results_per_source=200, 
-                        days_back=365
-                    )
+                    if os.path.exists(MAILS_FILE):
+                        with open(MAILS_FILE, 'rb') as f:
+                            emails = pickle.load(f)
+                    else:
+                        emails = self.fetch_comprehensive_history(
+                            max_results_per_source=10000, 
+                            days_back=365
+                        )
+                        
+                        if emails:
+                            with open(MAILS_FILE, 'wb') as f:
+                                pickle.dump(emails, f)
                     if emails:
                         print(f"\n📧 Found {len(emails)} unique emails")
                         save_choice = input("Save all as memories? (y/n): ").strip().lower()
