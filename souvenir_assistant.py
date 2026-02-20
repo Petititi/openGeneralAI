@@ -888,12 +888,99 @@ Memories:
                 "error": str(e)
             }
 
+    def find_similar_documents(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        similarity_threshold: float = 0.95
+    ) -> List[Dict[str, Any]]:
+        """Find documents with similar content using semantic search.
+        
+        Args:
+            query_text: The text to search for
+            top_k: Maximum number of results to return
+            similarity_threshold: Minimum similarity score (0-1) to consider a match
+            
+        Returns:
+            List of similar documents with their similarity scores
+        """
+        if self.ltm.embeddings is None:
+            return []
+        
+        try:
+            # Encode the query
+            query_emb = self.ltm.embeddings.encode([query_text], normalize=True)
+            
+            # Search in FAISS index
+            distances, indices = self.ltm.embeddings.search(query_emb, top_k)
+            
+            # Get chunk information for matches above threshold
+            similar_docs = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if dist >= similarity_threshold and idx >= 0:
+                    # Get chunk info from FAISS mapping
+                    chunk_info = self.ltm.db.get_chunk_by_id(int(idx))
+                    if chunk_info:
+                        chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
+                        # Get full document details
+                        doc_details = self.ltm.db.get_document_details(doc_id)
+                        if doc_details:
+                            similar_docs.append({
+                                "chunk_id": chunk_id,
+                                "document_id": doc_id,
+                                "document": doc_details["document"],
+                                "chunk_content": content,
+                                "chunk_type": chunk_type,
+                                "similarity_score": float(dist)
+                            })
+            
+            return similar_docs
+        except Exception as e:
+            print(f"Error searching for similar documents: {e}")
+            return []
+    
+    def embedding_exists(
+        self,
+        text: str,
+        similarity_threshold: float = 0.9999
+    ) -> Optional[int]:
+        """Check if an embedding for the given text already exists.
+        
+        Uses exact match (cosine similarity = 1.0 for normalized embeddings).
+        
+        Args:
+            text: The text to check
+            similarity_threshold: Minimum similarity to consider as exact match
+            
+        Returns:
+            FAISS ID if found, None otherwise
+        """
+        if self.ltm.embeddings is None or self.ltm.embeddings.ntotal == 0:
+            return None
+        
+        try:
+            # Encode the text
+            text_emb = self.ltm.embeddings.encode([text], normalize=True)
+            
+            # Search for exact match
+            distances, indices = self.ltm.embeddings.search(text_emb, 1)
+            
+            # Check if we have an exact match
+            if distances[0][0] >= similarity_threshold and indices[0][0] >= 0:
+                return int(indices[0][0])
+            
+            return None
+        except Exception as e:
+            print(f"Error checking embedding existence: {e}")
+            return None
+    
     def add_email_memory(
         self,
         thread_emails: List[Dict],
         conversation_info: Dict,
         category: str = 'email_conversation',
-        tags: Optional[List[str]] = None
+        tags: Optional[List[str]] = None,
+        allow_duplicates: bool = False
     ) -> Dict[str, Any]:
         """Add an email thread as a memory with multiple chunks.
         
@@ -906,6 +993,7 @@ Memories:
             conversation_info: Information extracted by LLM (topic, participants, key_points, etc.)
             category: Category for the memory
             tags: Optional tags for the memory
+            allow_duplicates: If False, check for similar existing documents first
             
         Returns:
             Dictionary with operation result
@@ -913,6 +1001,28 @@ Memories:
         try:
             import uuid
             import hashlib
+            
+            # Build content for similarity check
+            topic = conversation_info.get("topic", "")
+            key_points = conversation_info.get("key_points", [])
+            content_for_check = topic + " " + " ".join(key_points)
+            
+            # Check for similar existing documents if duplicates not allowed
+            if not allow_duplicates and self.ltm.embeddings is not None and content_for_check.strip():
+                similar_docs = self.find_similar_documents(content_for_check, top_k=3, similarity_threshold=0.90)
+                if similar_docs:
+                    # Return the most similar document instead of creating a duplicate
+                    best_match = similar_docs[0]
+                    return {
+                        "ok": True,
+                        "id": best_match["document_id"],
+                        "title": best_match["document"].get("extra", {}).get("title", "Email Conversation"),
+                        "category": category,
+                        "chunks_created": 0,
+                        "message": "Similar email memory already exists",
+                        "existing_document": best_match["document"],
+                        "similarity_score": best_match["similarity_score"]
+                    }
             
             # Generate a unique ID for the email memory
             memory_id = str(uuid.uuid4())[:8]
@@ -961,11 +1071,16 @@ Memories:
                 )
                 chunk_ordinal += 1
                 
-                # Add embedding for topic
+                # Add embedding for topic (check for duplicates)
                 if self.ltm.embeddings is not None:
-                    emb = self.ltm.embeddings.encode([topic_content], normalize=True)
-                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], topic_chunk_id)
+                    existing_faiss_id = self.embedding_exists(topic_content)
+                    if existing_faiss_id is None:
+                        emb = self.ltm.embeddings.encode([topic_content], normalize=True)
+                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], topic_chunk_id)
+                    else:
+                        # Reuse existing embedding
+                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, topic_chunk_id)
             
             # Chunk 2: Participants
             participants = conversation_info.get("participants", [])
@@ -987,11 +1102,16 @@ Memories:
                 )
                 chunk_ordinal += 1
                 
-                # Add embedding for key points
+                # Add embedding for key points (check for duplicates)
                 if self.ltm.embeddings is not None:
-                    emb = self.ltm.embeddings.encode([key_points_content], normalize=True)
-                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], key_points_chunk_id)
+                    existing_faiss_id = self.embedding_exists(key_points_content)
+                    if existing_faiss_id is None:
+                        emb = self.ltm.embeddings.encode([key_points_content], normalize=True)
+                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], key_points_chunk_id)
+                    else:
+                        # Reuse existing embedding
+                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, key_points_chunk_id)
             
             # Chunk 4: Action Items
             action_items = conversation_info.get("action_items", [])
@@ -1003,11 +1123,16 @@ Memories:
                 )
                 chunk_ordinal += 1
                 
-                # Add embedding for action items
+                # Add embedding for action items (check for duplicates)
                 if self.ltm.embeddings is not None:
-                    emb = self.ltm.embeddings.encode([action_items_content], normalize=True)
-                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], action_items_chunk_id)
+                    existing_faiss_id = self.embedding_exists(action_items_content)
+                    if existing_faiss_id is None:
+                        emb = self.ltm.embeddings.encode([action_items_content], normalize=True)
+                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], action_items_chunk_id)
+                    else:
+                        # Reuse existing embedding
+                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, action_items_chunk_id)
             
             # Chunk 5: Important Dates
             important_dates = conversation_info.get("important_dates", [])
@@ -1058,11 +1183,16 @@ Memories:
                 )
                 chunk_ordinal += 1
                 
-                # Add embedding for follow-ups
+                # Add embedding for follow-ups (check for duplicates)
                 if self.ltm.embeddings is not None:
-                    emb = self.ltm.embeddings.encode([follow_ups_content], normalize=True)
-                    faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                    self.ltm.db.insert_faiss_mapping(faiss_ids[0], follow_ups_chunk_id)
+                    existing_faiss_id = self.embedding_exists(follow_ups_content)
+                    if existing_faiss_id is None:
+                        emb = self.ltm.embeddings.encode([follow_ups_content], normalize=True)
+                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], follow_ups_chunk_id)
+                    else:
+                        # Reuse existing embedding
+                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, follow_ups_chunk_id)
             
             # Chunk 8: Original Email Content (truncated for each email)
             if thread_emails:
@@ -1083,11 +1213,16 @@ Memories:
                     )
                     chunk_ordinal += 1
                     
-                    # Add embedding for original emails
+                    # Add embedding for original emails (check for duplicates)
                     if self.ltm.embeddings is not None:
-                        emb = self.ltm.embeddings.encode([email_content], normalize=True)
-                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], email_chunk_id)
+                        existing_faiss_id = self.embedding_exists(email_content)
+                        if existing_faiss_id is None:
+                            emb = self.ltm.embeddings.encode([email_content], normalize=True)
+                            faiss_ids = self.ltm.embeddings.add_embeddings(emb)
+                            self.ltm.db.insert_faiss_mapping(faiss_ids[0], email_chunk_id)
+                        else:
+                            # Reuse existing embedding
+                            self.ltm.db.insert_faiss_mapping(existing_faiss_id, email_chunk_id)
             
             # Persist embeddings if available
             if self.ltm.embeddings is not None:
