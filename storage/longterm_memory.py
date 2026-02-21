@@ -4,17 +4,21 @@ import json
 import hashlib
 import datetime as dt
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 import numpy as np
 
-# Optional imports - handle gracefully if not available
-try:
-    from tree_sitter_language_pack import get_parser
-    TREE_SITTER_AVAILABLE = True
-except ImportError:
-    TREE_SITTER_AVAILABLE = False
-    get_parser = None
+# Import the new code_parser module (tree-sitter parsing)
+from .code_parser import (
+    parse_file,
+    extract_code_chunks,
+    extract_text_chunks,
+    SUPPORTED_CODE_EXT,
+    TEXT_EXT,
+    read_text_safe as _read_text_safe,
+    is_supported_code_file,
+    is_text_file,
+)
 
 from .DatabaseManagement import DatabaseManager
 
@@ -26,39 +30,12 @@ except ImportError:
     EMBEDDING_AVAILABLE = False
     EmbeddingManager = None
 
+# Import SearchEngine for better search separation
+from .search_engine import SearchEngine
+
 # --------------------------
 # Utilitaires
 # --------------------------
-
-SUPPORTED_CODE_EXT = {
-    ".py": "python",
-    ".js": "javascript",
-    ".ts": "typescript",
-    ".tsx": "tsx",
-    ".c": "c",
-    ".h": "c",
-    ".cc": "cpp",
-    ".cpp": "cpp",
-    ".hpp": "cpp",
-    ".java": "java",
-    ".go": "go",
-    ".rs": "rust",
-    ".php": "php",
-    ".rb": "ruby",
-    ".kt": "kotlin",
-    ".swift": "swift",
-    ".m": "objective-c",
-    ".mm": "objective-cpp",
-    ".cs": "c_sharp",
-    ".lua": "lua",
-    ".sh": "bash",
-    ".bash": "bash",
-    ".zsh": "bash",
-    ".sql": "sql",
-    ".r": "r",
-    ".scala": "scala",
-    ".hs": "haskell",
-}
 
 RESERVED_KEYWORD_CODE = [
     "def", "class", "function", "var", "let", "const", "import", "from",
@@ -66,8 +43,6 @@ RESERVED_KEYWORD_CODE = [
     "return", "if", "else", "switch", "case", "for", "while", "do", "try",
     "catch", "finally", "throw", "new", "this", "super", "extends", "implements",
 ]
-
-TEXT_EXT = {".md", ".txt", ".rst", ".log", ".toml", ".yaml", ".yml", ".ini", ".cfg", ".json"}
 
 def sha256_bytes(b: bytes) -> str:
     h = hashlib.sha256()
@@ -83,340 +58,8 @@ def normalize(v: np.ndarray) -> np.ndarray:
     return v / norms
 
 def read_text_safe(path: Path, max_bytes: int = 10_000_000) -> bytes:
-    data = path.read_bytes()
-    if len(data) > max_bytes:
-        data = data[:max_bytes]
-    return data
-
-# --------------------------
-# Chunking via tree-sitter
-# --------------------------
-
-def extract_name_from_node(node, source: bytes) -> Optional[str]:
-    """Extrait le nom d'une fonction/classe/méthode depuis un noeud tree-sitter."""
-    for child in node.children:
-        if child.type in {"identifier", "name"}:
-            return source[child.start_byte:child.end_byte].decode("utf-8")
-    return None
-
-def extract_class_attributes(root_node, source: bytes, language: str) -> List[Tuple[int, int, str, Dict]]:
-    """
-    Extrait les attributs de classe (variables de classe, propriétés, fields, etc.).
-    Retourne une liste de tuples (start_line, end_line, text, metadata).
-    """
-    attributes = []
-    
-    # Types de noeuds pour les attributs selon le langage
-    ATTRIBUTE_TYPES = {
-        "python": {"assignment", "expression_statement"},
-        "javascript": {"field_definition", "public_field_definition"},
-        "typescript": {"field_definition", "public_field_definition", "property_signature"},
-        "tsx": {"field_definition", "public_field_definition", "property_signature"},
-        "java": {"field_declaration"},
-        "c_sharp": {"field_declaration", "property_declaration"},
-        "cpp": {"field_declaration"},
-        "c": {"field_declaration"},
-        "go": {"field_declaration"},
-        "rust": {"field_declaration"},
-        "php": {"property_declaration"},
-        "ruby": {"assignment", "instance_variable"},
-        "kotlin": {"property_declaration"},
-        "swift": {"property_declaration"},
-    }
-    
-    CLASS_TYPES = {
-        "class_definition",
-        "class_declaration",
-        "interface_declaration",
-        "struct_specifier",
-    }
-    
-    attribute_types = ATTRIBUTE_TYPES.get(language, set())
-    if not attribute_types:
-        return []
-    
-    def is_class_level_attribute(node, parent_class_node):
-        """Vérifie si un noeud est un attribut au niveau de la classe (pas dans une méthode)."""
-        if parent_class_node is None:
-            return False
-        
-        # Remonter pour vérifier qu'on est directement dans le corps de la classe
-        current = node.parent
-        while current and current != parent_class_node:
-            # Si on traverse une fonction/méthode, ce n'est pas un attribut de classe
-            if current.type in {"function_definition", "method_definition", "function_declaration"}:
-                return False
-            current = current.parent
-        
-        return current == parent_class_node
-    
-    def walk_for_attributes(node, parent_class_node=None):
-        # Détecter si c'est une classe
-        if node.type in CLASS_TYPES:
-            parent_class_node = node
-            class_name = extract_name_from_node(node, source)
-        
-        # Vérifier si c'est un attribut de classe
-        if node.type in attribute_types and parent_class_node:
-            if is_class_level_attribute(node, parent_class_node):
-                # Extraire les informations
-                start = node.start_point[0] + 1
-                end = node.end_point[0] + 1
-                text = source[node.start_byte:node.end_byte].decode("utf-8").strip()
-                
-                if text:
-                    # Extraire le nom de l'attribut
-                    attr_name = None
-                    if language == "python":
-                        # Pour Python: chercher pattern "name = value"
-                        for child in node.children:
-                            if child.type == "assignment":
-                                left = child.child_by_field_name("left")
-                                if left and left.type == "identifier":
-                                    attr_name = source[left.start_byte:left.end_byte].decode("utf-8")
-                                    break
-                            elif child.type == "identifier":
-                                attr_name = source[child.start_byte:child.end_byte].decode("utf-8")
-                                break
-                    else:
-                        # Pour les autres langages: chercher identifier ou declarator
-                        for child in node.children:
-                            if child.type in {"identifier", "variable_declarator", "property_identifier"}:
-                                if child.type == "variable_declarator":
-                                    name_node = child.child_by_field_name("name")
-                                    if name_node:
-                                        attr_name = source[name_node.start_byte:name_node.end_byte].decode("utf-8")
-                                else:
-                                    attr_name = source[child.start_byte:child.end_byte].decode("utf-8")
-                                break
-                    
-                    parent_class_name = extract_name_from_node(parent_class_node, source)
-                    metadata = {
-                        "type": "class_attribute",
-                        "name": attr_name,
-                        "parent_class": parent_class_name
-                    }
-                    attributes.append((start, end, text, metadata))
-        
-        # Continuer la traversée
-        for child in node.children:
-            walk_for_attributes(child, parent_class_node)
-    
-    walk_for_attributes(root_node)
-    return attributes
-
-def extract_imports(root_node, source: bytes, _language: str) -> List[str]:
-    """Extrait tous les imports/includes d'un fichier."""
-    imports = []
-    
-    IMPORT_TYPES = {
-        "import_statement",
-        "import_from_statement",
-        "preproc_include",
-        "using_directive",
-        "package_declaration",
-    }
-    
-    def walk_imports(node):
-        if node.type in IMPORT_TYPES:
-            import_text = source[node.start_byte:node.end_byte].strip()
-            imports.append(import_text)
-        for child in node.children:
-            walk_imports(child)
-    
-    walk_imports(root_node)
-    return imports
-
-def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, int, str, Dict]], List[str], Dict[str, List[int]]]:
-    """
-    Retourne des chunks (start_line, end_line, text, metadata) pour fonctions/classes/attributs.
-    metadata contient: {type, name, class_name, parent_class}
-    Si rien de structuré trouvé, fallback: chunk par ~120 lignes.
-    
-    Retourne: (chunks, imports, class_methods_map)
-    class_methods_map: Dict[class_name, List[chunk_index]] pour lier classes et méthodes/attributs
-    """
-    try:
-        parser = get_parser(language)
-    except LookupError as e:  # type: ignore
-        print(f"[WARN] extract_code_chunks: pas de parser pour '{language}': {e}", file=sys.stderr)
-        # parser non dispo -> fallback lignes
-        lines = source.decode("utf-8").splitlines()
-        chunks = []
-        step = 120
-        for i in range(0, len(lines), step):
-            part = "\n".join(lines[i:i+step])
-            if part.strip():
-                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "text"}))
-        return chunks, [], {}
-    tree = parser.parse(source)
-    root = tree.root_node
-
-    # Extraire les imports une fois pour tout le fichier
-    imports = extract_imports(root, source, language)
-    
-    # Extraire les attributs de classe
-    class_attributes = extract_class_attributes(root, source, language)
-
-    # Noms de noeuds typiques par langage
-    FUNCTION_TYPES = {
-        "function_definition",
-        "function_declaration",
-    }
-    
-    METHOD_TYPES = {
-        "method_definition",
-    }
-    
-    CLASS_TYPES = {
-        "class_definition",
-        "class_declaration",
-        "interface_declaration",
-        "struct_specifier",
-        "enum_specifier",
-    }
-    
-    MODULE_TYPES = {
-        "module_declaration",
-    }
-
-    chunks = []
-    class_methods_map = {}  # {class_name: [chunk_indices]}
-    
-    def is_docstring(node):
-        if node.type == "string":
-            parent = node.parent
-            if parent is None or parent.type != "expression_statement":
-                return False
-            grandparent = parent.parent
-            if grandparent is None:
-                return False
-            # Vérifie que c'est le premier élément du bloc
-            first_child = grandparent.children[0] if grandparent.children else None
-            return first_child == parent and grandparent.type in ("module", "class_definition", "function_definition")
-        elif node.type == "comment" and node.parent is not None:
-            parent = node.parent
-            next_node = node.next_sibling
-            return next_node is not None and next_node.type == "class_definition"
-
-    
-    def walk(node, parent_class=None):
-        # Identifier le type de noeud
-        chunk_type = None
-        if node.type in CLASS_TYPES:
-            chunk_type = "class"
-        elif node.type in METHOD_TYPES:
-            chunk_type = "method"
-        elif node.type in FUNCTION_TYPES:
-            if parent_class:
-                chunk_type = "method"
-            else:
-                chunk_type = "function"
-        elif node.type in MODULE_TYPES:
-            chunk_type = "module"
-        
-        if chunk_type:
-            start = node.start_point[0] + 1
-            end = node.end_point[0] + 1
-            text = source[node.start_byte:node.end_byte].decode("utf-8")
-            
-            if text.strip():
-                name = extract_name_from_node(node, source)
-                metadata = {
-                    "type": chunk_type,
-                    "name": name,
-                    "parent_class": parent_class
-                }
-                chunk_index = len(chunks)
-                chunks.append((start, end, text, metadata))
-                
-                # Si c'est une méthode, l'ajouter à la map de sa classe
-                if chunk_type == "method" and parent_class:
-                    if parent_class not in class_methods_map:
-                        class_methods_map[parent_class] = []
-                    class_methods_map[parent_class].append(chunk_index)
-                
-                # Si c'est une classe, on marque les méthodes enfants avec ce parent
-                if chunk_type == "class":
-                    parent_class = name
-        
-        # Continuer la marche récursive
-        for c in node.children:
-            walk(c, parent_class)
-
-    walk(root)
-    
-    # Ajouter les attributs de classe extraits aux chunks
-    for start, end, text, metadata in class_attributes:
-        chunk_index = len(chunks)
-        chunks.append((start, end, text, metadata))
-        
-        # Ajouter l'attribut à la map de sa classe parente
-        parent_class = metadata.get("parent_class")
-        if parent_class:
-            if parent_class not in class_methods_map:
-                class_methods_map[parent_class] = []
-            class_methods_map[parent_class].append(chunk_index)
-
-    if not chunks:
-        # fallback: grands blocs
-        lines = source.decode("utf-8").splitlines()
-        step = 120
-        for i in range(0, len(lines), step):
-            part = "\n".join(lines[i:i+step])
-            if part.strip():
-                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "block"}))
-        return chunks, imports, {}
-
-    # Limiter la taille de chunk (~1500 tokens équiv) par nombre de caractères
-    MAX_CHARS = 6000
-    final = []
-    for s, e, t, meta in chunks:
-        if len(t) <= MAX_CHARS:
-            final.append((s, e, t, meta))
-        else:
-            # re-split par lignes
-            lines = t.splitlines()
-            buf, start = [], s
-            count = 0
-            for idx, line in enumerate(lines):
-                buf.append(line)
-                count += len(line) + 1
-                if count >= MAX_CHARS:
-                    segment = "\n".join(buf)
-                    final.append((start, s + idx, segment, {**meta, "type": "partial"}))
-                    buf, start, count = [], s + idx + 1, 0
-            if buf:
-                final.append((start, e, "\n".join(buf), meta))
-    
-    # Mettre à jour class_methods_map avec les nouveaux indices après split
-    # Note: les indices peuvent avoir changé, mais on garde la structure originale
-    # car le split ne devrait affecter que les chunks trop longs
-    
-    # Retourner aussi les imports et le mapping classe->méthodes
-    return final, imports, class_methods_map
-
-def extract_text_chunks(source: bytes, max_chars: int = 3000) -> Tuple[List[Tuple[int, int, str, Dict]], List[str], Dict[str, List[int]]]:
-    # Split par paragraphes, puis pack jusqu'à ~max_chars
-    text = source.decode("utf-8")
-    paras = [p.strip() for p in text.split("\n\n") if p.strip()]
-    chunks = []
-    buf = []
-    size = 0
-    start = 1
-    line_counter = 1
-    for p in paras:
-        if size + len(p) + 2 > max_chars and buf:
-            chunk = "\n\n".join(buf)
-            end = line_counter
-            chunks.append((start, end, chunk, {"type": "text"}))
-            buf, size, start = [], 0, line_counter + 1
-        buf.append(p)
-        size += len(p) + 2
-        line_counter += p.count("\n") + 2
-    if buf:
-        chunks.append((start, line_counter, "\n\n".join(buf), {"type": "text"}))
-    return chunks, [], {}
+    """Read file content safely with size limit. Wrapper for backward compatibility."""
+    return _read_text_safe(path, max_bytes)
 
 
 # --------------------------
@@ -1348,6 +991,743 @@ class LongTermMemory:
 
     def search_by_type(self, chunk_type: str, name_pattern: Optional[str] = None) -> List[Dict]:
         return self.db.search_by_type(chunk_type, name_pattern)
+
+    # ============================================================
+    # Souvenir/Memory API - High-level methods for souvenir_assistant
+    # These wrap db + embeddings operations for cleaner interface
+    # ============================================================
+
+    def add_memory_chunk(
+        self,
+        document_id: str,
+        ord: int,
+        start_line: int,
+        end_line: int,
+        content: str,
+        chunk_type: str = "text",
+        chunk_name: Optional[str] = None,
+        parent_class: Optional[str] = None,
+        embed: bool = True,
+    ) -> int:
+        """
+        Add a chunk to the database with automatic embedding handling.
+        
+        Handles embedding computation, duplicate detection, and reuse automatically.
+        
+        Args:
+            document_id: The document this chunk belongs to
+            ord: Ordinal position
+            start_line: Starting line number
+            end_line: Ending line number
+            content: The text content of the chunk
+            chunk_type: Type of chunk (text, class, method, function, etc.)
+            chunk_name: Optional name for the chunk
+            parent_class: Optional parent class name (for methods/attributes)
+            embed: Whether to compute and store embeddings (default: True)
+            
+        Returns:
+            The chunk_id of the inserted chunk
+        """
+        # Insert chunk into database
+        chunk_id = self.db.insert_chunk(
+            document_id, ord, start_line, end_line, content,
+            chunk_type, chunk_name, parent_class
+        )
+        
+        # Add embedding with automatic duplicate detection and reuse
+        if embed and self.embeddings is not None and content.strip():
+            existing_faiss_id = self.embedding_exists(content)
+            if existing_faiss_id is not None:
+                # Reuse existing embedding
+                self.db.insert_faiss_mapping(existing_faiss_id, chunk_id)
+            else:
+                # Compute new embedding
+                emb = self.embeddings.encode([content], normalize=True)
+                faiss_ids = self.embeddings.add_embeddings(emb)
+                self.db.insert_faiss_mapping(faiss_ids[0], chunk_id)
+                self.embeddings.persist()
+        
+        return chunk_id
+
+    def add_memory(
+        self,
+        content: str,
+        source_path: str = "memory",
+        title: Optional[str] = None,
+        category: str = "general",
+        tags: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """
+        Add a memory/souvenir to the database.
+        
+        This is a high-level method that handles document creation,
+        chunk creation, and embedding indexing.
+        
+        Args:
+            content: The memory content
+            source_path: Source path or identifier
+            title: Optional title
+            category: Category (default: general)
+            tags: Optional list of tags
+            
+        Returns:
+            Dict with 'ok' and 'document_id' or 'error'
+        """
+        import hashlib
+        
+        # Generate document ID from content
+        doc_id = hashlib.sha256(content.encode()).hexdigest()
+        
+        # Check if document already exists
+        existing = self.db.get_document_info(doc_id)
+        if existing:
+            return {"ok": True, "document_id": doc_id, "message": "Memory already exists"}
+        
+        # Insert document
+        self.db.insert_document(
+            doc_id=doc_id,
+            source_path=source_path,
+            rel_path=None,
+            media_type="text",
+            language=None,
+            sha256=doc_id,
+            size_bytes=len(content),
+            category=category,
+            extra={"title": title, "tags": tags or []}
+        )
+        
+        # Add chunk with embedding
+        self.add_memory_chunk(
+            document_id=doc_id,
+            content=content,
+            chunk_type="memory",
+            chunk_name=title,
+        )
+        
+        return {"ok": True, "document_id": doc_id, "message": "Memory added successfully"}
+
+    def get_memory(self, memory_id: str) -> Optional[Dict]:
+        """Get a memory by its ID."""
+        return self.db.get_document_details(memory_id)
+
+    def search_memories(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        top_k: int = 10,
+        mode: str = "hybrid",
+    ) -> List[Dict]:
+        """
+        Search memories using hybrid search.
+        
+        Args:
+            query: Search query
+            category: Optional category filter
+            top_k: Number of results
+            mode: Search mode (keyword, semantic, hybrid)
+            
+        Returns:
+            List of memory results
+        """
+        results = self.search(query, top_k=top_k, mode=mode)
+        
+        # Filter by category if specified
+        if category:
+            results = [r for r in results if r.get("category") == category]
+        
+        return results
+
+    def get_memory_chunks(self, memory_id: str) -> List[Dict]:
+        """Get all chunks for a memory document."""
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            cur.execute("""
+                SELECT id, ord, start_line, end_line, content, chunk_type, chunk_name
+                FROM chunks
+                WHERE document_id = ?
+                ORDER BY ord
+            """, (memory_id,))
+            
+            return [
+                {
+                    "chunk_id": row[0],
+                    "ord": row[1],
+                    "start_line": row[2],
+                    "end_line": row[3],
+                    "content": row[4],
+                    "chunk_type": row[5],
+                    "chunk_name": row[6],
+                }
+                for row in cur.fetchall()
+            ]
+
+    # ============================================================
+    # Category Management
+    # ============================================================
+
+    def list_categories(self) -> List[Dict]:
+        """List all categories."""
+        return self.db.list_categories()
+
+    def create_category(
+        self,
+        name: str,
+        description: str = "",
+        color: str = "#6B7280",
+        icon: str = "📂",
+    ) -> int:
+        """Create a new category."""
+        return self.db.create_category(name, description, color, icon)
+
+    def get_category(self, name: str) -> Optional[Dict]:
+        """Get a category by name."""
+        return self.db.get_category(name)
+
+    # ============================================================
+    # Embedding utilities
+    # ============================================================
+
+    def encode_text(self, text: str, normalize: bool = True) -> Optional[np.ndarray]:
+        """
+        Encode text to embedding vector.
+        
+        Args:
+            text: Text to encode
+            normalize: Whether to normalize the vector
+            
+        Returns:
+            Embedding vector or None if embeddings not available
+        """
+        if self.embeddings is None:
+            return None
+        return self.embeddings.encode([text], normalize=normalize)[0]
+
+    def find_similar(
+        self,
+        text: str,
+        top_k: int = 5,
+        exclude_doc_id: Optional[str] = None,
+    ) -> List[Dict]:
+        """
+        Find similar chunks using semantic search.
+        
+        Args:
+            text: Query text
+            top_k: Number of results
+            exclude_doc_id: Optional document ID to exclude from results
+            
+        Returns:
+            List of similar chunks with scores
+        """
+        if self.embeddings is None or self.embeddings.ntotal == 0:
+            return []
+        
+        query_emb = self.embeddings.encode([text], normalize=True)
+        distances, indices = self.embeddings.search(query_emb, top_k)
+        
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            if idx == -1:
+                continue
+            
+            # Get chunk from mapping
+            mapping = self.db.get_faiss_chunk_mapping([int(idx)])
+            chunk_id = mapping.get(int(idx))
+            if chunk_id is None:
+                continue
+            
+            chunk = self.db.get_chunk_by_id(chunk_id)
+            if not chunk:
+                continue
+            
+            # Optionally exclude a document
+            if exclude_doc_id and chunk[1] == exclude_doc_id:
+                continue
+            
+            results.append({
+                "chunk_id": chunk[0],
+                "document_id": chunk[1],
+                "content": chunk[6],
+                "score": float(dist),
+                "chunk_type": chunk[4],
+                "chunk_name": chunk[5],
+            })
+        
+        return results
+
+    def is_embeddings_available(self) -> bool:
+        """Check if embeddings are available."""
+        return self.embeddings is not None
+
+    def embeddings_count(self) -> int:
+        """Get the number of embeddings in the index."""
+        if self.embeddings is None:
+            return 0
+        return self.embeddings.ntotal
+
+    def search_embeddings(
+        self,
+        query_embedding: np.ndarray,
+        top_k: int = 5,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Search embeddings index.
+        
+        Args:
+            query_embedding: The query vector
+            top_k: Number of results
+            
+        Returns:
+            Tuple of (distances, indices)
+        """
+        if self.embeddings is None:
+            return np.array([]), np.array([-1])
+        return self.embeddings.search(query_embedding.reshape(1, -1), top_k)
+
+    def add_embedding(
+        self,
+        content: str,
+        chunk_id: int,
+    ) -> Optional[int]:
+        """
+        Add an embedding for content and map it to a chunk.
+        
+        Args:
+            content: Text content to embed
+            chunk_id: The chunk ID to map the embedding to
+            
+        Returns:
+            FAISS ID or None if embeddings not available
+        """
+        if self.embeddings is None or not content.strip():
+            return None
+        
+        emb = self.embeddings.encode([content], normalize=True)
+        faiss_ids = self.embeddings.add_embeddings(emb)
+        self.db.insert_faiss_mapping(faiss_ids[0], chunk_id)
+        return faiss_ids[0]
+
+    def add_embedding_for_existing_chunk(
+        self,
+        content: str,
+        chunk_id: int,
+        existing_faiss_id: Optional[int] = None,
+    ) -> int:
+        """
+        Add embedding for an existing chunk, optionally using existing FAISS ID.
+        
+        Args:
+            content: Text content
+            chunk_id: Chunk ID
+            existing_faiss_id: Optional existing FAISS ID to reuse
+            
+        Returns:
+            FAISS ID used
+        """
+        if existing_faiss_id is not None and existing_faiss_id >= 0:
+            self.db.insert_faiss_mapping(existing_faiss_id, chunk_id)
+            return existing_faiss_id
+        
+        return self.add_embedding(content, chunk_id) or -1
+
+    def persist_embeddings(self):
+        """Persist embeddings to disk."""
+        if self.embeddings is not None:
+            self.embeddings.persist()
+
+    # ============================================================
+    # Search API - Comprehensive search methods that combine
+    # embeddings and database lookups
+    # ============================================================
+
+    def find_similar_documents(
+        self,
+        query_text: str,
+        top_k: int = 5,
+        similarity_threshold: float = 0.95,
+    ) -> List[Dict[str, Any]]:
+        """
+        Find documents with similar content using semantic search.
+        
+        Args:
+            query_text: The text to search for
+            top_k: Maximum number of results to return
+            similarity_threshold: Minimum similarity score (0-1) to consider a match
+            
+        Returns:
+            List of similar documents with their similarity scores
+        """
+        if not self.is_embeddings_available():
+            return []
+        
+        try:
+            # Encode the query
+            query_emb = self.encode_text(query_text, normalize=True)
+            
+            # Search in FAISS index
+            distances, indices = self.search_embeddings(query_emb, top_k)
+            
+            # Get chunk information for matches above threshold
+            similar_docs = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if dist >= similarity_threshold and idx >= 0:
+                    # Get chunk info from database
+                    chunk_info = self.get_chunk_by_id(int(idx))
+                    if chunk_info:
+                        chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
+                        # Get full document details
+                        doc_details = self.get_memory(doc_id)
+                        if doc_details:
+                            similar_docs.append({
+                                "chunk_id": chunk_id,
+                                "document_id": doc_id,
+                                "document": doc_details.get("document"),
+                                "chunk_content": content,
+                                "chunk_type": chunk_type,
+                                "similarity_score": float(dist)
+                            })
+            
+            return similar_docs
+        except Exception as e:
+            print(f"Error searching for similar documents: {e}")
+            return []
+
+    def embedding_exists(
+        self,
+        text: str,
+        similarity_threshold: float = 0.9999
+    ) -> Optional[int]:
+        """
+        Check if an embedding for the given text already exists.
+        
+        Uses exact match (cosine similarity = 1.0 for normalized embeddings).
+        
+        Args:
+            text: The text to check
+            similarity_threshold: Minimum similarity to consider as exact match
+            
+        Returns:
+            FAISS ID if found, None otherwise
+        """
+        if not self.is_embeddings_available() or self.embeddings_count() == 0:
+            return None
+        
+        try:
+            # Encode the text
+            text_emb = self.encode_text(text, normalize=True)
+            
+            # Search for exact match
+            distances, indices = self.search_embeddings(text_emb, 1)
+            
+            # Check if we have an exact match
+            if distances[0][0] >= similarity_threshold and indices[0][0] >= 0:
+                return int(indices[0][0])
+            
+            return None
+        except Exception as e:
+            print(f"Error checking embedding existence: {e}")
+            return None
+
+    def search_by_chunk_type(
+        self,
+        chunk_types: List[str],
+        query: Optional[str] = None,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for documents by specific chunk types.
+        
+        Args:
+            chunk_types: List of chunk types to search (e.g., ['email_action_items', 'email_key_points'])
+            query: Optional text query to further filter results
+            top_k: Maximum number of results
+            
+        Returns:
+            List of documents matching the criteria
+        """
+        try:
+            with self.db._lock:
+                cur = self.db.conn.cursor()
+                
+                placeholders = ','.join('?' * len(chunk_types))
+                sql = f"""
+                    SELECT d.id, d.source_path, d.category, d.created_at, d.extra, c.content, c.chunk_type, c.chunk_name
+                    FROM documents d
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE c.chunk_type IN ({placeholders})
+                """
+                
+                params = list(chunk_types)
+                
+                if query:
+                    sql += " AND c.content LIKE ?"
+                    params.append(f'%{query}%')
+                
+                sql += " ORDER BY d.created_at DESC LIMIT ?"
+                params.append(top_k)
+                
+                cur.execute(sql, params)
+                rows = cur.fetchall()
+            
+            # Group results by document
+            doc_results = {}
+            for row in rows:
+                doc_id = row[0]
+                if doc_id not in doc_results:
+                    extra = json.loads(row[4] or '{}') if row[4] else {}
+                    doc_results[doc_id] = {
+                        "id": doc_id,
+                        "title": extra.get('title', 'Untitled'),
+                        "content": row[5],  # First chunk content
+                        "category": row[2],
+                        "tags": extra.get('tags', []),
+                        "created_at": row[3],
+                        "matching_chunks": []
+                    }
+                doc_results[doc_id]["matching_chunks"].append({
+                    "content": row[5],
+                    "chunk_type": row[6],
+                    "chunk_name": row[7]
+                })
+            
+            return list(doc_results.values())
+        except Exception as e:
+            print(f"Search by chunk type error: {e}")
+            return []
+
+    def search_semantic(
+        self,
+        query: str,
+        top_k: int = 5,
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for souvenirs using semantic embeddings.
+        
+        Args:
+            query: The search query
+            top_k: Maximum number of results
+            
+        Returns:
+            List of souvenirs with similarity scores
+        """
+        if not self.is_embeddings_available():
+            return []
+        
+        try:
+            # Encode query
+            query_emb = self.encode_text(query, normalize=True)
+            
+            # Search embeddings
+            distances, indices = self.search_embeddings(query_emb, top_k)
+            
+            results = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx >= 0:
+                    # Get chunk info
+                    chunk_info = self.get_chunk_by_id(int(idx))
+                    if chunk_info:
+                        chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
+                        
+                        # Get document info
+                        doc_info = self.db.get_document_info(doc_id)
+                        if doc_info:
+                            extra = json.loads(doc_info.get('extra', '{}')) if doc_info.get('extra') else {}
+                            results.append({
+                                "id": doc_id,
+                                "title": extra.get('title', 'Untitled'),
+                                "content": content,
+                                "category": doc_info.get('category', 'general'),
+                                "tags": extra.get('tags', []),
+                                "created_at": doc_info.get('created_at', ''),
+                                "similarity_score": float(dist),
+                                "chunk_type": chunk_type,
+                            })
+            
+            return results
+        except Exception as e:
+            print(f"Semantic search error: {e}")
+            return []
+
+    # ============================================================
+    # Legacy/Souvenir API - For backward compatibility with souvenir_assistant
+    # These wrap common db + embeddings patterns
+    # ============================================================
+
+    def insert_souvenir(
+        self,
+        content: str,
+        category: str = "general",
+        title: Optional[str] = None,
+        source: str = "manual",
+        tags: Optional[List[str]] = None,
+    ) -> str:
+        """
+        Insert a souvenir/memory (legacy method).
+        
+        Args:
+            content: The memory content
+            category: Category name
+            title: Optional title
+            source: Source identifier
+            tags: Optional tags
+            
+        Returns:
+            Document ID
+        """
+        import hashlib
+        doc_id = hashlib.sha256(content.encode()).hexdigest()
+        
+        # Check if exists
+        existing = self.db.get_document_info(doc_id)
+        if existing:
+            return doc_id
+        
+        self.db.insert_document(
+            doc_id=doc_id,
+            source_path=source,
+            rel_path=None,
+            media_type="text",
+            language=None,
+            sha256=doc_id,
+            size_bytes=len(content),
+            category=category,
+            extra={"title": title, "tags": tags or []}
+        )
+        
+        # Add chunk
+        self.add_memory_chunk(
+            document_id=doc_id,
+            content=content,
+            chunk_type="souvenir",
+            chunk_name=title,
+        )
+        
+        return doc_id
+
+    def list_souvenirs(
+        self,
+        category: Optional[str] = None,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict]:
+        """
+        List souvenirs (legacy method).
+        
+        Args:
+            category: Optional category filter
+            limit: Maximum number to return
+            offset: Offset for pagination
+            
+        Returns:
+            List of souvenirs
+        """
+        with self.db._lock:
+            cur = self.db.conn.cursor()
+            
+            query = "SELECT doc_id, source_path, category, extra FROM documents WHERE 1=1"
+            params = []
+            
+            if category:
+                query += " AND category = ?"
+                params.append(category)
+            
+            query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+            params.extend([limit, offset])
+            
+            cur.execute(query, params)
+            rows = cur.fetchall()
+            
+            return [
+                {
+                    "document_id": row[0],
+                    "source_path": row[1],
+                    "category": row[2],
+                    "title": (row[3].get("title") if row[3] else None),
+                    "tags": (row[3].get("tags") if row[3] else []),
+                }
+                for row in rows
+            ]
+
+    def search_souvenirs(
+        self,
+        query: str,
+        category: Optional[str] = None,
+        limit: int = 20,
+    ) -> List[Dict]:
+        """
+        Search souvenirs using keyword search.
+        
+        Args:
+            query: Search query
+            category: Optional category filter
+            limit: Maximum results
+            
+        Returns:
+            List of matching souvenirs
+        """
+        # Use hybrid search from parent method
+        results = self.search(query, top_k=limit, mode="hybrid")
+        
+        souvenirs = []
+        for r in results:
+            doc = r.get("document", {})
+            if category and doc.get("category") != category:
+                continue
+            souvenirs.append({
+                "document_id": doc.get("doc_id"),
+                "title": doc.get("extra", {}).get("title"),
+                "category": doc.get("category"),
+                "source_path": doc.get("source_path"),
+                "content": r.get("chunk_content"),
+                "score": r.get("score"),
+            })
+        
+        return souvenirs
+
+    def get_document_info(self, doc_id: str) -> Optional[Dict]:
+        """Get document info by ID."""
+        return self.db.get_document_info(doc_id)
+
+    def get_chunk_by_id(self, chunk_id: int) -> Optional[Tuple]:
+        """Get chunk by ID."""
+        return self.db.get_chunk_by_id(chunk_id)
+
+    def create_category_if_not_exists(
+        self,
+        name: str,
+        description: str = "",
+        color: str = "#6B7280",
+        icon: str = "📂",
+    ) -> int:
+        """Create category if it doesn't exist, return ID."""
+        existing = self.db.get_category(name)
+        if existing:
+            return existing.get("id", 0)
+        return self.db.create_category(name, description, color, icon)
+
+    @property
+    def connection(self):
+        """Get database connection (legacy property)."""
+        return self.db.conn
+
+    @property
+    def db_lock(self):
+        """Get database lock (legacy property)."""
+        return self.db._lock
+
+    # ============================================================
+    # Low-level access (for backward compatibility)
+    # ============================================================
+
+    @property
+    def db_manager(self):
+        """Access the database manager directly (backward compatibility)."""
+        return self.db
+
+    @property
+    def embedding_manager(self):
+        """Access the embedding manager directly (backward compatibility)."""
+        return self.embeddings
 
     def close(self):
         if self.embeddings is not None:

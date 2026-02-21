@@ -29,6 +29,7 @@ import configurator
 import litellm
 from storage.longterm_memory import LongTermMemory
 from storage.DatabaseManagement import DatabaseManager
+from storage.llm_extractor import LLMExtractor  # Shared LLM extractor
 from typing import Optional, List, Dict, Any, Callable
 import re
 import json
@@ -867,7 +868,7 @@ Memories:
             souvenir_id = str(uuid.uuid4())[:8]
             
             # Use the DatabaseManager directly to insert a souvenir
-            self.ltm.db.insert_souvenir(
+            self.ltm.insert_souvenir(
                 doc_id=souvenir_id,
                 content=content,
                 title=title,
@@ -896,48 +897,13 @@ Memories:
     ) -> List[Dict[str, Any]]:
         """Find documents with similar content using semantic search.
         
-        Args:
-            query_text: The text to search for
-            top_k: Maximum number of results to return
-            similarity_threshold: Minimum similarity score (0-1) to consider a match
-            
-        Returns:
-            List of similar documents with their similarity scores
+        Delegates to LongTermMemory.find_similar_documents()
         """
-        if self.ltm.embeddings is None:
-            return []
-        
-        try:
-            # Encode the query
-            query_emb = self.ltm.embeddings.encode([query_text], normalize=True)
-            
-            # Search in FAISS index
-            distances, indices = self.ltm.embeddings.search(query_emb, top_k)
-            
-            # Get chunk information for matches above threshold
-            similar_docs = []
-            for dist, idx in zip(distances[0], indices[0]):
-                if dist >= similarity_threshold and idx >= 0:
-                    # Get chunk info from FAISS mapping
-                    chunk_info = self.ltm.db.get_chunk_by_id(int(idx))
-                    if chunk_info:
-                        chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
-                        # Get full document details
-                        doc_details = self.ltm.db.get_document_details(doc_id)
-                        if doc_details:
-                            similar_docs.append({
-                                "chunk_id": chunk_id,
-                                "document_id": doc_id,
-                                "document": doc_details["document"],
-                                "chunk_content": content,
-                                "chunk_type": chunk_type,
-                                "similarity_score": float(dist)
-                            })
-            
-            return similar_docs
-        except Exception as e:
-            print(f"Error searching for similar documents: {e}")
-            return []
+        return self.ltm.find_similar_documents(
+            query_text=query_text,
+            top_k=top_k,
+            similarity_threshold=similarity_threshold
+        )
     
     def embedding_exists(
         self,
@@ -946,33 +912,12 @@ Memories:
     ) -> Optional[int]:
         """Check if an embedding for the given text already exists.
         
-        Uses exact match (cosine similarity = 1.0 for normalized embeddings).
-        
-        Args:
-            text: The text to check
-            similarity_threshold: Minimum similarity to consider as exact match
-            
-        Returns:
-            FAISS ID if found, None otherwise
+        Delegates to LongTermMemory.embedding_exists()
         """
-        if self.ltm.embeddings is None or self.ltm.embeddings.ntotal == 0:
-            return None
-        
-        try:
-            # Encode the text
-            text_emb = self.ltm.embeddings.encode([text], normalize=True)
-            
-            # Search for exact match
-            distances, indices = self.ltm.embeddings.search(text_emb, 1)
-            
-            # Check if we have an exact match
-            if distances[0][0] >= similarity_threshold and indices[0][0] >= 0:
-                return int(indices[0][0])
-            
-            return None
-        except Exception as e:
-            print(f"Error checking embedding existence: {e}")
-            return None
+        return self.ltm.embedding_exists(
+            text=text,
+            similarity_threshold=similarity_threshold
+        )
     
     def add_email_memory(
         self,
@@ -1047,7 +992,7 @@ Memories:
             
             # Insert the document
             content_preview = conversation_info.get('topic', '')[:500]
-            self.ltm.db.insert_document(
+            self.ltm.db_manager.insert_document(
                 doc_id=memory_id,
                 source_path=f"email_memory:{memory_id}",
                 rel_path=None,
@@ -1065,30 +1010,19 @@ Memories:
             # Chunk 1: Topic/Summary
             if conversation_info.get("topic"):
                 topic_content = f"Topic: {conversation_info['topic']}"
-                topic_chunk_id = self.ltm.db.insert_chunk(
+                topic_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(topic_content.split('\n')),
                     topic_content, 'email_topic', conversation_info['topic'][:50], None
                 )
                 chunk_ordinal += 1
-                
-                # Add embedding for topic (check for duplicates)
-                if self.ltm.embeddings is not None:
-                    existing_faiss_id = self.embedding_exists(topic_content)
-                    if existing_faiss_id is None:
-                        emb = self.ltm.embeddings.encode([topic_content], normalize=True)
-                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], topic_chunk_id)
-                    else:
-                        # Reuse existing embedding
-                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, topic_chunk_id)
             
-            # Chunk 2: Participants
+            # Chunk 2: Participants (no embeddings - contains email addresses)
             participants = conversation_info.get("participants", [])
             if participants:
                 participants_content = "Participants:\n" + "\n".join(f"  - {p}" for p in participants)
-                participants_chunk_id = self.ltm.db.insert_chunk(
+                participants_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(participants_content.split('\n')),
-                    participants_content, 'email_participants', None, None
+                    participants_content, 'email_participants', None, None, embed=False
                 )
                 chunk_ordinal += 1
             
@@ -1096,51 +1030,29 @@ Memories:
             key_points = conversation_info.get("key_points", [])
             if key_points:
                 key_points_content = "Key Points:\n" + "\n".join(f"  - {point}" for point in key_points)
-                key_points_chunk_id = self.ltm.db.insert_chunk(
+                key_points_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(key_points_content.split('\n')),
                     key_points_content, 'email_key_points', None, None
                 )
                 chunk_ordinal += 1
-                
-                # Add embedding for key points (check for duplicates)
-                if self.ltm.embeddings is not None:
-                    existing_faiss_id = self.embedding_exists(key_points_content)
-                    if existing_faiss_id is None:
-                        emb = self.ltm.embeddings.encode([key_points_content], normalize=True)
-                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], key_points_chunk_id)
-                    else:
-                        # Reuse existing embedding
-                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, key_points_chunk_id)
             
             # Chunk 4: Action Items
             action_items = conversation_info.get("action_items", [])
             if action_items:
                 action_items_content = "Action Items:\n" + "\n".join(f"  - {item}" for item in action_items)
-                action_items_chunk_id = self.ltm.db.insert_chunk(
+                action_items_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(action_items_content.split('\n')),
                     action_items_content, 'email_action_items', None, None
                 )
                 chunk_ordinal += 1
-                
-                # Add embedding for action items (check for duplicates)
-                if self.ltm.embeddings is not None:
-                    existing_faiss_id = self.embedding_exists(action_items_content)
-                    if existing_faiss_id is None:
-                        emb = self.ltm.embeddings.encode([action_items_content], normalize=True)
-                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], action_items_chunk_id)
-                    else:
-                        # Reuse existing embedding
-                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, action_items_chunk_id)
             
             # Chunk 5: Important Dates
             important_dates = conversation_info.get("important_dates", [])
             if important_dates:
                 dates_content = "Important Dates:\n" + "\n".join(f"  - {date}" for date in important_dates)
-                dates_chunk_id = self.ltm.db.insert_chunk(
+                dates_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(dates_content.split('\n')),
-                    dates_content, 'email_dates', None, None
+                    dates_content, 'email_dates', None, None, embed=False
                 )
                 chunk_ordinal += 1
             
@@ -1167,9 +1079,9 @@ Memories:
                 
                 if entities_lines:
                     entities_content = "\n".join(entities_lines)
-                    entities_chunk_id = self.ltm.db.insert_chunk(
+                    entities_chunk_id = self.ltm.add_memory_chunk(
                         memory_id, chunk_ordinal, 1, len(entities_content.split('\n')),
-                        entities_content, 'email_entities', None, None
+                        entities_content, 'email_entities', None, None, embed=False
                     )
                     chunk_ordinal += 1
             
@@ -1177,22 +1089,11 @@ Memories:
             follow_ups = conversation_info.get("follow_ups", [])
             if follow_ups:
                 follow_ups_content = "Follow-ups:\n" + "\n".join(f"  - {follow_up}" for follow_up in follow_ups)
-                follow_ups_chunk_id = self.ltm.db.insert_chunk(
+                follow_ups_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(follow_ups_content.split('\n')),
                     follow_ups_content, 'email_follow_ups', None, None
                 )
                 chunk_ordinal += 1
-                
-                # Add embedding for follow-ups (check for duplicates)
-                if self.ltm.embeddings is not None:
-                    existing_faiss_id = self.embedding_exists(follow_ups_content)
-                    if existing_faiss_id is None:
-                        emb = self.ltm.embeddings.encode([follow_ups_content], normalize=True)
-                        faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                        self.ltm.db.insert_faiss_mapping(faiss_ids[0], follow_ups_chunk_id)
-                    else:
-                        # Reuse existing embedding
-                        self.ltm.db.insert_faiss_mapping(existing_faiss_id, follow_ups_chunk_id)
             
             # Chunk 8: Original Email Content (truncated for each email)
             if thread_emails:
@@ -1207,26 +1108,11 @@ Memories:
                         email_details.append(preview)
                 
                     email_content = "\n".join(email_details)
-                    email_chunk_id = self.ltm.db.insert_chunk(
+                    email_chunk_id = self.ltm.add_memory_chunk(
                         memory_id, chunk_ordinal, 1, len(email_content.split('\n')),
                         email_content, 'email_original', thread_emails[0].get('subject', '')[:50], None
                     )
                     chunk_ordinal += 1
-                    
-                    # Add embedding for original emails (check for duplicates)
-                    if self.ltm.embeddings is not None:
-                        existing_faiss_id = self.embedding_exists(email_content)
-                        if existing_faiss_id is None:
-                            emb = self.ltm.embeddings.encode([email_content], normalize=True)
-                            faiss_ids = self.ltm.embeddings.add_embeddings(emb)
-                            self.ltm.db.insert_faiss_mapping(faiss_ids[0], email_chunk_id)
-                        else:
-                            # Reuse existing embedding
-                            self.ltm.db.insert_faiss_mapping(existing_faiss_id, email_chunk_id)
-            
-            # Persist embeddings if available
-            if self.ltm.embeddings is not None:
-                self.ltm.embeddings.persist()
             
             return {
                 "ok": True,
@@ -1252,7 +1138,7 @@ Memories:
             Dictionary with memory details and all chunks, or None if not found
         """
         try:
-            details = self.ltm.db.get_document_details(memory_id)
+            details = self.ltm.get_memory(memory_id)
             if not details:
                 return None
             
@@ -1287,7 +1173,7 @@ Memories:
     def search_souvenirs(self, query: str, category: Optional[str] = None, top_k: int = 15) -> List[Dict[str, Any]]:
         """Search for souvenirs matching the query."""
         try:
-            results = self.ltm.db.search_souvenirs(query, category=category, limit=top_k)
+            results = self.ltm.search_souvenirs(query, category=category, limit=top_k)
             
             souvenirs = []
             for r in results:
@@ -1310,63 +1196,13 @@ Memories:
                               top_k: int = 5) -> List[Dict[str, Any]]:
         """Search for souvenirs by specific chunk types.
         
-        Args:
-            chunk_types: List of chunk types to search (e.g., ['email_action_items', 'email_key_points'])
-            query: Optional text query to further filter results
-            top_k: Maximum number of results
-            
-        Returns:
-            List of souvenirs matching the criteria
+        Delegates to LongTermMemory.search_by_chunk_type()
         """
-        try:
-            with self.ltm.db._lock:
-                cur = self.ltm.db.conn.cursor()
-                
-                placeholders = ','.join('?' * len(chunk_types))
-                sql = f"""
-                    SELECT d.id, d.source_path, d.category, d.created_at, d.extra, c.content, c.chunk_type, c.chunk_name
-                    FROM documents d
-                    JOIN chunks c ON d.id = c.document_id
-                    WHERE c.chunk_type IN ({placeholders})
-                """
-                
-                params = list(chunk_types)
-                
-                if query:
-                    sql += " AND c.content LIKE ?"
-                    params.append(f'%{query}%')
-                
-                sql += " ORDER BY d.created_at DESC LIMIT ?"
-                params.append(top_k)
-                
-                cur.execute(sql, params)
-                rows = cur.fetchall()
-            
-            # Group results by document
-            doc_results = {}
-            for row in rows:
-                doc_id = row[0]
-                if doc_id not in doc_results:
-                    extra = json.loads(row[4] or '{}') if row[4] else {}
-                    doc_results[doc_id] = {
-                        "id": doc_id,
-                        "title": extra.get('title', 'Untitled'),
-                        "content": row[5],  # First chunk content
-                        "category": row[2],
-                        "tags": extra.get('tags', []),
-                        "created_at": row[3],
-                        "matching_chunks": []
-                    }
-                doc_results[doc_id]["matching_chunks"].append({
-                    "content": row[5],
-                    "chunk_type": row[6],
-                    "chunk_name": row[7]
-                })
-            
-            return list(doc_results.values())
-        except Exception as e:
-            print(f"Search by chunk type error: {e}")
-            return []
+        return self.ltm.search_by_chunk_type(
+            chunk_types=chunk_types,
+            query=query,
+            top_k=top_k
+        )
     
     def search_semantic(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """Search for souvenirs using semantic embeddings.
@@ -1378,24 +1214,24 @@ Memories:
         Returns:
             List of souvenirs with similarity scores
         """
-        if self.ltm.embeddings is None:
+        if not self.ltm.is_embeddings_available():
             return []
         
         try:
             # Encode the query
-            query_emb = self.ltm.embeddings.encode([query], normalize=True)
+            query_emb = self.ltm.encode_text(query, normalize=True)
             
             # Search in FAISS index
-            distances, indices = self.ltm.embeddings.search(query_emb, top_k)
+            distances, indices = self.ltm.search_embeddings(query_emb, top_k)
             
             # Get chunk information
             results = []
             for dist, idx in zip(distances[0], indices[0]):
                 if idx >= 0:
-                    chunk_info = self.ltm.db.get_chunk_by_id(int(idx))
+                    chunk_info = self.ltm.get_chunk_by_id(int(idx))
                     if chunk_info:
                         chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
-                        doc_details = self.ltm.db.get_document_details(doc_id)
+                        doc_details = self.ltm.get_memory(doc_id)
                         if doc_details:
                             extra = doc_details["document"].get("extra", {})
                             results.append({
@@ -1427,7 +1263,7 @@ Memories:
             Dictionary with search strategy and parameters
         """
         # First, check if we have embeddings for semantic search
-        has_embeddings = self.ltm.embeddings is not None and self.ltm.embeddings.ntotal > 0
+        has_embeddings = self.ltm.embeddings is not None and self.ltm.embeddings_count() > 0
         
         # Define chunk types that can be searched
         chunk_type_info = {
@@ -1659,7 +1495,7 @@ Please provide a detailed answer based on the memories above. If the question as
     def list_souvenirs(self, category: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
         """List all stored souvenirs, optionally filtered by category."""
         try:
-            results = self.ltm.db.list_souvenirs(category=category, limit=limit)
+            results = self.ltm.list_souvenirs(category=category, limit=limit)
             
             souvenirs = []
             for r in results:
@@ -1682,7 +1518,7 @@ Please provide a detailed answer based on the memories above. If the question as
         try:
             stats = self.ltm.stats()
             # Get category counts
-            categories = self.ltm.db.list_categories()
+            categories = self.ltm.list_categories()
             
             return {
                 "documents": stats.get("documents", 0),
@@ -1697,7 +1533,7 @@ Please provide a detailed answer based on the memories above. If the question as
     def list_categories(self) -> List[Dict[str, Any]]:
         """List all available categories."""
         try:
-            return self.ltm.db.list_categories()
+            return self.ltm.list_categories()
         except Exception as e:
             print(f"Error listing categories: {e}")
             return []
@@ -1705,7 +1541,7 @@ Please provide a detailed answer based on the memories above. If the question as
     def create_category(self, name: str, description: str = '', color: str = '#6B7280', icon: str = '📂') -> Dict[str, Any]:
         """Create a new category."""
         try:
-            cat_id = self.ltm.db.create_category(name, description, color, icon)
+            cat_id = self.ltm.create_category_if_not_exists(name, description, color, icon)
             return {"ok": True, "id": cat_id, "message": f"Category '{name}' created"}
         except Exception as e:
             return {"ok": False, "error": str(e)}
