@@ -1284,7 +1284,7 @@ Memories:
                 "error": str(e)
             }
     
-    def search_souvenirs(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search_souvenirs(self, query: str, category: Optional[str] = None, top_k: int = 15) -> List[Dict[str, Any]]:
         """Search for souvenirs matching the query."""
         try:
             results = self.ltm.db.search_souvenirs(query, category=category, limit=top_k)
@@ -1299,6 +1299,7 @@ Memories:
                     "category": r.get('category', 'general'),
                     "tags": extra.get('tags', []),
                     "created_at": r.get('created_at', ''),
+                    "similarity_score": r.get('similarity_score', 0)
                 })
             return souvenirs
         except Exception as e:
@@ -1520,7 +1521,7 @@ Choose "keyword" for simple factual queries or if no embeddings."""
             keywords = search_strategy.get("keywords", [])
             if keywords:
                 keyword_query = " ".join(keywords[:5])
-                keyword_results = self.search_souvenirs(keyword_query, top_k=5)
+                keyword_results = self.search_souvenirs(keyword_query, top_k=15)
                 all_results.extend(keyword_results)
         
         if search_strategy["search_strategy"] == "chunk_type":
@@ -1528,7 +1529,7 @@ Choose "keyword" for simple factual queries or if no embeddings."""
             if chunk_types:
                 # Combine keywords if any
                 query = " ".join(search_strategy.get("keywords", []))
-                chunk_results = self.search_by_chunk_type(chunk_types, query=query if query else None, top_k=5)
+                chunk_results = self.search_by_chunk_type(chunk_types, query=query if query else None, top_k=15)
                 all_results.extend(chunk_results)
         
         # Deduplicate results by document ID

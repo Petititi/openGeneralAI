@@ -296,72 +296,75 @@ class DatabaseManager:
             return results
     
     def search_souvenirs(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
-        """Search souvenirs by content using simple LIKE search with OR logic."""
+        """Search souvenirs by content using multiple queries and prioritizing documents with the most keyword matches."""
         with self._lock:
             cur = self.conn.cursor()
-            
-            # Split query into keywords and search with OR logic
+
+            # Split query into keywords
             keywords = query.lower().split()
-            
-            if len(keywords) == 1:
-                # Single keyword - simple search
+
+            # Perform a separate query for each keyword and store results in sets
+            result_sets = []
+            for keyword in keywords:
+                # Query for each keyword
+                sql = """
+                    SELECT d.id, c.content 
+                    FROM documents d
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE (c.content LIKE ? OR d.extra LIKE ?)
+                """
+                params = [f'%{keyword}%', f'%{keyword}%']
                 if category:
-                    cur.execute("""
-                        SELECT d.*, c.content 
-                        FROM documents d
-                        JOIN chunks c ON d.id = c.document_id
-                        WHERE (c.content LIKE ? OR d.extra LIKE ?) AND d.category = ?
-                        ORDER BY d.created_at DESC
-                        LIMIT ?
-                    """, (f'%{query}%', f'%{query}%', category, limit))
-                else:
-                    cur.execute("""
-                        SELECT d.*, c.content 
-                        FROM documents d
-                        JOIN chunks c ON d.id = c.document_id
-                        WHERE c.content LIKE ? OR d.extra LIKE ?
-                        ORDER BY d.created_at DESC
-                        LIMIT ?
-                    """, (f'%{query}%', f'%{query}%', limit))
-            else:
-                # Multiple keywords - OR logic for any match
-                conditions = " OR ".join(["c.content LIKE ?" for _ in keywords]) + " OR " + " OR ".join(["d.extra LIKE ?" for _ in keywords])
-                params = [f'%{kw}%' for kw in keywords] + [f'%{kw}%' for kw in keywords]
-                
-                if category:
-                    sql = f"""
-                        SELECT d.*, c.content 
-                        FROM documents d
-                        JOIN chunks c ON d.id = c.document_id
-                        WHERE ({conditions}) AND d.category = ?
-                        ORDER BY d.created_at DESC
-                        LIMIT ?
-                    """
-                    params.extend([category, limit])
-                else:
-                    sql = f"""
-                        SELECT d.*, c.content 
-                        FROM documents d
-                        JOIN chunks c ON d.id = c.document_id
-                        WHERE {conditions}
-                        ORDER BY d.created_at DESC
-                        LIMIT ?
-                    """
-                    params.append(limit)
-                
+                    sql += " AND d.category = ?"
+                    params.append(category)
+                sql += " LIMIT ?"
+                params.append(limit * 10)
                 cur.execute(sql, params)
-            
-            results = []
-            for row in cur.fetchall():
+
+                # Fetch results for this keyword and store document IDs in a set
+                result_set = set(row[0] for row in cur.fetchall())
+                result_sets.append(result_set)
+
+            # Compute the intersection of all result sets
+            # Start with the first set, and iteratively intersect with others
+            final_result_set = result_sets[0]
+            for result_set in result_sets[1:]:
+                final_result_set |= result_set
+
+            # If there are no results in the intersection, return an empty list
+            if not final_result_set:
+                return []
+
+            # Fetch the documents corresponding to the intersection
+            final_results = []
+            for doc_id in final_result_set:
+                sql = """
+                    SELECT d.*, c.content 
+                    FROM documents d
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE d.id = ?
+                """
+                cur.execute(sql, [doc_id])
+                row = cur.fetchone()
+
                 # Handle both tuple and Row objects
                 if hasattr(row, 'keys'):
                     doc = dict(row)
                 else:
-                    # Get column names from cursor description
                     columns = [desc[0] for desc in cur.description]
                     doc = dict(zip(columns, row))
-                results.append(doc)
-            return results
+
+                # Calculate the number of keyword matches in 'content' and 'extra'
+                matches = sum(1 for kw in keywords if kw in doc.get('content', '').lower())
+                matches += sum(1 for kw in keywords if kw in doc.get('extra', '').lower())
+
+                # Add match score to the document
+                doc['similarity_score'] = matches / (2 * len(keywords))
+                final_results.append(doc)
+
+            # Sort by match_score (higher is better) and limit to 'limit' number of results
+            sorted_results = sorted(final_results, key=lambda x: x['similarity_score'], reverse=True)
+            return sorted_results[:limit]
 
     def insert_imports(self, doc_id: str, imports: List[str]) -> None:
         with self._lock:
