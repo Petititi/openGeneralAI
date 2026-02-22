@@ -1729,10 +1729,207 @@ class LongTermMemory:
         """Access the embedding manager directly (backward compatibility)."""
         return self.embeddings
 
-    def close(self):
-        if self.embeddings is not None:
-            self.embeddings.persist()
-        self.db.close()
+    def cluster_memories(self, n_clusters: int = 5, chunk_types: Optional[List[str]] = None) -> Dict[str, Any]:
+        """
+        Cluster memories using embeddings.
+        
+        Uses KMeans-like clustering on the embeddings to group related memories.
+        
+        Args:
+            n_clusters: Number of clusters to create
+            chunk_types: Optional list of chunk types to include (e.g., ['memory', 'souvenir'])
+            
+        Returns:
+            Dictionary with clustering results and statistics
+        """
+        if self.embeddings is None:
+            return {"error": "Embeddings not available"}
+        
+        # Get all embeddings and their associated chunks
+        cursor = self.db.conn.cursor()
+        
+        # Build query to get chunks with embeddings
+        query = """
+            SELECT c.id, c.document_id, c.content, c.chunk_type, c.chunk_name, d.source_path, d.category
+            FROM chunks c
+            JOIN documents d ON c.document_id = d.doc_id
+            WHERE c.id IN (SELECT chunk_id FROM faiss_mappings)
+        """
+        
+        if chunk_types:
+            placeholders = ",".join("?" * len(chunk_types))
+            query += f" AND c.chunk_type IN ({placeholders})"
+        
+        if chunk_types:
+            cursor.execute(query, chunk_types)
+        else:
+            cursor.execute(query)
+        
+        rows = cursor.fetchall()
+        
+        if len(rows) < n_clusters:
+            return {
+                "error": f"Not enough chunks ({len(rows)}) for {n_clusters} clusters",
+                "total_chunks": len(rows)
+            }
+        
+        # Build embeddings matrix and store chunk info
+        chunk_infos = []
+        embeddings_matrix = []
+        
+        for row in rows:
+            chunk_id, doc_id, content, chunk_type, chunk_name, source_path, category = row
+            
+            # Get FAISS index for this chunk
+            cursor.execute("SELECT faiss_id FROM faiss_mappings WHERE chunk_id = ?", (chunk_id,))
+            faiss_row = cursor.fetchone()
+            if not faiss_row:
+                continue
+            
+            faiss_id = faiss_row[0]
+            
+            # Get embedding from FAISS index
+            try:
+                embedding = self.embeddings.index.reconstruct(faiss_id)
+                embeddings_matrix.append(embedding)
+                chunk_infos.append({
+                    "chunk_id": chunk_id,
+                    "document_id": doc_id,
+                    "content": content[:100],  # Truncate for display
+                    "chunk_type": chunk_type,
+                    "chunk_name": chunk_name,
+                    "source_path": source_path,
+                    "category": category,
+                    "faiss_id": faiss_id,
+                })
+            except Exception as e:
+                continue
+        
+        if len(embeddings_matrix) < n_clusters:
+            return {
+                "error": f"Not enough valid embeddings ({len(embeddings_matrix)}) for {n_clusters} clusters",
+                "total_embeddings": len(embeddings_matrix)
+            }
+        
+        embeddings_matrix = np.array(embeddings_matrix).astype("float32")
+        
+        # Normalize embeddings for clustering
+        norms = np.linalg.norm(embeddings_matrix, axis=1, keepdims=True) + 1e-12
+        embeddings_matrix = embeddings_matrix / norms
+        
+        # Simple KMeans implementation
+        # Initialize cluster centers randomly
+        np.random.seed(42)
+        indices = np.random.choice(len(embeddings_matrix), n_clusters, replace=False)
+        centers = embeddings_matrix[indices].copy()
+        
+        # Run KMeans iterations
+        max_iter = 50
+        for _ in range(max_iter):
+            # Assign each point to nearest center
+            distances = np.dot(embeddings_matrix, centers.T)
+            labels = np.argmax(distances, axis=1)
+            
+            # Update centers
+            new_centers = np.zeros_like(centers)
+            for k in range(n_clusters):
+                mask = labels == k
+                if np.sum(mask) > 0:
+                    new_centers[k] = np.mean(embeddings_matrix[mask], axis=0)
+                    # Re-normalize center
+                    norm = np.linalg.norm(new_centers[k])
+                    if norm > 1e-12:
+                        new_centers[k] = new_centers[k] / norm
+            
+            # Check convergence
+            if np.allclose(centers, new_centers):
+                break
+            centers = new_centers
+        
+        # Assign labels to all chunks
+        distances = np.dot(embeddings_matrix, centers.T)
+        labels = np.argmax(distances, axis=1)
+        
+        # Build cluster information
+        clusters = {}
+        for i, info in enumerate(chunk_infos):
+            label = int(labels[i])
+            if label not in clusters:
+                clusters[label] = {
+                    "cluster_id": label,
+                    "chunks": [],
+                    "documents": set(),
+                    "categories": set(),
+                    "chunk_types": set(),
+                }
+            clusters[label]["chunks"].append(info)
+            clusters[label]["documents"].add(info["document_id"])
+            if info["category"]:
+                clusters[label]["categories"].add(info["category"])
+            clusters[label]["chunk_types"].add(info["chunk_type"])
+        
+        # Calculate statistics for each cluster
+        results = {
+            "n_clusters": n_clusters,
+            "total_chunks": len(chunk_infos),
+            "clusters": [],
+        }
+        
+        for cluster_id in sorted(clusters.keys()):
+            cluster = clusters[cluster_id]
+            
+            # Get top terms (simplified - using first few chars of content)
+            sample_contents = [c["content"][:50] for c in cluster["chunks"][:5]]
+            
+            cluster_info = {
+                "cluster_id": cluster_id,
+                "size": len(cluster["chunks"]),
+                "unique_documents": len(cluster["documents"]),
+                "categories": sorted(list(cluster["categories"])) if cluster["categories"] else [],
+                "chunk_types": sorted(list(cluster["chunk_types"])),
+                "sample_topics": sample_contents,
+            }
+            results["clusters"].append(cluster_info)
+        
+        # Sort clusters by size
+        results["clusters"].sort(key=lambda x: x["size"], reverse=True)
+        
+        return results
+
+    def print_cluster_summary(self, n_clusters: int = 5, chunk_types: Optional[List[str]] = None):
+        """
+        Print a summary of clustered memories.
+        
+        Args:
+            n_clusters: Number of clusters
+            chunk_types: Optional filter for chunk types
+        """
+        print(f"\n{'='*60}")
+        print(f"Memory Clustering Analysis")
+        print(f"{'='*60}")
+        
+        result = self.cluster_memories(n_clusters=n_clusters, chunk_types=chunk_types)
+        
+        if "error" in result:
+            print(f"Error: {result['error']}")
+            return
+        
+        print(f"\nTotal chunks analyzed: {result['total_chunks']}")
+        print(f"Number of clusters: {result['n_clusters']}")
+        print(f"\n{'='*60}")
+        
+        for cluster in result["clusters"]:
+            print(f"\n📌 Cluster {cluster['cluster_id']}")
+            print(f"   Size: {cluster['size']} chunks")
+            print(f"   Unique documents: {cluster['unique_documents']}")
+            if cluster["categories"]:
+                print(f"   Categories: {', '.join(cluster['categories'])}")
+            print(f"   Chunk types: {', '.join(cluster['chunk_types'])}")
+            print(f"   Sample topics:")
+            for topic in cluster["sample_topics"]:
+                print(f"      - {topic}...")
+        
+        print(f"\n{'='*60}\n")
 
 # --------------------------
 # CLI simple
