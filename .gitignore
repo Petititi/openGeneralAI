@@ -2,7 +2,8 @@
 .env
 __pycache__/*
 *.pyc
-/*.sqlite*
+*.sqlite*
+*.sqlite
 gmail_token.pickle
 mails.pickle
-faiss.index
+*faiss.index
