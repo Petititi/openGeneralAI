@@ -3,6 +3,7 @@ import json5
 from typing import Tuple, Callable, List
 
 from agents.logger import TrajectoryLogger, _digest_messages
+from constants import AgentStatus, StepStatus
 
 class ReasoningAgent:
     def __init__(self, cfg: configurator.AppConfig, logger: TrajectoryLogger, ask_llm: Callable[[List[dict]], str]):
@@ -126,13 +127,13 @@ PLAN:
         # two possibilities: raw_response start with "FINAL" or "PLAN"
         json_data = None
         is_done = False
-        if raw_response.startswith("STOP"):
+        if raw_response.startswith(AgentStatus.STOP):
             return {}, True
-        if raw_response.startswith("FINAL:"):
-            json_data = raw_response[len("FINAL:"):].strip()
+        if raw_response.startswith(AgentStatus.FINAL_PREFIX):
+            json_data = raw_response[len(AgentStatus.FINAL_PREFIX):].strip()
             is_done = True
-        elif raw_response.startswith("PLAN:"):
-            json_data = raw_response[len("PLAN:"):].strip()
+        elif raw_response.startswith(AgentStatus.PLAN_PREFIX):
+            json_data = raw_response[len(AgentStatus.PLAN_PREFIX):].strip()
         if json_data is None:
             # try with the full response:
             json_data = raw_response.strip()
@@ -143,7 +144,7 @@ PLAN:
             # Defensive: ensure parsed_json is a dict
             if not isinstance(parsed_json, dict):
                 raise ValueError("Parsed response is not a dict")
-            done_flag = is_done or parsed_json.get("done", False) or all(isinstance(step, dict) and step.get("status") == "done" for step in parsed_json.get("plan_steps", []))
+            done_flag = is_done or parsed_json.get("done", False) or all(isinstance(step, dict) and step.get("status") == StepStatus.DONE for step in parsed_json.get("plan_steps", []))
             if self.logger and node_id is not None:
                 self.logger.set_plan(plan=parsed_json, is_done=done_flag)
             return parsed_json, done_flag
@@ -154,9 +155,9 @@ PLAN:
         first_todo_step = -1
         steps = plan.get("plan_steps", [])
         for i, step in enumerate(steps):
-            if step.get("status", "").lower() == "current":
+            if step.get("status", "").lower() == StepStatus.CURRENT:
                 return i
-            elif step.get("status", "").lower() != "done" and first_todo_step < 0:
+            elif step.get("status", "").lower() != StepStatus.DONE and first_todo_step < 0:
                 first_todo_step = i
         return first_todo_step
 
@@ -164,7 +165,7 @@ PLAN:
         output = "Action plan:\n"
         # construct the history of done steps:
         for step in plan.get("plan_steps", []):
-            if step.get("status", "").lower() == "done":
+            if step.get("status", "").lower() == StepStatus.DONE:
                 output += f"Done: {step.get('descr', '')}\n"
 
         todo_step_idx = self.get_current_step_idx(plan)
@@ -206,24 +207,24 @@ PLAN:
         except ValueError as exc:
             raise ValueError("Response is not valid JSON") from exc
 
-        if status == "NEXT_TASK":
+        if status == AgentStatus.NEXT_TASK:
             # Mark the current step as done
             current_step = plan['plan_steps'][self.get_current_step_idx(plan)]
-            current_step["status"] = "done"
-        elif status == "NEW_PLAN":
+            current_step["status"] = AgentStatus.DONE
+        elif status == AgentStatus.NEW_PLAN:
             current_step = self.get_current_step_idx(plan)
-            plan['plan_steps'][current_step]["status"] = "error"
+            plan['plan_steps'][current_step]["status"] = AgentStatus.ERROR
             if current_step>0:
-                plan['plan_steps'][current_step-1]["status"] = "error"
+                plan['plan_steps'][current_step-1]["status"] = AgentStatus.ERROR
             raise ValueError("Need a 'NEW_PLAN'.")
-        elif status == "DONE":
+        elif status == AgentStatus.DONE:
             # Mark all step as done
             for step in plan['plan_steps']:
-                step["status"] = "done"
+                step["status"] = AgentStatus.DONE
         else:
             raise ValueError("Expecting either 'DONE', 'NEXT_TASK', or 'NEW_PLAN' from the reasoning agent.")
 
         # Logging
         if self.logger and node_id is not None:
-            self.logger.set_plan(plan=plan, is_done=all(step.get("status") == "done" for step in plan["plan_steps"]))
-        return plan, all(step.get("status") == "done" for step in plan["plan_steps"])
+            self.logger.set_plan(plan=plan, is_done=all(step.get("status") == StepStatus.DONE for step in plan["plan_steps"]))
+        return plan, all(step.get("status") == StepStatus.DONE for step in plan["plan_steps"])

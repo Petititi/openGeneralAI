@@ -33,9 +33,15 @@ except ImportError:
 # Import SearchEngine for better search separation
 from .search_engine import SearchEngine
 
+# Import logging
+import logging
+
 # --------------------------
-# Utilitaires
+# Utilities
 # --------------------------
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
 
 RESERVED_KEYWORD_CODE = [
     "def", "class", "function", "var", "let", "const", "import", "from",
@@ -68,17 +74,17 @@ def read_text_safe(path: Path, max_bytes: int = 10_000_000) -> bytes:
 
 class LongTermMemory:
     """
-    Système de mémoire à long terme basé sur l'indexation de fichiers.
+    Long-term memory system based on file indexing.
     
-    Version modifiée pour ne pas copier les fichiers analysés mais stocker
-    seulement leurs chemins d'accès. Cela économise l'espace disque mais
-    nécessite que les fichiers restent à leur emplacement original.
+    Modified version that doesn't copy analyzed files but only stores
+    their paths. This saves disk space but requires files to remain
+    at their original locations.
     
-    Fonctionnalités:
-    - Indexation de code (via tree-sitter) et de texte
-    - Recherche hybride (mots-clés + sémantique)
-    - Vérification de l'intégrité des fichiers
-    - Nettoyage automatique des références cassées
+    Features:
+    - Code indexing (via tree-sitter) and text
+    - Hybrid search (keywords + semantic)
+    - File integrity verification
+    - Automatic cleanup of broken references
     """
     def __init__(
         self,
@@ -103,20 +109,20 @@ class LongTermMemory:
             try:
                 self._embeddings = EmbeddingManager(faiss_index_path, model_name)
             except Exception as e:
-                print(f"[WARNING] LongTermMemory: Could not initialize embeddings: {e}", file=sys.stderr)
+                logger.warning(f"LongTermMemory: Could not initialize embeddings: {e}")
                 self._embeddings = None
 
         if need_consistency_check:
             report = self.check_file_integrity()
             if report["total_documents"] != report["existing_unchanged"]:
-                print(f"[INFO] LongTermMemory: Consistency check found issues: {report}", file=sys.stderr)
+                logger.warning(f"LongTermMemory: Consistency check found issues: {report}")
 
     @property
     def embeddings(self):
         """Property to access embeddings, returns None if not available."""
         return self._embeddings
 
-    # Propriétés de compatibilité pour accès legacy
+    # Legacy compatibility properties for backward access
     @property
     def conn(self):
         return self.db.conn
@@ -300,7 +306,7 @@ class LongTermMemory:
             if ext in SUPPORTED_CODE_EXT or ext in TEXT_EXT:
                 files.append(path)
 
-        # Encodage batch possible, mais on garde simple & robuste (un par un)
+        # Batch encoding is possible but we keep it simple & robust (one by one)
         should_update_FAISS = False
         for f in files:
             try:
@@ -308,7 +314,7 @@ class LongTermMemory:
                 if updated:
                     should_update_FAISS = True
             except Exception as e:  # type: ignore
-                print(f"[WARN] Skip {f}: {e}", file=sys.stderr)
+                logger.warning(f"Skipping file {f}: {e}")
         if should_update_FAISS:
             self._rebuild_faiss_index()
 

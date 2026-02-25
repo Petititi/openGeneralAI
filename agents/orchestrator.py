@@ -1,5 +1,6 @@
 import json
 import re
+import logging
 from litellm import AuthenticationError, RateLimitError, APIConnectionError, Timeout, BadRequestError, cost_per_token
 from typing import Dict, List, Tuple, Any, Optional
 import litellm
@@ -11,14 +12,15 @@ import agents.tools.ToolRegistry as tools_module
 import agents.action as action
 import agents.reasoning as reasoning
 from storage.longterm_memory import LongTermMemory
+from constants import OrchestratorConfig
 
-# Default max tokens for context (roughly 1000 words to limit costs)
-DEFAULT_CONTEXT_MAX_TOKENS = 2000
+# Configure module-level logger
+logger = logging.getLogger(__name__)
 
 class Orchestrator:
     def __init__(self, cfg: configurator.AppConfig, tools: tools_module.ToolRegistry, 
-                 ltm: Optional[LongTermMemory] = None, max_turn=10,
-                 max_context_tokens: int = DEFAULT_CONTEXT_MAX_TOKENS):
+                 ltm: Optional[LongTermMemory] = None, max_turn: int = OrchestratorConfig.DEFAULT_MAX_TURN,
+                 max_context_tokens: int = OrchestratorConfig.DEFAULT_CONTEXT_MAX_TOKENS):
         self.last_trace: Optional[TrajectoryLogger] = None
         self.cur_trace: Optional[TrajectoryLogger] = None
 
@@ -159,7 +161,7 @@ Readability:
             return self._format_context_results(all_results)
             
         except Exception as e:
-            print(f"Memory context error: {e}")
+            logger.error(f"Memory context error: {e}")
             return ""
 
     def _analyze_query_for_memory(self, query: str) -> Dict[str, Any]:

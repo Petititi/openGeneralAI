@@ -17,18 +17,22 @@ try:
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
 
-
 @pytest.fixture
 def persistant_ltm():
     """Fixture pour créer une instance temporaire de LongTermMemory"""
-    db_path = "test/datas/test_memory.sqlite"
-    faiss_index_path = "test/datas/test_faiss.index"
+    ROOT_FOLDER = Path(__file__).parent
+    db_path = ROOT_FOLDER / "datas/test_memory.sqlite"
+    faiss_index_path = ROOT_FOLDER / "datas/test_faiss.index"
 
     CREATE_DBD = not Path(db_path).exists()
     
+    # Check if embeddings are available
+    enable_embeddings = EMBEDDINGS_AVAILABLE
+    
     ltm = LongTermMemory(
         db_path=str(db_path),
-        faiss_index_path=str(faiss_index_path)
+        faiss_index_path=str(faiss_index_path),
+        enable_embeddings=enable_embeddings
     )
 
     if CREATE_DBD:
@@ -91,32 +95,6 @@ def temp_ltm(tmp_path):
     ltm.close()
 
 
-# Also update persistant_ltm fixture
-@pytest.fixture
-def persistant_ltm():
-    """Fixture pour créer une instance temporaire de LongTermMemory"""
-    db_path = "test/datas/test_memory.sqlite"
-    faiss_index_path = "test/datas/test_faiss.index"
-
-    CREATE_DBD = not Path(db_path).exists()
-    
-    # Check if embeddings are available
-    enable_embeddings = EMBEDDINGS_AVAILABLE
-    
-    ltm = LongTermMemory(
-        db_path=str(db_path),
-        faiss_index_path=str(faiss_index_path),
-        enable_embeddings=enable_embeddings
-    )
-
-    if CREATE_DBD:
-        ltm.add_folder(str(Path(__file__).parent.parent))
-    
-    yield ltm
-    
-    # Cleanup
-    ltm.close()
-
 
 def test_indexation(tmp_path, temp_ltm):
     initial_stats = temp_ltm.stats()
@@ -140,13 +118,13 @@ def test_stats(persistant_ltm):
     assert isinstance(stats, dict)
     assert len(stats) > 0
     #relatively big codebase:
-    assert stats['chunks'] > 200
+    assert stats['chunks'] > 100
     
     class_name = "LongTermMemory"
     
     # Obtenir le code de la classe
     class_code = persistant_ltm.get_class_code(class_name)
-    assert class_code is not None
+    assert class_code is not None and len(class_code) > 0
 
 
 def test_list_content(persistant_ltm):

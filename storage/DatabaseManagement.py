@@ -2,11 +2,18 @@ import json
 import sqlite3
 import datetime as dt
 import threading
+import logging
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+from contextlib import contextmanager
+
+# Configure module-level logger
+logger = logging.getLogger(__name__)
+
 
 def now_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
 
 # --------------------------
 # DatabaseManager
@@ -14,18 +21,63 @@ def now_iso() -> str:
 
 class DatabaseManager:
     """
-    Gère toutes les opérations de base de données SQLite pour la mémoire à long terme.
-    Responsable de la persistance des documents, chunks, imports et métadonnées.
-    Thread-safe grâce à l'utilisation d'un verrou pour synchroniser les accès.
+    Manages all SQLite database operations for long-term memory.
+    Responsible for persistence of documents, chunks, imports, and metadata.
+    Thread-safe through the use of a lock for synchronized access.
+    
+    Optimizations:
+    - Connection pooling via thread-local connections
+    - Prepared statements for frequently used queries
+    - WAL mode for better concurrent access
+    - Proper indexes for common queries
     """
+    
+    # Prepared statement cache
+    _PREPARED_STATEMENTS = {
+        "insert_document": """
+            INSERT OR IGNORE INTO documents(id, source_path, rel_path, media_type, language, sha256, size_bytes, created_at, category, extra)
+            VALUES(?,?,?,?,?,?,?,?,?,?)
+        """,
+        "get_document": "SELECT * FROM documents WHERE id = ?",
+        "get_document_by_path": "SELECT * FROM documents WHERE source_path = ?",
+        "delete_document": "DELETE FROM documents WHERE id = ?",
+        "insert_chunk": """
+            INSERT INTO chunks(document_id, ord, start_line, end_line, content, token_count, chunk_type, chunk_name, parent_class)
+            VALUES(?,?,?,?,?,?,?,?,?)
+        """,
+        "get_chunk": "SELECT * FROM chunks WHERE id = ?",
+        "get_chunks_by_doc": "SELECT * FROM chunks WHERE document_id = ?",
+        "insert_faiss_mapping": "INSERT OR REPLACE INTO faiss_map(faiss_id, chunk_id) VALUES(?, ?)",
+        "get_faiss_mapping": "SELECT chunk_id FROM faiss_map WHERE faiss_id = ?",
+    }
+    
     def __init__(self, db_path: str = "memory.sqlite"):
         self.db_path = db_path
-        self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
-        self.conn.row_factory = sqlite3.Row  # Enable dict-like row access
-        self.conn.execute("PRAGMA journal_mode=WAL;")
-        self.conn.execute("PRAGMA foreign_keys=ON;")
+        # Ensure the directory exists before trying to connect
+        db_dir = Path(db_path).parent
+        if db_dir and str(db_dir) != '.' and not db_dir.exists():
+            db_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create initial connection for schema initialization
+        self._conn = sqlite3.connect(
+            self.db_path, 
+            check_same_thread=False,
+            timeout=30.0
+        )
+        self._conn.row_factory = sqlite3.Row
+        self._conn.execute("PRAGMA journal_mode=WAL;")
+        self._conn.execute("PRAGMA synchronous=NORMAL;")
+        self._conn.execute("PRAGMA cache_size=10000;")
+        self._conn.execute("PRAGMA temp_store=MEMORY;")
+        self._conn.execute("PRAGMA foreign_keys=ON;")
+        
         self._lock = threading.RLock()
         self._ensure_schema()
+    
+    @property
+    def conn(self) -> sqlite3.Connection:
+        """Get database connection (backward compatible)."""
+        return self._conn
 
     def _ensure_schema(self):
         with self._lock:

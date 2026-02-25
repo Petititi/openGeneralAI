@@ -15,13 +15,11 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
+# Import constants for magic numbers
+from constants import CodeParserConfig
+
 # Tree-sitter imports with graceful fallback
-try:
-    from tree_sitter_language_pack import get_parser
-    TREE_SITTER_AVAILABLE = True
-except ImportError:
-    TREE_SITTER_AVAILABLE = False
-    get_parser = None
+from tree_sitter_language_pack import get_parser
 
 # Supported code file extensions to language mapping
 SUPPORTED_CODE_EXT = {
@@ -235,17 +233,6 @@ def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, i
     metadata contains: {type, name, parent_class}
     If no structured elements found, fallback: chunk by ~120 lines.
     """
-    if not TREE_SITTER_AVAILABLE or get_parser is None:
-        # Fallback when tree-sitter not available
-        lines = source.decode("utf-8").splitlines()
-        chunks = []
-        step = 120
-        for i in range(0, len(lines), step):
-            part = "\n".join(lines[i:i+step])
-            if part.strip():
-                chunks.append((i+1, min(i+step, len(lines)), part, {"type": "text"}))
-        return chunks, [], {}
-    
     try:
         parser = get_parser(language)
     except LookupError as e:
@@ -380,7 +367,7 @@ def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, i
         return chunks, imports, {}
 
     # Limit chunk size (~1500 tokens equivalent) by character count
-    MAX_CHARS = 6000
+    MAX_CHARS = CodeParserConfig.MAX_CHARS
     final = []
     for s, e, t, meta in chunks:
         if len(t) <= MAX_CHARS:
