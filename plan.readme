@@ -1,0 +1,206 @@
+# OpenGeneralAI Refactoring Plan
+
+This document outlines key refactoring opportunities to improve the codebase's efficiency, maintainability, and design quality.
+
+---
+
+## 1. Architecture & Design Issues
+
+### 1.1 Circular/Scattered Dependencies
+- **Issue**: Import statements are scattered across files with relative imports (`import configurator`, `import agents.tools.ToolRegistry as tools_module`). No clear dependency direction.
+- **Recommendation**: Use absolute imports consistently. Consider a dependency injection pattern for core services (LLM, config, memory).
+
+### 1.2 Orchestrator God Class
+- **Issue**: `orchestrator.py` (~360 lines) handles: memory context retrieval, message cleaning, planning, action execution, token counting, cost calculation.
+- **Recommendation**: Split into specialized classes:
+  - `MemoryContextManager` - Handle context injection
+  - `MessageHistoryManager` - Handle message cleaning/truncation
+  - `TurnController` - Manage the agent loop
+
+### 1.3 Hardcoded Prompts
+- **Issue**: Large prompt strings are embedded directly in `action.py`, `reasoning.py`, `memory_tool.py`, `orchestrator.py`.
+- **Recommendation**: Create a `prompts.py` module or YAML/JSON config file for all prompts. This makes iteration and A/B testing easier.
+
+### 1.4 Mixed Language (French/English)
+- **Issue**: Comments in French (`# Utilitaires`, `# Propriété de compatibilité`), variable names in French (`extra`, `rel_to`), but documentation in English.
+- **Recommendation**: Standardize on English for everything (comments, variable names, documentation).
+
+---
+
+## 2. Code Structure & Duplication
+
+### 2.1 Duplicate JSON Parsing
+- **Issue**: `safe_json_parsing()` in `action.py`, `get_plan()` in `reasoning.py`, `LLMExtractor.extract()` all have similar JSON parsing with fallback logic.
+- **Recommendation**: Create a shared `json_parser.py` utility with `parse_json_safe()` function.
+
+### 2.2 Duplicate Code in Search
+- **Issue**: `memory_tool.py`, `orchestrator.py`, and `search_engine.py` all have similar result formatting and search logic.
+- **Recommendation**: Consolidate result formatting into `SearchResultFormatter` (already exists in search_engine.py but not used everywhere).
+
+### 2.3 Long Methods
+- **Issue**: 
+  - `LongTermMemory.add()` (~80 lines)
+  - `LongTermMemory.search()` is split across multiple methods
+  - `DatabaseManager._ensure_schema()` (~90 lines)
+- **Recommendation**: Apply Single Responsibility Principle. Break into smaller, focused methods.
+
+### 2.4 No Abstract Base Classes
+- **Issue**: `Tool` is an ABC but `SearchEngine` and `EmbeddingManager` have no formal interface.
+- **Recommendation**: Create protocol classes for `SearchBackend`, `EmbeddingBackend`, `StorageBackend` to enable swapping implementations.
+
+---
+
+## 3. Memory System Issues
+
+### 3.1 LongTermMemory Too Many Responsibilities
+- **Issue**: Handles indexing, search, code parsing, embedding management, database operations.
+- **Recommendation**: Extract into:
+  - `CodeIndexer` - File parsing and chunking
+  - `EmbeddingStore` - Vector storage
+  - `MetadataStore` - SQLite operations
+  - Keep `LongTermMemory` as a facade/coordinator
+
+### 3.2 Class-Methods Map Handling
+- **Issue**: `class_methods_map` is built in `code_parser.py`, used in `longterm_memory.py`, but not fully utilized for search.
+- **Recommendation**: Create a proper `SymbolGraph` class that tracks class-method relationships for better code navigation.
+
+### 3.3 Embedding Management
+- **Issue**: `EmbeddingManager` is tightly coupled with FAISS. No abstraction for other backends (Pinecone, Qdrant).
+- **Recommendation**: Create an abstract `VectorStore` interface.
+
+---
+
+## 4. Error Handling & Resilience
+
+### 4.1 Inconsistent Error Handling
+- **Issue**: 
+  - `safe_ask()` in orchestrator has specific exception handling
+  - `LLMExtractor.extract()` catches generic `Exception`
+  - `SearchEngine.search()` silently falls back to keyword-only
+- **Recommendation**: Create a unified error handling strategy with custom exceptions and consistent logging.
+
+### 4.2 Silent Failures
+- **Issue**: Some methods return empty results on error instead of raising exceptions (`_get_relevant_context()` returns `""` on exception).
+- **Recommendation**: Either return error objects or raise specific exceptions. Don't silently fail.
+
+---
+
+## 5. Configuration Management
+
+### 5.1 Scattered Configuration
+- **Issue**: Config is spread across:
+  - `config.json` (JSON)
+  - `.env` file
+  - Hardcoded defaults in `configurator.py`, `orchestrator.py`
+- **Recommendation**: 
+  - Use a single configuration approach (consider Pydantic settings)
+  - Document all configuration options in one place
+
+### 5.2 Hardcoded Values
+- **Issue**: 
+  - `DEFAULT_CONTEXT_MAX_TOKENS = 2000` in orchestrator
+  - `MAX_CHARS = 6000` in code_parser
+  - Various magic numbers throughout
+- **Recommendation**: Move all configurable values to a settings class.
+
+---
+
+## 6. Security Concerns
+
+### 6.1 Permissive CORS
+- **Issue**: `app.py` line 26: `CORS(app, resources={r"/*": {"origins": "*"}})`
+- **Recommendation**: Restrict to known origins in production.
+
+### 6.2 No Input Validation
+- **Issue**: User input in `/ask` endpoint goes directly to LLM without sanitization.
+- **Recommendation**: Add input validation and sanitization layer.
+
+### 6.3 API Key Storage
+- **Issue**: API keys stored in plain `.env` file.
+- **Recommendation**: Consider encryption for at-rest API keys.
+
+---
+
+## 7. Performance Optimizations
+
+### 7.1 No Caching
+- **Issue**: Embeddings are recalculated every time. No caching of frequently accessed code chunks.
+- **Recommendation**: 
+  - Add LRU cache for embeddings (with TTL)
+  - Cache recently searched results
+
+### 7.2 Database Optimizations
+- **Issue**: 
+  - `DatabaseManager` creates new cursors for each query
+  - No prepared statements
+  - No connection pooling
+- **Recommendation**:
+  - Use connection pooling
+  - Prepare frequently used statements
+  - Add indexes for common queries
+
+### 7.3 Synchronous LLM Calls
+- **Issue**: `safe_ask()` is synchronous, blocks the Flask server.
+- **Recommendation**: Consider async LLM calls (async/await) for better throughput.
+
+---
+
+## 8. Testing
+
+### 8.1 Test Organization
+- **Issue**: Tests are in `test/` directory but have inconsistent naming (`test_*.py`, `Calculator_test.py`).
+- **Recommendation**: Follow pytest conventions (`test_*.py`).
+
+### 8.2 Test Coverage
+- **Issue**: No clear indication of coverage. Some modules like `configurator.py` lack tests.
+- **Recommendation**: Add unit tests for critical paths and increase coverage.
+
+---
+
+## 9. Logging & Observability
+
+### 9.1 Inconsistent Logging
+- **Issue**: 
+  - Some places use `print()` (`longterm_memory.py`)
+  - Some use `logging` module
+  - Logger is initialized differently across files
+- **Recommendation**: Use consistent logging throughout. Configure a single logger.
+
+### 9.2 Logger Complexity
+- **Issue**: `TrajectoryLogger` uses contextvars which can be confusing. The tree structure adds complexity.
+- **Recommendation**: Simplify or add clear documentation. Consider using existing observability frameworks (OpenTelemetry).
+
+---
+
+## 10. Code Quality
+
+### 10.1 Type Hints Incomplete
+- **Issue**: Some functions missing return types, some use `Any` extensively.
+- **Recommendation**: Add complete type hints. Use stricter types where possible.
+
+### 10.2 Docstrings Inconsistent
+- **Issue**: Mix of styles (Google, NumPy, no format). Some functions have no docstrings.
+- **Recommendation**: Choose one style (recommend Google style) and apply consistently.
+
+### 10.3 Magic Strings/Numbers
+- **Issue**: Strings like `"STOP"`, `"FINAL:"`, `"NEXT_TASK"` appear in multiple files.
+- **Recommendation**: Create constants/enums for these.
+
+---
+
+## Summary Priority
+
+| Priority | Issue | Impact |
+|----------|-------|--------|
+| HIGH | Orchestrator god class | Maintainability |
+| HIGH | Hardcoded prompts | Iterability |
+| HIGH | Security (CORS, input validation) | Security |
+| MEDIUM | Memory system SRP | Maintainability, Testability |
+| MEDIUM | Error handling consistency | Reliability |
+| MEDIUM | Configuration centralization | Usability |
+| LOW | Language standardization | Readability |
+| LOW | Performance optimizations | Scalability |
+
+---
+
+*Generated based on code analysis of openGeneralAI repository*
