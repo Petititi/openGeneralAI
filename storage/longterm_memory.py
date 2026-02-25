@@ -1752,8 +1752,8 @@ class LongTermMemory:
         query = """
             SELECT c.id, c.document_id, c.content, c.chunk_type, c.chunk_name, d.source_path, d.category
             FROM chunks c
-            JOIN documents d ON c.document_id = d.doc_id
-            WHERE c.id IN (SELECT chunk_id FROM faiss_mappings)
+            JOIN documents d ON c.document_id = d.id
+            WHERE c.id IN (SELECT chunk_id FROM faiss_map)
         """
         
         if chunk_types:
@@ -1781,7 +1781,7 @@ class LongTermMemory:
             chunk_id, doc_id, content, chunk_type, chunk_name, source_path, category = row
             
             # Get FAISS index for this chunk
-            cursor.execute("SELECT faiss_id FROM faiss_mappings WHERE chunk_id = ?", (chunk_id,))
+            cursor.execute("SELECT faiss_id FROM faiss_map WHERE chunk_id = ?", (chunk_id,))
             faiss_row = cursor.fetchone()
             if not faiss_row:
                 continue
@@ -1879,7 +1879,20 @@ class LongTermMemory:
             cluster = clusters[cluster_id]
             
             # Get top terms (simplified - using first few chars of content)
-            sample_contents = [c["content"][:50] for c in cluster["chunks"][:5]]
+            sample_contents = []
+            processed_doc = []
+            for c in cluster["chunks"]:
+                doc_id = c["document_id"]
+                if doc_id in processed_doc:
+                    continue
+                if len(processed_doc) >= 5:
+                    break
+                processed_doc.append(doc_id)
+                souvenirs = self.db.get_souvenir_chuncks(doc_id)
+                for souvenir in souvenirs:
+                    if souvenir["chunk_type"] == "email_topic":
+                        sample_contents.append(souvenir["content"])
+                        break
             
             cluster_info = {
                 "cluster_id": cluster_id,

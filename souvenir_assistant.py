@@ -634,7 +634,11 @@ class SouvenirAssistant:
         return "\n".join(lines)
     
     def _strip_quoted_text(self, body: str) -> str:
-        return EmailReplyParser.parse_reply(body)
+        response = EmailReplyParser.parse_reply(body)
+        # remove from response all css/html tags:
+        # Handles edge cases where ">" might appear inside quoted attributes
+        response = re.sub(r'<[^>]*(?:"[^"]*"[^>]*)*(?:\'[^\']*\'[^>]*)*>', '', response)
+        return response
 
     def _split_into_paragraphs(self, text: str) -> List[str]:
         """

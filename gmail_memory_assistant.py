@@ -987,7 +987,7 @@ class GmailMemoryAssistant:
             print("  4. Search emails and save")
             print("  5. View current memories")
             print("  6. Ask about memories")
-            print("  7. Analyze email insights (who sends emails, companies, appointments, etc.)")
+            print("  7. Get summary of memory")
             print("  8. Quit")
             
             choice = input("\nEnter choice (1-8): ").strip()
@@ -1064,24 +1064,7 @@ class GmailMemoryAssistant:
                             print(f"\n📚 Sources: {', '.join(result.get('sources', []))}")
             
             elif choice == "7":
-                # NEW: Analyze email insights
-                print("\n" + "="*60)
-                print("🔍 Email Insights Analysis")
-                print("="*60)
-                print("\nYou can ask questions like:")
-                print("  • 'Who sends me the most emails?'")
-                print("  • 'Which companies send me emails?'")
-                print("  • 'What pending action items do I have?'")
-                print("  • 'What appointments are scheduled?'")
-                print("  • 'What topics are most common?'")
-                print("  • 'Show me email statistics'")
-                
-                question = input("\n❓ Ask a question: ").strip()
-                if question:
-                    result = self.answer_email_question(question)
-                    if result.get('ok'):
-                        print(f"\n💡 {result.get('answer', 'No answer')}")
-            
+                self.souvenir_assistant.ltm.print_cluster_summary(20, chunk_types=["email_original"])
             elif choice == "8":
                 print("\n👋 Goodbye!")
                 break

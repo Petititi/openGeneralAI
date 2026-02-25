@@ -244,22 +244,23 @@ class DatabaseManager:
         # Insert content as a single chunk
         self.insert_chunk(doc_id, 0, 1, len(content.split('\n')), content, 'souvenir', title, None)
     
-    def get_souvenir(self, doc_id: str) -> Optional[Dict]:
+    def get_souvenir_chuncks(self, doc_id: str) -> Optional[Dict]:
         """Get a souvenir by ID."""
         with self._lock:
             cur = self.conn.cursor()
-            cur.execute("SELECT * FROM documents WHERE id = ?", (doc_id,))
-            row = cur.fetchone()
-            if not row:
-                return None
-            
-            doc = dict(row)
             # Get the chunk content
-            cur.execute("SELECT content FROM chunks WHERE document_id = ?", (doc_id,))
-            chunk_row = cur.fetchone()
-            if chunk_row:
-                doc['content'] = chunk_row[0]
-            return doc
+            cur.execute("SELECT content, chunk_type FROM chunks WHERE document_id = ?", (doc_id,))
+            results = []
+            for row in cur.fetchall():
+                # Handle both tuple and Row objects
+                if hasattr(row, 'keys'):
+                    doc = dict(row)
+                else:
+                    # Get column names from cursor description
+                    columns = [desc[0] for desc in cur.description]
+                    doc = dict(zip(columns, row))
+                results.append(doc)
+            return results
     
     def list_souvenirs(self, category: str = None, limit: int = 20) -> List[Dict]:
         """List all souvenirs, optionally filtered by category."""
