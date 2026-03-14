@@ -2,8 +2,13 @@ import json
 import sqlite3
 import datetime as dt
 import threading
+import os
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
+
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
 
 def now_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -18,13 +23,22 @@ class DatabaseManager:
     Responsable de la persistance des documents, chunks, imports et métadonnées.
     Thread-safe grâce à l'utilisation d'un verrou pour synchroniser les accès.
     """
-    def __init__(self, db_path: str = "memory.sqlite"):
+    def __init__(self, db_path: str = "memory.sqlite", enable_souvenir_embeddings: bool = False):
         self.db_path = db_path
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row  # Enable dict-like row access
         self.conn.execute("PRAGMA journal_mode=WAL;")
         self.conn.execute("PRAGMA foreign_keys=ON;")
         self._lock = threading.RLock()
+        
+        # For souvenir embeddings
+        self.enable_souvenir_embeddings = enable_souvenir_embeddings
+        self._souvenir_embedding_manager = None
+        self._souvenir_faiss_index_path = db_path.replace('.sqlite', '_souvenirs.faiss')
+        
+        if enable_souvenir_embeddings:
+            self._init_souvenir_embeddings()
+        
         self._ensure_schema()
 
     def _ensure_schema(self):
@@ -96,6 +110,22 @@ class DatabaseManager:
             VALUES (new.id, new.content, new.id, new.document_id);
             END;
             """)
+            
+            # Create FTS5 virtual table specifically for souvenirs
+            cur.execute("""
+            CREATE VIRTUAL TABLE IF NOT EXISTS souvenirs_fts USING fts5(
+            title,
+            content,
+            tags,
+            tokenize='porter'
+            )""")
+            
+            # Create table to map souvenir IDs to FTS rowids
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS souvenirs_faiss_map (
+            souvenir_id TEXT PRIMARY KEY,
+            faiss_id INTEGER
+            )""")
             cur.execute("""
             CREATE TABLE IF NOT EXISTS faiss_map (
             faiss_id INTEGER PRIMARY KEY,
@@ -118,6 +148,39 @@ class DatabaseManager:
             self._init_default_categories()
             
             self.conn.commit()
+    
+    def _init_souvenir_embeddings(self):
+        """Initialize FAISS index for souvenir embeddings."""
+        try:
+            model_name = "mixedbread-ai/mxbai-embed-large-v1"
+            self._souvenir_embedding_manager = SentenceTransformer(model_name)
+            self._souvenir_dim = self._souvenir_embedding_manager.get_sentence_embedding_dimension()
+            
+            # Load existing index or create new one
+            if os.path.exists(self._souvenir_faiss_index_path):
+                self._souvenir_faiss_index = faiss.read_index(self._souvenir_faiss_index_path)
+            else:
+                self._souvenir_faiss_index = faiss.IndexFlatIP(self._souvenir_dim)
+            
+            # Load existing souvenir-FAISS mapping from database
+            self._load_souvenir_faiss_map()
+        except Exception as e:
+            print(f"Warning: Failed to initialize souvenir embeddings: {e}")
+            self.enable_souvenir_embeddings = False
+    
+    def _load_souvenir_faiss_map(self):
+        """Load the mapping of souvenir IDs to FAISS IDs."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("SELECT souvenir_id, faiss_id FROM souvenirs_faiss_map WHERE faiss_id IS NOT NULL")
+            rows = cur.fetchall()
+            self._souvenir_faiss_id_map = {}  # faiss_id -> souvenir_id
+            self._souvenir_id_faiss_map = {}  # souvenir_id -> faiss_id
+            for row in rows:
+                if hasattr(row, '__getitem__'):
+                    souvenir_id, faiss_id = row[0], row[1]
+                    self._souvenir_faiss_id_map[faiss_id] = souvenir_id
+                    self._souvenir_id_faiss_map[souvenir_id] = faiss_id
 
     def insert_document(self, doc_id: str, source_path: str, rel_path: Optional[str],
                        media_type: str, language: Optional[str], sha256: str,
@@ -243,6 +306,30 @@ class DatabaseManager:
         )
         # Insert content as a single chunk
         self.insert_chunk(doc_id, 0, 1, len(content.split('\n')), content, 'souvenir', title, None)
+        
+        # Also add to souvenirs FTS5 index
+        with self._lock:
+            cur = self.conn.cursor()
+            tags_str = ' '.join(tags) if tags else ''
+            cur.execute("""
+                INSERT INTO souvenirs_fts(title, content, tags)
+                VALUES (?, ?, ?)
+            """, (title or '', content, tags_str))
+            
+            # Get the rowid of the inserted FTS entry
+            fts_rowid = cur.lastrowid
+            
+            # Update the souvenirs_faiss_map (initially with None for faiss_id)
+            cur.execute("""
+                INSERT OR REPLACE INTO souvenirs_faiss_map(souvenir_id, faiss_id)
+                VALUES (?, ?)
+            """, (doc_id, fts_rowid))
+            
+            self.conn.commit()
+        
+        # Add embedding for semantic search if enabled
+        if self.enable_souvenir_embeddings and self._souvenir_embedding_manager is not None:
+            self._add_souvenir_embedding(doc_id, title or '', content, ' '.join(tags) if tags else '')
     
     def get_souvenir(self, doc_id: str) -> Optional[Dict]:
         """Get a souvenir by ID."""
@@ -362,6 +449,215 @@ class DatabaseManager:
                     doc = dict(zip(columns, row))
                 results.append(doc)
             return results
+    
+    def search_souvenirs_fts(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
+        """Search souvenirs using FTS5 full-text search with BM25 scoring.
+        
+        This provides much better search quality than simple LIKE queries.
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            
+            # Prepare the FTS5 query - join keywords with OR for flexible matching
+            keywords = query.lower().split()
+            fts_query = ' OR '.join(keywords)
+            
+            # Build the SQL query with BM25 scoring
+            if category:
+                sql = """
+                    SELECT d.*, c.content, bm25(souvenirs_fts) as rank
+                    FROM souvenirs_fts sfts
+                    JOIN documents d ON d.id = (
+                        SELECT souvenir_id FROM souvenirs_faiss_map WHERE faiss_id = sfts.rowid
+                    )
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE souvenirs_fts MATCH ? AND d.category = ?
+                    ORDER BY rank
+                    LIMIT ?
+                """
+                cur.execute(sql, (fts_query, category, limit))
+            else:
+                sql = """
+                    SELECT d.*, c.content, bm25(souvenirs_fts) as rank
+                    FROM souvenirs_fts sfts
+                    JOIN documents d ON d.id = (
+                        SELECT souvenir_id FROM souvenirs_faiss_map WHERE faiss_id = sfts.rowid
+                    )
+                    JOIN chunks c ON d.id = c.document_id
+                    WHERE souvenirs_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                """
+                cur.execute(sql, (fts_query, limit))
+            
+            results = []
+            for row in cur.fetchall():
+                if hasattr(row, 'keys'):
+                    doc = dict(row)
+                else:
+                    columns = [desc[0] for desc in cur.description]
+                    doc = dict(zip(columns, row))
+                results.append(doc)
+            return results
+    
+    def _add_souvenir_embedding(self, doc_id: str, title: str, content: str, tags: str) -> None:
+        """Add a souvenir embedding to the FAISS index."""
+        if not self.enable_souvenir_embeddings or self._souvenir_embedding_manager is None:
+            return
+        
+        try:
+            # Create combined text for embedding
+            combined_text = f"{title} {content} {tags}".strip()
+            
+            # Encode the text
+            embedding = self._souvenir_embedding_manager.encode(
+                [combined_text],
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype("float32")
+            
+            # Add to FAISS index
+            faiss_id = self._souvenir_faiss_index.ntotal
+            self._souvenir_faiss_index.add(embedding)
+            
+            # Update mapping
+            self._souvenir_faiss_id_map[faiss_id] = doc_id
+            self._souvenir_id_faiss_map[doc_id] = faiss_id
+            
+            # Persist the FAISS index
+            faiss.write_index(self._souvenir_faiss_index, self._souvenir_faiss_index_path)
+            
+            # Update the database mapping
+            with self._lock:
+                cur = self.conn.cursor()
+                cur.execute("""
+                    UPDATE souvenirs_faiss_map SET faiss_id = ? WHERE souvenir_id = ?
+                """, (faiss_id, doc_id))
+                self.conn.commit()
+        except Exception as e:
+            print(f"Error adding souvenir embedding: {e}")
+    
+    def search_souvenirs_semantic(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
+        """Search souvenirs using semantic embeddings (vector search).
+        
+        Returns souvenirs most similar to the query using cosine similarity.
+        """
+        if not self.enable_souvenir_embeddings or self._souvenir_embedding_manager is None:
+            return []
+        
+        try:
+            # Encode the query
+            query_embedding = self._souvenir_embedding_manager.encode(
+                [query],
+                convert_to_numpy=True,
+                normalize_embeddings=True
+            ).astype("float32")
+            
+            # Search in FAISS
+            distances, indices = self._souvenir_faiss_index.search(query_embedding, min(limit * 2, self._souvenir_faiss_index.ntotal))
+            
+            # Collect results
+            results = []
+            for dist, idx in zip(distances[0], indices[0]):
+                if idx < 0:
+                    continue
+                souvenir_id = self._souvenir_faiss_id_map.get(int(idx))
+                if souvenir_id is None:
+                    continue
+                
+                # Get the souvenir details from the database
+                with self._lock:
+                    cur = self.conn.cursor()
+                    cur.execute("""
+                        SELECT d.*, c.content
+                        FROM documents d
+                        JOIN chunks c ON d.id = c.document_id
+                        WHERE d.id = ?
+                    """, (souvenir_id,))
+                    row = cur.fetchone()
+                    if row:
+                        if hasattr(row, 'keys'):
+                            doc = dict(row)
+                        else:
+                            columns = [desc[0] for desc in cur.description]
+                            doc = dict(zip(columns, row))
+                        doc['score'] = float(dist)
+                        results.append(doc)
+                
+                if len(results) >= limit:
+                    break
+            
+            # Apply category filter if specified
+            if category:
+                results = [r for r in results if r.get('category') == category]
+            
+            return results[:limit]
+        except Exception as e:
+            print(f"Error in semantic search: {e}")
+            return []
+    
+    def search_souvenirs_hybrid(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
+        """Hybrid search combining keyword (LIKE), FTS5, and semantic search using Reciprocal Rank Fusion.
+        
+        This approach provides robust recall by combining multiple search signals:
+        - Keyword search (LIKE queries) - traditional text matching
+        - FTS5 full-text search - better ranking with BM25
+        - Semantic search - concept matching via embeddings
+        
+        Results are fused using RRF: score = 1 / (k + rank)
+        """
+        from collections import defaultdict
+        
+        # RRF constant - higher k reduces the impact of ranking differences
+        k = 60
+        
+        # Get results from each search method
+        keyword_results = self.search_souvenirs(query, category=category, limit=limit * 3)
+        fts_results = self.search_souvenirs_fts(query, category=category, limit=limit * 3)
+        semantic_results = self.search_souvenirs_semantic(query, category=category, limit=limit * 3)
+        
+        # Build RRF scores
+        rrf_scores = defaultdict(float)
+        doc_details = {}
+        
+        # Process keyword results
+        for rank, doc in enumerate(keyword_results):
+            doc_id = doc.get('id')
+            if doc_id:
+                rrf_scores[doc_id] += 1.0 / (k + rank + 1)
+                if doc_id not in doc_details:
+                    doc_details[doc_id] = doc
+        
+        # Process FTS results
+        for rank, doc in enumerate(fts_results):
+            doc_id = doc.get('id')
+            if doc_id:
+                rrf_scores[doc_id] += 1.0 / (k + rank + 1)
+                if doc_id not in doc_details:
+                    doc_details[doc_id] = doc
+        
+        # Process semantic results (with similarity score weighting)
+        for rank, doc in enumerate(semantic_results):
+            doc_id = doc.get('id')
+            if doc_id:
+                # Weight semantic scores by their similarity (already 0-1 range)
+                semantic_weight = doc.get('score', 0.5)
+                rrf_scores[doc_id] += semantic_weight * (1.0 / (k + rank + 1))
+                if doc_id not in doc_details:
+                    doc_details[doc_id] = doc
+        
+        # Sort by RRF score
+        sorted_docs = sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)
+        
+        # Build final results
+        results = []
+        for doc_id, score in sorted_docs[:limit]:
+            doc = doc_details.get(doc_id)
+            if doc:
+                doc['rrf_score'] = score
+                results.append(doc)
+        
+        return results
 
     def insert_imports(self, doc_id: str, imports: List[str]) -> None:
         with self._lock:

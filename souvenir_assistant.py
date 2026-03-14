@@ -46,6 +46,7 @@ class SouvenirAssistant:
             db_path = self.cfg.souvenir_db_path
         
         self.db_path = db_path
+        self.enable_embeddings = enable_embeddings
         
         # Initialize LongTermMemory with optional embeddings
         try:
@@ -53,6 +54,12 @@ class SouvenirAssistant:
                 db_path=db_path,
                 enable_embeddings=enable_embeddings
             )
+            
+            # Enable souvenir embeddings in the database
+            if enable_embeddings:
+                self.ltm.db.enable_souvenir_embeddings = True
+                self.ltm.db._init_souvenir_embeddings()
+            
             print(f"✓ LongTermMemory initialized (embeddings: {enable_embeddings})")
         except Exception as e:
             print(f"❌ Failed to initialize LongTermMemory: {e}")
@@ -92,9 +99,10 @@ class SouvenirAssistant:
             }
     
     def search_souvenirs(self, query: str, category: Optional[str] = None, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Search for souvenirs matching the query."""
+        """Search for souvenirs matching the query using hybrid search."""
         try:
-            results = self.ltm.db.search_souvenirs(query, category=category, limit=top_k)
+            # Use hybrid search (combines keyword, FTS5, and semantic search)
+            results = self.ltm.db.search_souvenirs_hybrid(query, category=category, limit=top_k)
             
             souvenirs = []
             for r in results:
@@ -106,6 +114,7 @@ class SouvenirAssistant:
                     "category": r.get('category', 'general'),
                     "tags": extra.get('tags', []),
                     "created_at": r.get('created_at', ''),
+                    "score": r.get('rrf_score', 0),  # Include RRF score for reference
                 })
             return souvenirs
         except Exception as e:
@@ -113,12 +122,23 @@ class SouvenirAssistant:
             return []
     
     def ask_about_souvenirs(self, question: str) -> Dict[str, Any]:
-        """Ask a question about souvenirs using LLM with context from memory."""
+        """Ask a question about souvenirs using LLM with context from memory.
+        
+        Uses enhanced keyword extraction, query expansion, and hybrid search
+        for improved souvenir recall.
+        """
         # Extract keywords from the question for better search
         search_query = self._extract_keywords_from_question(question)
         
-        # Get relevant souvenirs as context
-        souvenirs = self.search_souvenirs(search_query, top_k=5)
+        # Expand query with synonyms for better recall
+        expanded_query = self._expand_query_with_synonyms(search_query)
+        
+        # Combine original question context with extracted keywords
+        # This helps capture semantic meaning beyond keywords
+        combined_query = f"{question} {expanded_query}"
+        
+        # Get relevant souvenirs using hybrid search
+        souvenirs = self.search_souvenirs(combined_query, top_k=5)
         
         if not souvenirs:
             return {
@@ -232,43 +252,292 @@ My question: {question}
 Please provide a detailed answer based on the souvenirs above:"""
     
     def _extract_keywords_from_question(self, question: str) -> str:
-        """Extract key terms from a question for searching."""
+        """Extract key terms from a question using LLM for better multilingual support.
+        
+        Uses LLM to intelligently extract search keywords that will help find
+        relevant souvenirs. This approach works well for any language and handles
+        complex queries better than rule-based extraction.
+        
+        Falls back to simple extraction if LLM is not available.
+        """
         import re
-        # Remove question words, keep more content words (reduced stop words)
-        stop_words = r'\b(what|who|where|when|why|how)\b'
-        cleaned = re.sub(stop_words, '', question.lower())
         
-        # Extract meaningful words (alphanumeric, length > 2)
-        keywords = re.findall(r'\b[a-z0-9]{3,}\b', cleaned)
+        # Try to use LLM for keyword extraction
+        try:
+            # Check if model is configured
+            if not hasattr(self.cfg, 'model') or not self.cfg.model:
+                return self._extract_keywords_fallback(question)
+            
+            response = litellm.completion(
+                model=self.cfg.model,
+                messages=[
+                    {"role": "system", "content": """You are a keyword extraction assistant. Your task is to extract 5-10 important search keywords from the user's question that will help find relevant souvenirs/memories.
+
+Extract keywords that describe:
+- What happened (events, activities)
+- Who was involved (people names or roles)
+- Where it happened (locations)
+- When it happened (time expressions like yesterday, last week, first day)
+- Emotional context (celebration, meeting, trip)
+
+IMPORTANT:
+1. Output ONLY keywords, one per line, no numbering
+2. Do NOT include question words (what, who, where, when, why, how)
+3. Do NOT include articles (the, a, an)
+4. Use base form of verbs (working -> work, met -> meet)
+5. Include specific names or proper nouns as they are
+6. Handle ANY language - extract keywords from the language the question is written in
+7. If the question mentions negation (NOT something), include both positive and negative concepts
+
+Example:
+Input: "What did I do on my first day at work?"
+Output:
+first day
+work
+office
+colleague
+boss
+"""},
+                    {"role": "user", "content": f"Extract keywords from this question:\n{question}"}
+                ],
+                temperature=0.3,
+                max_tokens=100
+            )
+            
+            # Parse the LLM response
+            keywords_text = response.choices[0].message.content.strip()
+            keywords = [k.strip() for k in keywords_text.split('\n') if k.strip()]
+            
+            # Filter out any non-keyword content
+            keywords = [k for k in keywords if len(k) > 1 and not k.startswith(('1', '2', '3', '4', '5', '6', '7', '8', '9', '0'))]
+            
+            return ' '.join(keywords[:8])
+            
+        except Exception as e:
+            # Fall back to simple extraction if LLM fails
+            print(f"LLM keyword extraction failed ({e}), using fallback")
+            return self._extract_keywords_fallback(question)
+    
+    def _extract_keywords_fallback(self, question: str) -> str:
+        """Fallback keyword extraction using simple rules.
         
-        # If no keywords, fall back to the original question
-        if not keywords:
-            keywords = re.findall(r'\b[a-z0-9]{3,}\b', question.lower())
+        This is a simplified version kept for when LLM is not available.
+        """
+        import re
+        from collections import OrderedDict
         
-        # Simple stemming for common suffixes
-        stemmed = []
-        for kw in keywords:
-            # Remove common suffixes to improve matching
-            if kw.endswith('ies'):
-                stemmed.append(kw[:-3] + 'y')  # meetings → meeting
-            elif kw.endswith('ed') and len(kw) > 4:
-                stemmed.append(kw[:-2])  # discussed → discuss
-            elif kw.endswith('ing') and len(kw) > 5:
-                stemmed.append(kw[:-3])  # discussing → discuss
-            elif kw.endswith('s') and len(kw) > 3 and kw not in ['this', 'thus', 'yes', 'class']:
-                stemmed.append(kw[:-1])  # trips → trip
-            else:
-                stemmed.append(kw)
+        question_lower = question.lower()
         
-        # Deduplicate while preserving order
-        seen = set()
-        unique = []
-        for kw in stemmed:
-            if kw not in seen:
-                seen.add(kw)
-                unique.append(kw)
+        # Define comprehensive stop words (question words + common filler words)
+        stop_words = {
+            'what', 'who', 'where', 'when', 'why', 'how', 'which', 'whom',
+            'is', 'are', 'was', 'were', 'be', 'been', 'being',
+            'do', 'does', 'did', 'have', 'has', 'had',
+            'can', 'could', 'would', 'should', 'may', 'might', 'must',
+            'i', 'me', 'my', 'mine', 'we', 'our', 'ours',
+            'you', 'your', 'yours', 'he', 'she', 'it', 'they', 'them', 'their',
+            'this', 'that', 'these', 'those',
+            'a', 'an', 'the', 'and', 'or', 'but', 'if', 'then', 'else',
+            'to', 'for', 'of', 'in', 'on', 'at', 'by', 'with', 'about',
+            'from', 'up', 'out', 'over', 'under', 'again', 'further',
+            'so', 'very', 'just', 'only', 'also', 'now', 'here', 'there',
+            'tell', 'ask', 'remember', 'recall', 'find', 'get', 'show'
+        }
         
-        return ' '.join(unique[:5])
+        # Simple lemmatization dictionary for common irregular words
+        lemmatization_map = {
+            'meeting': 'meet', 'meetings': 'meet',
+            'working': 'work', 'worked': 'work',
+            'going': 'go', 'went': 'go',
+            'having': 'have', 'had': 'have',
+            'doing': 'do', 'did': 'do',
+            'saying': 'say', 'said': 'say',
+            'thinking': 'think', 'thought': 'think',
+            'eating': 'eat', 'ate': 'eat',
+            'buying': 'buy', 'bought': 'buy',
+            'seeing': 'see', 'saw': 'see',
+            'getting': 'get', 'got': 'get',
+            'making': 'make', 'made': 'make',
+            'taking': 'take', 'took': 'take',
+            'giving': 'give', 'gave': 'give',
+            'knowing': 'know', 'knew': 'know',
+            'coming': 'come', 'came': 'come',
+            'using': 'use', 'used': 'use',
+            'learning': 'learn', 'learned': 'learn', 'learnt': 'learn',
+            'talking': 'talk', 'talked': 'talk',
+            'walking': 'walk', 'walked': 'walk',
+            'running': 'run', 'ran': 'run',
+            'traveling': 'travel', 'travelled': 'travel',
+            'writing': 'write', 'wrote': 'write',
+            'reading': 'read', 'read': 'read',
+            'listening': 'listen', 'listened': 'listen',
+            'watching': 'watch', 'watched': 'watch',
+            'playing': 'play', 'played': 'play',
+            'working': 'work', 'works': 'work',
+            'visiting': 'visit', 'visited': 'visit',
+            'celebrating': 'celebrate', 'celebrated': 'celebrate',
+            'graduating': 'graduate', 'graduated': 'graduate',
+            'starting': 'start', 'started': 'start',
+            'finishing': 'finish', 'finished': 'finish',
+            'beginning': 'begin', 'began': 'begin',
+            'purchasing': 'purchase', 'purchased': 'purchase',
+            'ordered': 'order', 'ordering': 'order',
+            'received': 'receive', 'receiving': 'receive',
+        }
+        
+        # Simple suffix-stripping lemmatization for regular words
+        def simple_lemmatize(word: str) -> str:
+            """Apply simple rule-based lemmatization."""
+            # Check dictionary first
+            if word in lemmatization_map:
+                return lemmatization_map[word]
+            
+            # Handle common suffixes
+            if word.endswith('ies') and len(word) > 4:
+                return word[:-3] + 'y'
+            elif word.endswith('ied') and len(word) > 4:
+                return word[:-3] + 'y'
+            elif word.endswith('es') and len(word) > 4:
+                return word[:-2]
+            elif word.endswith('ed') and len(word) > 4:
+                # Check for double consonant
+                if len(word) > 3 and word[-3] == word[-4]:
+                    return word[:-3]
+                return word[:-2]
+            elif word.endswith('ing') and len(word) > 5:
+                # Handle doubled consonants (running -> run)
+                if len(word) > 5 and word[-4] == word[-5]:
+                    return word[:-4]
+                return word[:-3]
+            elif word.endswith('s') and len(word) > 3 and word[-2] not in 'su':
+                return word[:-1]
+            elif word.endswith('er') and len(word) > 4:
+                return word[:-2]
+            elif word.endswith('est') and len(word) > 5:
+                return word[:-3]
+            
+            return word
+        
+        # Detect negation patterns
+        negation_words = {'not', 'no', "n't", 'never', 'none', 'nothing', 'neither', 'nobody', 'nowhere'}
+        has_negation = any(neg in question_lower for neg in negation_words)
+        
+        # Extract time expressions for boosting
+        time_patterns = [
+            (r'\byesterday\b', 'yesterday'),
+            (r'\btoday\b', 'today'),
+            (r'\blast week\b', 'last_week'),
+            (r'\blist month\b', 'last_month'),
+            (r'\byesterday\b', 'yesterday'),
+            (r'\bweek ago\b', 'week_ago'),
+            (r'\bmonth ago\b', 'month_ago'),
+            (r'\byears? ago\b', 'years_ago'),
+            (r'\bfirst day\b', 'first_day'),
+            (r'\blast year\b', 'last_year'),
+        ]
+        
+        time_expressions = []
+        for pattern, label in time_patterns:
+            if re.search(pattern, question_lower):
+                time_expressions.append(label)
+        
+        # Extract named entities patterns (people, places)
+        entity_patterns = [
+            (r'\b(mr|mrs|ms|dr|prof)\s+\w+\b', 'person'),
+            (r'\b[A-Z][a-z]+\s+[A-Z][a-z]+\b', 'person'),
+            (r'\b(?:at|in|to|from)\s+(?:the\s+)?([A-Z][a-z]+(?:\s+[A-Z][a-z]+)*)\b', 'place'),
+        ]
+        
+        # Clean the question and extract tokens
+        # Remove question words and punctuation
+        cleaned = re.sub(r'\b(what|who|where|when|why|how|which|whom)\b', '', question_lower)
+        cleaned = re.sub(r'[^\w\s]', ' ', cleaned)
+        cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+        
+        # Extract words
+        words = cleaned.split()
+        
+        # Filter stopwords and lemmatize
+        keywords = []
+        for word in words:
+            if len(word) > 2 and word not in stop_words:
+                lemma = simple_lemmatize(word)
+                if lemma not in stop_words:
+                    keywords.append(lemma)
+        
+        # Add time expressions if found
+        keywords.extend(time_expressions)
+        
+        # Deduplicate while preserving order using OrderedDict
+        unique_keywords = list(OrderedDict.fromkeys(keywords))
+        
+        # Limit to top keywords
+        final_keywords = unique_keywords[:8]
+        
+        return ' '.join(final_keywords)
+    
+    def _expand_query_with_synonyms(self, query: str) -> str:
+        """Expand query with synonyms and related terms for better recall.
+        
+        Uses a simple synonym dictionary for common terms related to
+        memories, events, people, and activities.
+        """
+        # Synonym dictionary for common memory-related terms
+        synonyms = {
+            # Work/Career
+            'work': ['job', 'career', 'professional', 'office', 'boss', 'colleague', 'coworker'],
+            'meeting': ['meet', 'met', 'discussion', 'standup', 'one-on-one'],
+            'project': ['task', 'assignment', 'deliverable', 'deadline'],
+            
+            # Social/People
+            'meet': ['met', 'introduced', 'introduce', 'greet', 'greeting'],
+            'friend': ['buddy', 'companion', 'acquaintance', 'pal', 'mate'],
+            'colleague': ['coworker', 'teammate', 'associate', 'partner'],
+            'boss': ['manager', 'supervisor', 'lead', 'chief', 'director'],
+            
+            # Events/Activities
+            'event': ['occasion', 'function', 'gathering', 'party', 'celebration'],
+            'conference': ['convention', 'summit', 'seminar', 'workshop', 'talk'],
+            'lunch': ['meal', 'dinner', 'breakfast', 'food', 'eating'],
+            'travel': ['trip', 'journey', 'visit', 'vacation', 'honeymoon'],
+            
+            # Memory/Learning
+            'learn': ['learned', 'learnt', 'study', 'studied', 'discover', 'discovered'],
+            'remember': ['recall', 'recollect', 'remind', 'reminded', 'memory'],
+            'forget': ['forgot', 'forgotten', 'missed', 'miss'],
+            
+            # Time expressions
+            'first': ['initial', 'initial', 'beginning', 'beginning'],
+            'last': ['previous', 'past', 'recent', 'recently'],
+            'yesterday': ['previous', 'prior', 'last day'],
+            'today': ['now', 'current', 'this day'],
+            'week': ['seven days', 'weekend', 'weekday'],
+            
+            # Emotions/States
+            'happy': ['glad', 'pleased', 'delighted', 'thrilled', 'excited'],
+            'sad': ['unhappy', 'disappointed', 'upset', 'down'],
+            'excited': ['thrilled', 'eager', 'enthusiastic', 'pumped'],
+            
+            # Achievements
+            'promotion': ['advance', 'raised', 'elevation', 'step up'],
+            'award': ['prize', 'recognition', 'honor', 'accolade'],
+            'graduate': ['graduation', 'degree', 'diploma', 'completed'],
+        }
+        
+        # Add expansion
+        expanded_terms = []
+        query_lower = query.lower()
+        words = query_lower.split()
+        
+        for word in words:
+            expanded_terms.append(word)
+            if word in synonyms:
+                # Add a subset of synonyms (not all to avoid query explosion)
+                for syn in synonyms[word][:3]:
+                    if syn not in query_lower:  # Only add if not already in query
+                        expanded_terms.append(syn)
+        
+        return ' '.join(expanded_terms)
     
     def close(self):
         """Close the memory storage."""
