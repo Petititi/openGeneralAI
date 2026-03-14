@@ -402,8 +402,11 @@ class GmailMemoryAssistant:
         - Starred (starred messages)
         - All Categories
         
+        This method uses iterative fetching to bypass Gmail's 500 message limit
+        per request by using page tokens for pagination.
+        
         Args:
-            max_results_per_source: Maximum emails per folder (default: 200)
+            max_results_per_source: Maximum emails to fetch (default: 200)
             days_back: How far back to search (default: 365 = 1 year)
             
         Returns:
@@ -427,20 +430,52 @@ class GmailMemoryAssistant:
                 print(f"\n  📂 Fetching...")
                 
                 query = f'after:{date_since}'
-                # Use labelIds filter
-                results = self.service.users().messages().list(
-                    userId='me',
-                    maxResults=max_results_per_source,
-                    q=query,
-                ).execute()
+                
+                # Gmail API has a hard limit of 500 messages per request
+                # Use the smaller of max_results_per_source or 500
+                batch_size = min(max_results_per_source, 500)
+                
+                # Initial request
+                request_params = {
+                    'userId': 'me',
+                    'maxResults': batch_size,
+                    'q': query,
+                }
+                results = self.service.users().messages().list(**request_params).execute()
                 
                 messages = results.get('messages', [])
-                print(f"     Found {len(messages)} emails")
+                page_token = results.get('nextPageToken')
+                
+                print(f"     Retrieved first batch: {len(messages)} emails")
+                
+                # Iteratively fetch more pages until we reach max_results_per_source
+                iteration = 1
+                while page_token and len(seen_ids) < max_results_per_source:
+                    remaining = max_results_per_source - len(seen_ids)
+                    if remaining <= 0:
+                        break
+                    
+                    # Request next page
+                    request_params['pageToken'] = page_token
+                    request_params['maxResults'] = min(remaining, 500)
+                    
+                    try:
+                        results = self.service.users().messages().list(**request_params).execute()
+                        batch_messages = results.get('messages', [])
+                        messages.extend(batch_messages)
+                        page_token = results.get('nextPageToken')
+                        iteration += 1
+                        print(f"     Retrieved batch {iteration}: {len(batch_messages)} emails (total: {len(messages)})")
+                    except HttpError as e:
+                        print(f"⚠️  Error fetching page {iteration}: {e}")
+                        break
+                
+                print(f"     Found {len(messages)} emails in {iteration} batch(es)")
                 
                 # Fetch details (with batching for efficiency)
-                batch_size = 25
-                for i in range(0, len(messages), batch_size):
-                    batch = messages[i:i + batch_size]
+                detail_batch_size = 25
+                for i in range(0, len(messages), detail_batch_size):
+                    batch = messages[i:i + detail_batch_size]
                     
                     for msg in batch:
                         if msg['id'] in seen_ids:
@@ -462,8 +497,8 @@ class GmailMemoryAssistant:
                         except HttpError:
                             continue
                     
-                    if (i + batch_size) % 50 == 0:
-                        print(f"     Processed {min(i + batch_size, len(messages))}/{len(messages)}...")
+                    if (i + detail_batch_size) % 50 == 0:
+                        print(f"     Processed {min(i + detail_batch_size, len(messages))}/{len(messages)}...")
                 
             except HttpError as e:
                 print(f"⚠️  Error fetching mails: {e}")
