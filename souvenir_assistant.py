@@ -929,7 +929,8 @@ Memories:
         conversation_info: Dict,
         category: str = 'email_conversation',
         tags: Optional[List[str]] = None,
-        allow_duplicates: bool = False
+        allow_duplicates: bool = False,
+        is_single_email: bool = False
     ) -> Dict[str, Any]:
         """Add an email thread as a memory with multiple chunks.
         
@@ -943,6 +944,7 @@ Memories:
             category: Category for the memory
             tags: Optional tags for the memory
             allow_duplicates: If False, check for similar existing documents first
+            is_single_email: If True, use lower threshold (0.70) for single emails
             
         Returns:
             Dictionary with operation result
@@ -956,9 +958,14 @@ Memories:
             key_points = conversation_info.get("key_points", [])
             content_for_check = topic + " " + " ".join(key_points)
             
+            # Determine duplicate threshold - lower for single emails (0.70) to allow more storage
+            # For threads: 0.75, for singles: 0.70
+            duplicate_threshold = 0.70 if is_single_email else 0.75
+            
             # Check for similar existing documents if duplicates not allowed
+            # Lowered threshold from 0.90 to allow storing more variants
             if not allow_duplicates and self.ltm.embeddings is not None and content_for_check.strip():
-                similar_docs = self.find_similar_documents(content_for_check, top_k=3, similarity_threshold=0.90)
+                similar_docs = self.find_similar_documents(content_for_check, top_k=3, similarity_threshold=duplicate_threshold)
                 if similar_docs:
                     # Return the most similar document instead of creating a duplicate
                     best_match = similar_docs[0]
@@ -976,6 +983,15 @@ Memories:
             # Generate a unique ID for the email memory
             memory_id = str(uuid.uuid4())[:8]
             
+            # Step 9: Create content hash for improved deduplication
+            # Use full email content (body, sender, date) for more accurate deduplication
+            full_content_parts = []
+            for email in thread_emails:
+                full_content_parts.append(email.get('body', ''))
+                full_content_parts.append(email.get('from', ''))
+                full_content_parts.append(email.get('date', ''))
+            content_hash = hashlib.sha256(' '.join(full_content_parts).encode()).hexdigest()[:16]
+            
             # Build title from topic or subject
             if conversation_info.get("topic"):
                 title = f"📧 {conversation_info['topic']}"
@@ -983,7 +999,7 @@ Memories:
                 subject = thread_emails[0].get('subject', 'Email Conversation')
                 title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
             
-            # Prepare extra metadata
+            # Prepare extra metadata - include content hash for deduplication tracking
             extra = {
                 'title': title,
                 'tags': tags or [],
@@ -991,6 +1007,7 @@ Memories:
                     'subject': thread_emails[0].get('subject', ''),
                     'message_count': len(thread_emails),
                     'participants': conversation_info.get('participants', []),
+                    'content_hash': content_hash  # Store for deduplication reference
                 }
             }
             
@@ -1023,7 +1040,7 @@ Memories:
             # Chunk 2: Participants (no embeddings - contains email addresses)
             participants = conversation_info.get("participants", [])
             if participants:
-                participants_content = "Participants:\n" + "\n".join(f"  - {p}" for p in participants)
+                participants_content = "\n".join(f"  - {p}" for p in participants)
                 participants_chunk_id = self.ltm.add_memory_chunk(
                     memory_id, chunk_ordinal, 1, len(participants_content.split('\n')),
                     participants_content, 'email_participants', None, None, embed=False
@@ -1178,18 +1195,16 @@ Memories:
         """Search for souvenirs matching the query."""
         try:
             results = self.ltm.search_souvenirs(query, category=category, limit=top_k)
-            
+
             souvenirs = []
             for r in results:
-                extra = json.loads(r.get('extra', '{}')) if r.get('extra') else {}
                 souvenirs.append({
-                    "id": r["id"],
-                    "title": extra.get('title', 'Untitled'),
-                    "content": r.get('content', ''),
+                    "id": r["document_id"],
+                    "title": r.get('title', 'Untitled'),
+                    "participants": r.get('participants', 'Unknown'),
                     "category": r.get('category', 'general'),
-                    "tags": extra.get('tags', []),
-                    "created_at": r.get('created_at', ''),
-                    "similarity_score": r.get('similarity_score', 0)
+                    "tags": r.get('tags', []),
+                    "similarity_score": r.get('score', 0)
                 })
             return souvenirs
         except Exception as e:
@@ -1197,10 +1212,16 @@ Memories:
             return []
     
     def search_by_chunk_type(self, chunk_types: List[str], query: Optional[str] = None, 
-                              top_k: int = 5) -> List[Dict[str, Any]]:
+                              top_k: int = 30) -> List[Dict[str, Any]]:
         """Search for souvenirs by specific chunk types.
         
-        Delegates to LongTermMemory.search_by_chunk_type()
+        Args:
+            chunk_types: List of chunk types to search
+            query: Optional text query for FTS search
+            top_k: Maximum results (default increased from 5 to 30)
+            
+        Returns:
+            List of souvenirs matching the criteria
         """
         return self.ltm.search_by_chunk_type(
             chunk_types=chunk_types,
@@ -1208,12 +1229,30 @@ Memories:
             top_k=top_k
         )
     
-    def search_semantic(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def search_by_participant(self, participant_name: str, top_k: int = 20) -> List[Dict[str, Any]]:
+        """Search for emails by participant/sender name.
+        
+        Args:
+            participant_name: Name of the sender or participant to search for
+            top_k: Maximum number of results
+            
+        Returns:
+            List of souvenirs where the participant was involved
+        """
+        # Search specifically in email_participants chunk type
+        return self.ltm.search_by_chunk_type(
+            chunk_types=["email_participants"],
+            query=participant_name,
+            top_k=top_k
+        )
+    
+    def search_semantic(self, query: str, top_k: int = 20, similarity_threshold: float = 0.75) -> List[Dict[str, Any]]:
         """Search for souvenirs using semantic embeddings.
         
         Args:
             query: The search query
-            top_k: Maximum number of results
+            top_k: Maximum number of results (default increased from 5 to 20)
+            similarity_threshold: Minimum similarity score (default lowered from 0.95 to 0.75)
             
         Returns:
             List of souvenirs with similarity scores
@@ -1225,31 +1264,35 @@ Memories:
             # Encode the query
             query_emb = self.ltm.encode_text(query, normalize=True)
             
-            # Search in FAISS index
-            distances, indices = self.ltm.search_embeddings(query_emb, top_k)
+            # Search in FAISS index - request more results to filter by threshold
+            search_k = max(top_k * 2, 40)  # Get more results to apply threshold filtering
+            distances, indices = self.ltm.search_embeddings(query_emb, search_k)
             
-            # Get chunk information
+            # Get chunk information and apply threshold filtering
             results = []
             for dist, idx in zip(distances[0], indices[0]):
                 if idx >= 0:
                     chunk_info = self.ltm.get_chunk_by_id(int(idx))
                     if chunk_info:
                         chunk_id, doc_id, start_line, end_line, chunk_type, chunk_name, content = chunk_info
-                        doc_details = self.ltm.get_memory(doc_id)
-                        if doc_details:
-                            extra = doc_details["document"].get("extra", {})
-                            results.append({
-                                "id": doc_id,
-                                "title": extra.get("title", "Untitled"),
-                                "content": content,
-                                "category": doc_details["document"].get("category", "general"),
-                                "tags": extra.get("tags", []),
-                                "created_at": doc_details["document"].get("created_at", ""),
-                                "chunk_type": chunk_type,
-                                "similarity_score": float(dist)
-                            })
+                        # Apply similarity threshold filtering
+                        if float(dist) >= similarity_threshold:
+                            doc_details = self.ltm.get_memory(doc_id)
+                            if doc_details:
+                                extra = doc_details["document"].get("extra", {})
+                                results.append({
+                                    "id": doc_id,
+                                    "title": extra.get("title", "Untitled"),
+                                    "content": content,
+                                    "category": doc_details["document"].get("category", "general"),
+                                    "tags": extra.get("tags", []),
+                                    "created_at": doc_details["document"].get("created_at", ""),
+                                    "chunk_type": chunk_type,
+                                    "similarity_score": float(dist)
+                                })
             
-            return results
+            # Limit to requested top_k after filtering
+            return results[:top_k]
         except Exception as e:
             print(f"Semantic search error: {e}")
             return []
@@ -1293,11 +1336,26 @@ The database has the following chunk types (each document is split into multiple
 
 Return a JSON object with:
 {{
-    "search_strategy": "semantic" or "keyword" or "chunk_type" or "hybrid",
+    "search_strategy": "semantic" or "keyword" or "chunk_type" or "hybrid" or "participant",
     "chunk_types": ["list of relevant chunk types if chunk_type or hybrid strategy"],
     "keywords": ["important keywords for search"],
+    "participant_name": "person name if the question is about a specific person (e.g., 'what did John email me', 'emails from Sarah')",
+    "entities": ["people, organizations, locations mentioned in the question for query expansion"],
+    "dates": ["dates or time periods mentioned (e.g., 'last week', 'this month', 'January')"],
+    "action_items_implied": true/false - if question asks about tasks or todos,
     "reasoning": "brief explanation of why this strategy was chosen"
 }}
+
+Step 4: Query Expansion - Extract entities and dates from question for broadening search
+- Extract person names, organizations, locations mentioned
+- Identify any date references (last week, this month, specific dates)
+- Note if the question implies looking for action items/tasks
+
+Choose "participant" or include participant_name if the question asks about:
+- emails from/to a specific person
+- what someone emailed
+- communications from a specific person
+- "emails from X", "what did Y send me", "messages between me and Z"
 
 Choose "chunk_type" or "hybrid" if the question specifically asks about:
 - action items, tasks, todos -> email_action_items
@@ -1324,11 +1382,15 @@ Choose "keyword" for simple factual queries or if no embeddings."""
             result = response.choices[0].message.content
             strategy = json.loads(result)
             
-            # Ensure required fields exist
+            # Ensure required fields exist - including query expansion fields
             return {
                 "search_strategy": strategy.get("search_strategy", "hybrid"),
                 "chunk_types": strategy.get("chunk_types", []),
                 "keywords": strategy.get("keywords", []),
+                "participant_name": strategy.get("participant_name", ""),
+                "entities": strategy.get("entities", []),
+                "dates": strategy.get("dates", []),
+                "action_items_implied": strategy.get("action_items_implied", False),
                 "reasoning": strategy.get("reasoning", ""),
                 "has_embeddings": has_embeddings
             }
@@ -1341,9 +1403,73 @@ Choose "keyword" for simple factual queries or if no embeddings."""
                 "search_strategy": "keyword" if not has_embeddings else "semantic",
                 "chunk_types": [],
                 "keywords": keywords,
+                "participant_name": "",
+                "entities": [],
+                "dates": [],
+                "action_items_implied": False,
                 "reasoning": "Fallback due to error",
                 "has_embeddings": has_embeddings
             }
+    
+    def _apply_recency_boost(self, results: List[Dict[str, Any]], decay_factor: float = 0.95, decay_days: int = 30) -> List[Dict[str, Any]]:
+        """Apply recency boosting to search results.
+        
+        Calculates days since email creation and applies a decay factor to boost
+        scores for more recent memories.
+        
+        Args:
+            results: List of search results
+            decay_factor: Multiplication factor per decay_days (default 0.95)
+            decay_days: Number of days for each decay step (default 30)
+            
+        Returns:
+            List of results with combined scores that factor in recency
+        """
+        from datetime import datetime
+        
+        try:
+            current_time = datetime.now()
+        except Exception:
+            return results
+        
+        for result in results:
+            created_at = result.get("created_at", "")
+            days_old = 0
+            
+            if created_at:
+                try:
+                    # Try parsing ISO format
+                    if isinstance(created_at, str):
+                        created_date = datetime.fromisoformat(created_at.replace('Z', '+00:00'))
+                        # For naive datetime, assume UTC
+                        if created_date.tzinfo is None:
+                            created_date = created_date
+                        # Calculate days difference
+                        days_old = (current_time - created_date.replace(tzinfo=None)).days
+                except Exception:
+                    # Try parsing other common formats
+                    try:
+                        created_date = datetime.strptime(created_at[:10], "%Y-%m-%d")
+                        days_old = (current_time - created_date).days
+                    except Exception:
+                        pass
+            
+            # Calculate recency boost: newer items get higher boost
+            # decay_factor^(days_old/decay_days) gives 1.0 for today, 0.95 for 30 days ago, etc.
+            import math
+            recency_multiplier = math.pow(decay_factor, days_old / decay_days) if days_old > 0 else 1.0
+            
+            # Get original similarity score (default to 0.5 for keyword results without scores)
+            original_score = result.get("similarity_score", 0.5)
+            
+            # Combine scores: weighted average of similarity and recency
+            combined_score = (0.8 * original_score) + (0.2 * recency_multiplier)
+            
+            result["combined_score"] = combined_score
+            result["recency_boost"] = recency_multiplier
+            result["days_old"] = days_old
+        
+        return results
     
     def ask_about_souvenirs(self, question: str) -> Dict[str, Any]:
         """Ask a question about souvenirs using intelligent search based on question analysis."""
@@ -1352,25 +1478,70 @@ Choose "keyword" for simple factual queries or if no embeddings."""
         
         all_results = []
         
-        # Execute search based on strategy
+        # Execute search based on strategy - using improved parameters for better recall
         if search_strategy["search_strategy"] in ["semantic", "hybrid"]:
-            semantic_results = self.search_semantic(question, top_k=5)
+            semantic_results = self.search_semantic(question, top_k=20, similarity_threshold=0.75)
             all_results.extend(semantic_results)
         
         if search_strategy["search_strategy"] in ["keyword", "hybrid"]:
             keywords = search_strategy.get("keywords", [])
             if keywords:
-                keyword_query = " ".join(keywords[:5])
-                keyword_results = self.search_souvenirs(keyword_query, top_k=15)
+                # Increased from 5 to 10 keywords for better coverage
+                keyword_query = " ".join(keywords[:10])
+                # Increased from 15 to 30 results for more candidates
+                keyword_results = self.search_souvenirs(keyword_query, top_k=30)
                 all_results.extend(keyword_results)
         
         if search_strategy["search_strategy"] == "chunk_type":
             chunk_types = search_strategy.get("chunk_types", [])
             if chunk_types:
-                # Combine keywords if any
-                query = " ".join(search_strategy.get("keywords", []))
-                chunk_results = self.search_by_chunk_type(chunk_types, query=query if query else None, top_k=15)
+                # Combine keywords if any - increased from 5 to 10
+                query = " ".join(search_strategy.get("keywords", [])[:10])
+                # Increased from 15 to 30 results for more candidates
+                chunk_results = self.search_by_chunk_type(chunk_types, query=query if query else None, top_k=30)
                 all_results.extend(chunk_results)
+        
+        # Step 2: Add explicit participant/sender search
+        participant_name = search_strategy.get("participant_name", "")
+        if participant_name:
+            participant_results = self.search_by_participant(participant_name, top_k=20)
+            all_results.extend(participant_results)
+        
+        # Step 4: Query Expansion - broaden search using extracted entities and dates
+        entities = search_strategy.get("entities", [])
+        dates = search_strategy.get("dates", [])
+        action_items_implied = search_strategy.get("action_items_implied", False)
+        
+        # Expand keywords with entities
+        expanded_keywords = list(search_strategy.get("keywords", []))
+        expanded_keywords.extend(entities)
+        
+        # If entities or dates are found, do additional searches
+        if entities or dates:
+            # Search with expanded keywords
+            expanded_query = " ".join(expanded_keywords[:15])
+            if expanded_query:
+                expanded_results = self.search_souvenirs(expanded_query, top_k=20)
+                all_results.extend(expanded_results)
+            
+            # If action items are implied, search action items chunk type
+            if action_items_implied:
+                action_results = self.search_by_chunk_type(
+                    ["email_action_items"],
+                    query=expanded_query if expanded_query else None,
+                    top_k=20
+                )
+                all_results.extend(action_results)
+            
+            # If dates are mentioned, search dates chunk type
+            if dates:
+                date_query = " ".join(dates)
+                date_results = self.search_by_chunk_type(
+                    ["email_dates"],
+                    query=date_query,
+                    top_k=15
+                )
+                all_results.extend(date_results)
         
         # Deduplicate results by document ID
         seen_ids = set()
@@ -1380,11 +1551,66 @@ Choose "keyword" for simple factual queries or if no embeddings."""
                 seen_ids.add(r["id"])
                 unique_results.append(r)
         
-        # Re-rank by similarity score if available
-        if any("similarity_score" in r for r in unique_results):
-            unique_results.sort(key=lambda x: x.get("similarity_score", 0), reverse=True)
+        # Step 5: Fallback Search Chain - ensure results even when primary search fails
+        if len(unique_results) < 3:
+            # Fallback 1: Try semantic search with lower threshold
+            fallback_semantic = self.search_semantic(question, top_k=15, similarity_threshold=0.5)
+            for r in fallback_semantic:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    unique_results.append(r)
         
-        souvenirs = unique_results[:5]
+        if len(unique_results) < 3:
+            # Fallback 2: Try chunk-type specific search across all email types
+            fallback_chunk = self.search_by_chunk_type(
+                ["email_topic", "email_key_points", "email_original"],
+                query=question,
+                top_k=20
+            )
+            for r in fallback_chunk:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    unique_results.append(r)
+        
+        if len(unique_results) < 3:
+            # Fallback 3: Full-text keyword search across all chunks
+            fallback_keyword = self.search_souvenirs(question, top_k=25)
+            for r in fallback_keyword:
+                if r["id"] not in seen_ids:
+                    seen_ids.add(r["id"])
+                    unique_results.append(r)
+        
+        if not unique_results:
+            # Fallback 4: List recent souvenirs as last resort
+            recent_memories = self.ltm.list_souvenirs(limit=10)
+            for mem in recent_memories:
+                doc_id = mem.get("document_id")
+                if doc_id:
+                    # Get full memory details
+                    memory_details = self.ltm.get_memory(doc_id)
+                    unique_results.append({
+                        "id": doc_id,
+                        "title": memory_details.get("document", {}).get("extra", {}).get("title", "Untitled") if memory_details else mem.get("title", "Untitled"),
+                        "content": memory_details.get("document", {}).get("content", "")[:500] if memory_details else "",
+                        "category": memory_details.get("document", {}).get("category", "general") if memory_details else mem.get("category", "general"),
+                        "created_at": memory_details.get("document", {}).get("created_at", "") if memory_details else "",
+                        "chunk_type": "fallback_recent",
+                        "similarity_score": 0.1
+                    })
+        
+        # Step 3: Apply recency boosting - prioritize recent emails
+        unique_results = self._apply_recency_boost(unique_results)
+        
+        # keep only results that have a combined_score above 0.5 to ensure relevance, but allow some flexibility
+        unique_results = [r for r in unique_results if r.get("combined_score", r.get("similarity_score", 0)) >= 0.5]
+        if any("similarity_score" in r for r in unique_results):
+            unique_results.sort(key=lambda x: x.get("combined_score", x.get("similarity_score", 0)), reverse=True)
+        
+        # Increased from 5 to 15 to provide more candidates to the LLM
+        if len(unique_results) > 10:
+            souvenirs = unique_results[:10]
+        else:
+            souvenirs = unique_results
         
         if not souvenirs:
             return {
@@ -1438,20 +1664,14 @@ Choose "keyword" for simple factual queries or if no embeddings."""
         
         formatted = []
         for i, s in enumerate(souvenirs, 1):
-            created = s.get('created_at', 'Unknown date')
+            participants = s.get('participants', 'Unknown')
             title = s.get('title', 'Untitled')
-            category = s.get('category', 'general')
             chunk_type = s.get('chunk_type', 'unknown')
-            chunk_label = chunk_type_labels.get(chunk_type, chunk_type)
             
             formatted.append(f"""
 --- Memory {i} ---
 Title: {title}
-Category: {category}
-Type: {chunk_label}
-Date: {created}
-Content:
-{s['content']}
+Participants: {participants}
 """)
             
             # Include matching chunks if available
@@ -1494,7 +1714,7 @@ Memories:
 
 My question: {question}
 
-Please provide a detailed answer based on the memories above. If the question asks about specific types of information (like action items, dates, participants), prioritize those sections in your answer:"""
+Please provide a detailed answer using question language based on the memories above. If the question asks about specific types of information (like action items, dates, participants), prioritize those sections in your answer:"""
     
     def list_souvenirs(self, category: Optional[str] = None, limit: int = 20) -> List[Dict[str, Any]]:
         """List all stored souvenirs, optionally filtered by category."""
@@ -1503,14 +1723,11 @@ Please provide a detailed answer based on the memories above. If the question as
             
             souvenirs = []
             for r in results:
-                extra = json.loads(r.get('extra', '{}')) if r.get('extra') else {}
                 souvenirs.append({
-                    "id": r["id"],
-                    "title": extra.get('title', 'Untitled'),
-                    "content": r.get('content', ''),
+                    "id": r["document_id"],
+                    "title": r.get('title', 'Untitled'),
                     "category": r.get('category', 'general'),
-                    "tags": extra.get('tags', []),
-                    "created_at": r.get('created_at', ''),
+                    "tags": r.get('tags', []),
                 })
             return souvenirs
         except Exception as e:
@@ -1679,8 +1896,6 @@ Example output format:
     
     def close(self):
         """Close the memory storage."""
-        if self.ltm:
-            self.ltm.close()
 
 
 def interactive_mode(assistant: SouvenirAssistant):

@@ -664,11 +664,17 @@ class GmailMemoryAssistant:
         
         return "\n".join(lines)
     
-    def create_memories_from_emails(self, emails: List[Dict]) -> Dict[str, Any]:
+    def create_memories_from_emails(self, emails: List[Dict], include_single_emails: bool = True, store_individual_emails: bool = True) -> Dict[str, Any]:
         """Create souvenirs from extracted email data.
         
-        Only processes email threads (conversations with multiple messages).
-        Uses conversation_info from LLM extraction to build rich memory content.
+        Args:
+            emails: List of email dictionaries
+            include_single_emails: If True, also store single emails (not just threads)
+            store_individual_emails: If True, store each email within threads separately (in addition to thread-level memory)
+        
+        Processes email threads (conversations with multiple messages) and optionally
+        single emails (messages with no replies). Uses conversation_info from LLM 
+        extraction to build rich memory content.
         """
         if not emails:
             return {"ok": False, "error": "No emails to process"}
@@ -687,13 +693,35 @@ class GmailMemoryAssistant:
         thread_count = sum(1 for t in threads.values() if t['size'] > 1)
         print(f"   Found {thread_count} email conversations (threads with multiple messages)")
         
-        if thread_count == 0:
+        # Identify single emails (emails not part of any thread with multiple messages)
+        single_emails = []
+        for email in emails:
+            thread_id = email.get('thread_id')
+            if thread_id and thread_id in threads:
+                if threads[thread_id]['size'] == 1:
+                    # This is a single email in its thread
+                    single_emails.append(email)
+            else:
+                # No thread ID at all - treat as single
+                single_emails.append(email)
+        
+        if include_single_emails:
+            print(f"   Found {len(single_emails)} single emails (not part of threads)")
+        else:
+            print(f"   Skipping {len(single_emails)} single emails (include_single_emails=False)")
+        
+        # Step 8: Email-level granularity option
+        if store_individual_emails and thread_count > 0:
+            print(f"   Will store individual emails within threads (store_individual_emails=True)")
+        
+        if thread_count == 0 and len(single_emails) == 0:
             return {
                 "ok": True,
                 "memories_created": 0,
                 "emails_processed": len(emails),
                 "threads_processed": 0,
-                "message": f"No conversation threads found. Need threads with multiple messages to create memories."
+                "single_emails_processed": 0,
+                "message": f"No conversation threads or single emails found."
             }
         
         memories_created = 0
@@ -712,8 +740,11 @@ class GmailMemoryAssistant:
             'CATEGORY_UPDATES': 'email_updates',
         }
         
-        # Process only threads (conversations with multiple emails)
+        # Process threads (conversations with multiple emails)
         for thread_id, thread in threads.items():
+            if thread['size'] <= 1:
+                continue  # Skip single emails here, handle below
+            
             thread_emails = thread['emails']
             
             # Use LLM to extract meaningful information from the conversation
@@ -750,14 +781,125 @@ class GmailMemoryAssistant:
             
             if result.get('ok'):
                 memories_created += 1
+            
+            # Step 8: Store individual emails within thread if enabled
+            if store_individual_emails:
+                for i, email in enumerate(thread_emails):
+                    # Create individual email memory with unique content
+                    individual_info = {
+                        "topic": email.get('subject', 'No Subject'),
+                        "participants": [email.get('from', 'Unknown'), email.get('to', '')],
+                        "key_points": [email.get('snippet', '')] if email.get('snippet') else [],
+                        "action_items": [],
+                        "dates": [],
+                        "entities": [],
+                        "follow_ups": [],
+                        "tags": ["individual_email", "thread_email"]
+                    }
+                    
+                    # Determine category for individual email
+                    ind_category = category
+                    for label in email.get('labels', []):
+                        if label in categories_map:
+                            ind_category = categories_map[label]
+                            break
+                    
+                    # Add tags for individual email
+                    ind_tags = ["individual_email", "thread_email"]
+                    for label in email.get('labels', []):
+                        low_label = label.lower()
+                        if low_label not in ind_tags:
+                            ind_tags.append(low_label)
+                    ind_tags = list(set(ind_tags))[:15]
+                    
+                    # Create individual memory - use lower threshold to allow storing
+                    ind_result = self.souvenir_assistant.add_email_memory(
+                        thread_emails=[email],
+                        conversation_info=individual_info,
+                        category=ind_category,
+                        tags=ind_tags,
+                        is_single_email=False  # Use thread threshold (0.75) not single email (0.70)
+                    )
+                    
+                    if ind_result.get('ok'):
+                        memories_created += 1
+        
+        # Step 6: Process single emails if enabled
+        single_emails_processed = 0
+        individual_emails_stored = 0
+        
+        if include_single_emails and single_emails:
+            print(f"   Processing {len(single_emails)} single emails...")
+            for email in single_emails:
+                # Create a simple memory for single email
+                single_result = self._create_single_email_memory(email, categories_map)
+                if single_result.get('ok'):
+                    memories_created += 1
+                    single_emails_processed += 1
+        
+        # Count individual emails stored (done inside the thread processing)
+        # Already counted in memories_created
         
         return {
             "ok": True,
             "memories_created": memories_created,
             "emails_processed": len(emails),
             "threads_processed": thread_count,
-            "message": f"Created {memories_created} memories from {len(emails)} emails ({thread_count} conversation threads)"
+            "single_emails_processed": single_emails_processed,
+            "individual_emails_stored": store_individual_emails and thread_count > 0,
+            "message": f"Created {memories_created} memories from {len(emails)} emails ({thread_count} threads, {single_emails_processed} single emails, individual emails stored: {store_individual_emails})"
         }
+    
+    def _create_single_email_memory(self, email: Dict, categories_map: Dict) -> Dict[str, Any]:
+        """Create a memory from a single email (not part of a thread).
+        
+        Args:
+            email: Single email dictionary
+            categories_map: Mapping of Gmail labels to categories
+            
+        Returns:
+            Result dictionary from add_email_memory
+        """
+        # Extract basic info from the email
+        subject = email.get('subject', 'No Subject')
+        sender = email.get('from', 'Unknown')
+        snippet = email.get('snippet', '')
+        
+        # Create a simple conversation_info structure for single email
+        conversation_info = {
+            "topic": subject,
+            "participants": [sender],
+            "key_points": [snippet] if snippet else [],
+            "action_items": [],
+            "dates": [],
+            "entities": [],
+            "follow_ups": [],
+            "tags": ["single_email", "email"]
+        }
+        
+        # Determine category from labels
+        category = 'email_single'
+        for label in email.get('labels', []):
+            if label in categories_map:
+                category = categories_map[label]
+                break
+        
+        # Add label tags
+        tags = ["single_email", "email"]
+        for label in email.get('labels', []):
+            low_label = label.lower()
+            if low_label not in tags:
+                tags.append(low_label)
+        tags = list(set(tags))[:15]
+        
+        # Create single email memory using add_email_memory with single email
+        return self.souvenir_assistant.add_email_memory(
+            thread_emails=[email],
+            conversation_info=conversation_info,
+            category=category,
+            tags=tags,
+            is_single_email=True
+        )
     
     def analyze_email_memories(self) -> Dict[str, Any]:
         """Analyze all email memories to extract high-level insights.
@@ -1049,7 +1191,6 @@ class GmailMemoryAssistant:
                 print(f"\n📋 Stored Memories ({len(souvenirs)}):\n")
                 for i, s in enumerate(souvenirs, 1):
                     print(f"{i}. {s['title']}")
-                    print(f"   {s['content'][:100]}...")
                     print(f"   🏷️  {', '.join(s.get('tags', []))}")
                     print()
             

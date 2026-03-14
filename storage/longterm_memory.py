@@ -1630,7 +1630,7 @@ class LongTermMemory:
         with self.db._lock:
             cur = self.db.conn.cursor()
             
-            query = "SELECT doc_id, source_path, category, extra FROM documents WHERE 1=1"
+            query = "SELECT id, source_path, category, extra FROM documents WHERE 1=1"
             params = []
             
             if category:
@@ -1643,16 +1643,26 @@ class LongTermMemory:
             cur.execute(query, params)
             rows = cur.fetchall()
             
-            return [
-                {
-                    "document_id": row[0],
-                    "source_path": row[1],
-                    "category": row[2],
-                    "title": (row[3].get("title") if row[3] else None),
-                    "tags": (row[3].get("tags") if row[3] else []),
-                }
-                for row in rows
-            ]
+            results = []
+            for row in rows:
+                result = {}
+                result["document_id"] = row[0]
+                result["source_path"] = row[1]
+                result["category"] = row[2]
+                json_datas = row[3]
+                if json_datas:
+                    try:
+                        extra = json.loads(json_datas)
+                        result["title"] = extra.get("title")
+                        result["tags"] = extra.get("tags", [])
+                    except json.JSONDecodeError:
+                        result["title"] = None
+                        result["tags"] = []
+                else:
+                    result["title"] = None
+                    result["tags"] = []
+                results.append(result)
+            return results
 
     def search_souvenirs(
         self,
@@ -1675,16 +1685,29 @@ class LongTermMemory:
         results = self.search(query, top_k=limit, mode="hybrid")
         
         souvenirs = []
+        doc_id_in_souvenirs = set()
         for r in results:
-            doc = r.get("document", {})
+            doc_id = r.get("document_id", {})
+            if doc_id in doc_id_in_souvenirs:
+                continue
+            doc_id_in_souvenirs.add(doc_id)
+            # get doc details from dbd:
             if category and doc.get("category") != category:
                 continue
+            details = self.db.get_document_details(doc_id)
+            doc_info, chunks = details.get("document", {}), details.get("chunks", [])
+            participants = set()
+            for c in chunks:
+                if c.get("chunk_type") == "email_participants":
+                    participants.add(c.get("content"))
+            extra = doc_info.get("extra", {})
             souvenirs.append({
-                "document_id": doc.get("doc_id"),
-                "title": doc.get("extra", {}).get("title"),
-                "category": doc.get("category"),
-                "source_path": doc.get("source_path"),
-                "content": r.get("chunk_content"),
+                "document_id": doc_id,
+                "title": extra.get("title"),
+                "participants": " ".join(participants),
+                "category": r.get("chunk_type"),
+                "source_path": doc_info.get("source_path"),
+                "tags": extra.get("tags"),
                 "score": r.get("score"),
             })
         

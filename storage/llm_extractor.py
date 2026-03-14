@@ -137,7 +137,7 @@ Content:
 Return a JSON object with these fields:
 {{
     "summary": "2-3 sentence summary of the content, same language as content",
-    "participants": ["list of participants"],
+    "participants": ["list of participants using email adresses if possible"],
     "entities": {{"people": [], "organizations": [], "locations": []}},
     "key_points": ["main points discussed"],
     "action_items": ["any tasks or actions mentioned"],
