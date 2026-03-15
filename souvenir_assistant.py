@@ -19,7 +19,7 @@ from typing import List, Dict
 import hashlib
 from email_reply_parser import EmailReplyParser
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Set
 import json
 
 # Add parent directory to path
@@ -523,6 +523,42 @@ class SouvenirAssistant:
         # Initialize thread builder for conversation reconstruction
         self.thread_builder = ThreadBuilder()
     
+    def get_stored_thread_ids(self) -> Set[str]:
+        """Get all thread_ids already stored in the database.
+        
+        Queries all email-related documents and extracts their thread_ids
+        from the extra.email_thread metadata for deduplication purposes.
+        
+        Returns:
+            Set of thread_id strings already stored in the database
+        """
+        stored_thread_ids = set()
+        
+        try:
+            # Get all documents from the database
+            all_docs = self.ltm.db_manager.get_all_documents()
+            
+            for doc in all_docs:
+                doc_id = doc[0]  # First element is the document ID
+                
+                # Get document details including extra metadata
+                doc_details = self.ltm.db_manager.get_document_details(doc_id)
+                
+                if doc_details and doc_details.get("document"):
+                    extra = doc_details["document"].get("extra", {})
+                    email_thread = extra.get("email_thread", {})
+                    
+                    # Extract thread_id if present
+                    thread_id = email_thread.get("thread_id")
+                    if thread_id:
+                        stored_thread_ids.add(thread_id)
+            
+            return stored_thread_ids
+            
+        except Exception as e:
+            print(f"Warning: Failed to get stored thread_ids: {e}")
+            return set()
+    
     def extract_information(self, content: str, extraction_type: str = "general") -> Dict[str, Any]:
         """Extract meaningful information from content using LLM.
         
@@ -930,7 +966,8 @@ Memories:
         category: str = 'email_conversation',
         tags: Optional[List[str]] = None,
         allow_duplicates: bool = False,
-        is_single_email: bool = False
+        is_single_email: bool = False,
+        thread_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Add an email thread as a memory with multiple chunks.
         
@@ -945,6 +982,7 @@ Memories:
             tags: Optional tags for the memory
             allow_duplicates: If False, check for similar existing documents first
             is_single_email: If True, use lower threshold (0.70) for single emails
+            thread_id: Optional Gmail thread ID for deduplication tracking
             
         Returns:
             Dictionary with operation result
@@ -1000,15 +1038,20 @@ Memories:
                 title = f"📧 Thread: {subject[:45]}{'...' if len(subject) > 45 else ''}"
             
             # Prepare extra metadata - include content hash for deduplication tracking
+            # Also include thread_id if provided for future deduplication
+            email_thread_info = {
+                'subject': thread_emails[0].get('subject', ''),
+                'message_count': len(thread_emails),
+                'participants': conversation_info.get('participants', []),
+                'content_hash': content_hash  # Store for deduplication reference
+            }
+            if thread_id:
+                email_thread_info['thread_id'] = thread_id
+            
             extra = {
                 'title': title,
                 'tags': tags or [],
-                'email_thread': {
-                    'subject': thread_emails[0].get('subject', ''),
-                    'message_count': len(thread_emails),
-                    'participants': conversation_info.get('participants', []),
-                    'content_hash': content_hash  # Store for deduplication reference
-                }
+                'email_thread': email_thread_info
             }
             
             # Insert the document

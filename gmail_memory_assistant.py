@@ -296,7 +296,7 @@ class GmailMemoryAssistant:
         """
         return self._fetch_emails_from_multiple_sources(max_results, days_back)
     
-    def _fetch_emails_from_multiple_sources(self, max_results: int = 200, days_back: int = 90) -> List[Dict]:
+    def _fetch_emails_from_multiple_sources(self, max_results: int = 200, days_back: int = 90, skip_existing: bool = True) -> List[Dict]:
         """Fetch emails from multiple Gmail labels/folders.
         
         Fetches from: INBOX, SENT, and important categories to get comprehensive history.
@@ -304,6 +304,7 @@ class GmailMemoryAssistant:
         Args:
             max_results: Maximum emails per folder
             days_back: Days back to search
+            skip_existing: If True, skip threads that already exist in database
             
         Returns:
             Combined list of all emails
@@ -311,6 +312,13 @@ class GmailMemoryAssistant:
         if not self.service:
             print("❌ Not connected to Gmail")
             return []
+        
+        # Load stored thread_ids for deduplication if skip_existing is enabled
+        stored_thread_ids = set()
+        if skip_existing:
+            print("   Loading stored thread IDs for deduplication...")
+            stored_thread_ids = self._get_stored_thread_ids()
+            print(f"   Found {len(stored_thread_ids)} existing threads in database")
         
         # Define which labels/folders to fetch from
         sources = [
@@ -345,9 +353,17 @@ class GmailMemoryAssistant:
                     print(f"     Found {len(messages)} emails in {label_name}")
                     
                     # Fetch details for each message
+                    skipped_existing = 0
                     for i, msg in enumerate(messages):
                         if msg['id'] in seen_ids:
                             continue
+                        
+                        # Check if thread already exists in database (to save API call)
+                        if skip_existing and stored_thread_ids:
+                            thread_id = msg.get('threadId')
+                            if thread_id and thread_id in stored_thread_ids:
+                                skipped_existing += 1
+                                continue
                         
                         try:
                             message = self.service.users().messages().get(
@@ -367,6 +383,9 @@ class GmailMemoryAssistant:
                         except HttpError as e:
                             print(f"⚠️  Error fetching email {msg['id']}: {e}")
                             continue
+                    
+                    if skipped_existing > 0:
+                        print(f"     Skipped {skipped_existing} existing threads (already in database)")
                     
                 except HttpError as e:
                     print(f"⚠️  Error fetching {label_name}: {e}")
@@ -391,7 +410,19 @@ class GmailMemoryAssistant:
             print(f"❌ Error fetching emails: {e}")
             return []
     
-    def fetch_comprehensive_history(self, max_results_per_source: int = 200, days_back: int = 365) -> List[Dict]:
+    def _get_stored_thread_ids(self) -> Set[str]:
+        """Get all thread_ids already stored in the database.
+        
+        Returns:
+            Set of thread_id strings from the database
+        """
+        try:
+            return self.souvenir_assistant.get_stored_thread_ids()
+        except Exception as e:
+            print(f"Warning: Failed to get stored thread IDs: {e}")
+            return set()
+    
+    def fetch_comprehensive_history(self, max_results_per_source: int = 200, days_back: int = 365, skip_existing: bool = True) -> List[Dict]:
         """Fetch comprehensive email history across all major folders.
         
         This method fetches the maximum amount of email history for creating
@@ -408,6 +439,7 @@ class GmailMemoryAssistant:
         Args:
             max_results_per_source: Maximum emails to fetch (default: 200)
             days_back: How far back to search (default: 365 = 1 year)
+            skip_existing: If True, skip threads that already exist in database
             
         Returns:
             List of unique email dictionaries
@@ -415,6 +447,13 @@ class GmailMemoryAssistant:
         if not self.service:
             print("❌ Not connected to Gmail")
             return []
+        
+        # Load stored thread_ids for deduplication if skip_existing is enabled
+        stored_thread_ids = set()
+        if skip_existing:
+            print("   Loading stored thread IDs for deduplication...")
+            stored_thread_ids = self._get_stored_thread_ids()
+            print(f"   Found {len(stored_thread_ids)} existing threads in database")
         
         all_emails = []
         seen_ids = set()
@@ -474,12 +513,20 @@ class GmailMemoryAssistant:
                 
                 # Fetch details (with batching for efficiency)
                 detail_batch_size = 25
+                skipped_existing = 0
                 for i in range(0, len(messages), detail_batch_size):
                     batch = messages[i:i + detail_batch_size]
                     
                     for msg in batch:
                         if msg['id'] in seen_ids:
                             continue
+                        
+                        # Check if thread already exists in database (to save API call)
+                        if skip_existing and stored_thread_ids:
+                            thread_id = msg.get('threadId')
+                            if thread_id and thread_id in stored_thread_ids:
+                                skipped_existing += 1
+                                continue
                         
                         try:
                             message = self.service.users().messages().get(
@@ -499,6 +546,9 @@ class GmailMemoryAssistant:
                     
                     if (i + detail_batch_size) % 50 == 0:
                         print(f"     Processed {min(i + detail_batch_size, len(messages))}/{len(messages)}...")
+                
+                if skipped_existing > 0:
+                    print(f"     Skipped {skipped_existing} existing threads (already in database)")
                 
             except HttpError as e:
                 print(f"⚠️  Error fetching mails: {e}")
@@ -811,7 +861,8 @@ class GmailMemoryAssistant:
                 thread_emails=thread_emails,
                 conversation_info=conversation_info,
                 category=category,
-                tags=tags
+                tags=tags,
+                thread_id=thread_id
             )
             
             if result.get('ok'):
@@ -853,7 +904,8 @@ class GmailMemoryAssistant:
                         conversation_info=individual_info,
                         category=ind_category,
                         tags=ind_tags,
-                        is_single_email=False  # Use thread threshold (0.75) not single email (0.70)
+                        is_single_email=False,  # Use thread threshold (0.75) not single email (0.70)
+                        thread_id=thread_id
                     )
                     
                     if ind_result.get('ok'):
@@ -866,8 +918,10 @@ class GmailMemoryAssistant:
         if include_single_emails and single_emails:
             print(f"   Processing {len(single_emails)} single emails...")
             for email in single_emails:
+                # Get thread_id from email if available (may be None for true single emails)
+                email_thread_id = email.get('thread_id')
                 # Create a simple memory for single email
-                single_result = self._create_single_email_memory(email, categories_map)
+                single_result = self._create_single_email_memory(email, categories_map, email_thread_id)
                 if single_result.get('ok'):
                     memories_created += 1
                     single_emails_processed += 1
@@ -885,12 +939,13 @@ class GmailMemoryAssistant:
             "message": f"Created {memories_created} memories from {len(emails)} emails ({thread_count} threads, {single_emails_processed} single emails, individual emails stored: {store_individual_emails})"
         }
     
-    def _create_single_email_memory(self, email: Dict, categories_map: Dict) -> Dict[str, Any]:
+    def _create_single_email_memory(self, email: Dict, categories_map: Dict, thread_id: Optional[str] = None) -> Dict[str, Any]:
         """Create a memory from a single email (not part of a thread).
         
         Args:
             email: Single email dictionary
             categories_map: Mapping of Gmail labels to categories
+            thread_id: Optional Gmail thread ID for deduplication tracking
             
         Returns:
             Result dictionary from add_email_memory
@@ -933,7 +988,8 @@ class GmailMemoryAssistant:
             conversation_info=conversation_info,
             category=category,
             tags=tags,
-            is_single_email=True
+            is_single_email=True,
+            thread_id=thread_id
         )
     
     def analyze_email_memories(self) -> Dict[str, Any]:
