@@ -120,6 +120,90 @@ class LLMExtractor:
         except Exception as e:
             return {"ok": False, "error": str(e)}
     
+    def extract_entities_enhanced(self, content: str) -> Dict[str, Any]:
+        """Extract detailed entity information from email content.
+        
+        This method extracts more specific entity information including:
+        - Person: name, email, role, organization
+        - Organization: name, type, relationship (client/vendor/partner)
+        - Project: name, status, participants, description
+        - Service: name, provider, description
+        
+        Args:
+            content: The text content to extract entities from
+            
+        Returns:
+            Dictionary with detailed entity information
+        """
+        prompt = f"""
+Content:
+---
+{content[:3000]}
+---
+
+Extract detailed entity information from the content above. Return a JSON object with these fields:
+
+{{
+    "people": [
+        {{
+            "name": "full name or null if not found",
+            "email": "email address or null if not found", 
+            "role": "job title/role or null if not found",
+            "organization": "company/org name or null if not found"
+        }}
+    ],
+    "organizations": [
+        {{
+            "name": "organization name",
+            "type": "type of organization (client/vendor/partner/competitor/other)",
+            "relationship": "how this org relates to you (client/vendor/partner/other)"
+        }}
+    ],
+    "projects": [
+        {{
+            "name": "project name",
+            "status": "active/completed/pending/unknown",
+            "participants": ["list of participants"],
+            "description": "brief description of the project"
+        }}
+    ],
+    "services": [
+        {{
+            "name": "service/product name",
+            "provider": "provider/vendor name or null",
+            "description": "brief description of the service"
+        }}
+    ]
+}}
+
+Return valid JSON only. If no entities of a type are found, use empty arrays [].
+"""
+        try:
+            response = litellm.completion(
+                model=self.model,
+                messages=[
+                    {"role": "system", "content": "You are an expert entity extraction assistant. Extract structured entity information from the given content. Return valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.3,
+                response_format={"type": "json_object"}
+            )
+            
+            result = response.choices[0].message.content
+            
+            try:
+                extracted = json.loads(result)
+                return {"ok": True, "data": extracted}
+            except json.JSONDecodeError:
+                json_match = re.search(r'\{.*\}', result, re.DOTALL)
+                if json_match:
+                    extracted = json.loads(json_match.group())
+                    return {"ok": True, "data": extracted}
+                return {"ok": False, "error": "Could not parse JSON from LLM response"}
+                
+        except Exception as e:
+            return {"ok": False, "error": str(e)}
+    
     def _build_extraction_prompt(self, content: str, extraction_type: str) -> str:
         """Build extraction prompt based on type."""
         
@@ -485,6 +569,279 @@ class ThreadBuilder:
         return base
 
 
+class EntityContextBuilder:
+    """Builds entity context from email content for richer memory storage.
+    
+    This class handles:
+    - Finding related entities in the database before storing emails
+    - Building context from previous related entity memories
+    - Creating or updating entity documents
+    - Cross-referencing emails with entities
+    """
+    
+    def __init__(self, souvenir_assistant):
+        """Initialize with a reference to SouvenirAssistant.
+        
+        Args:
+            souvenir_assistant: Instance of SouvenirAssistant for database operations
+        """
+        self.souvenir_assistant = souvenir_assistant
+        self.ltm = souvenir_assistant.ltm
+    
+    def find_related_entities(
+        self,
+        email_content: str,
+        participants: List[str],
+        entity_types: Optional[List[str]] = None
+    ) -> List[Dict[str, Any]]:
+        """Find entities related to an email based on content and participants.
+        
+        Args:
+            email_content: The email body/content to search for entity mentions
+            participants: List of email participants (senders, recipients)
+            entity_types: Optional list of entity types to filter (person/org/project/service)
+            
+        Returns:
+            List of related entity documents with their details
+        """
+        if entity_types is None:
+            entity_types = ['person', 'organization', 'project', 'service']
+        
+        related_entities = []
+        
+        # Search for people by email or name
+        for participant in participants:
+            # Try to find person by email address
+            if '@' in participant:
+                # Search for existing person entity with this email
+                person_results = self._find_entity_by_value('person', 'email', participant)
+                related_entities.extend(person_results)
+            
+            # Also try to find by name (extract name from email or use full string)
+            name = participant.split('@')[0].replace('.', ' ').replace('_', ' ')
+            if name and len(name) > 2:
+                person_results = self._find_entity_by_value('person', 'name', name)
+                related_entities.extend(person_results)
+        
+        # Search for organizations mentioned in content
+        org_results = self._search_entities_in_content(
+            email_content, 
+            ['organization', 'company', 'inc', 'llc', 'corp']
+        )
+        related_entities.extend(org_results)
+        
+        # Search for projects/services mentioned in content
+        project_service_results = self._search_entities_in_content(
+            email_content,
+            ['project', 'service', 'product', 'platform']
+        )
+        related_entities.extend(project_service_results)
+        
+        # Deduplicate by entity ID
+        seen_ids = set()
+        unique_entities = []
+        for e in related_entities:
+            if e.get('id') not in seen_ids:
+                seen_ids.add(e.get('id'))
+                unique_entities.append(e)
+        
+        return unique_entities
+    
+    def _find_entity_by_value(self, entity_type: str, field: str, value: str) -> List[Dict[str, Any]]:
+        """Find entity by a specific field value.
+        
+        Args:
+            entity_type: Type of entity (person, organization, etc.)
+            field: Field to search (email, name, etc.)
+            value: Value to search for
+            
+        Returns:
+            List of matching entity documents
+        """
+        if not value or len(value) < 3:
+            return []
+        
+        try:
+            # Search using FTS for entities with matching field
+            results = self.ltm.search_souvenirs(value, category='entity', limit=10)
+            
+            entities = []
+            for r in results:
+                doc_id = r.get('document_id')
+                if doc_id:
+                    details = self.ltm.get_memory(doc_id)
+                    if details:
+                        doc = details.get('document', {})
+                        # Check if this is the right entity type
+                        if doc.get('media_type') == entity_type:
+                            extra = doc.get('extra', {})
+                            entity_data = extra.get('entity_data', {})
+                            
+                            # Check if the field matches
+                            if field == 'email':
+                                entity_email = entity_data.get('email', '').lower()
+                                if entity_email and value.lower() in entity_email:
+                                    entities.append({
+                                        'id': doc_id,
+                                        'title': extra.get('title', ''),
+                                        'entity_type': entity_type,
+                                        'entity_data': entity_data,
+                                        'linked_memories': extra.get('linked_memories', [])
+                                    })
+                            elif field == 'name':
+                                entity_name = entity_data.get('name', '').lower()
+                                if entity_name and value.lower() in entity_name:
+                                    entities.append({
+                                        'id': doc_id,
+                                        'title': extra.get('title', ''),
+                                        'entity_type': entity_type,
+                                        'entity_data': entity_data,
+                                        'linked_memories': extra.get('linked_memories', [])
+                                    })
+            
+            return entities
+        except Exception as e:
+            print(f"Error finding entity by {field}: {e}")
+            return []
+    
+    def _search_entities_in_content(self, content: str, keywords: List[str]) -> List[Dict[str, Any]]:
+        """Search for entities mentioned in content based on keywords.
+        
+        Args:
+            content: Text content to search
+            keywords: Keywords to look for (entity types, company suffixes, etc.)
+            
+        Returns:
+            List of potential entity matches
+        """
+        content_lower = content.lower()
+        
+        # Check if any keywords are in content
+        found_keywords = [kw for kw in keywords if kw.lower() in content_lower]
+        if not found_keywords:
+            return []
+        
+        # Search for entities in database
+        entities = []
+        try:
+            # Search for any entity documents
+            results = self.ltm.search_souvenirs(content[:500], category='entity', limit=20)
+            
+            for r in results:
+                doc_id = r.get('document_id')
+                if doc_id:
+                    details = self.ltm.get_memory(doc_id)
+                    if details:
+                        doc = details.get('document', {})
+                        extra = doc.get('extra', {})
+                        entity_data = extra.get('entity_data', {})
+                        
+                        entities.append({
+                            'id': doc_id,
+                            'title': extra.get('title', ''),
+                            'entity_type': doc.get('media_type', ''),
+                            'entity_data': entity_data,
+                            'linked_memories': extra.get('linked_memories', [])
+                        })
+        except Exception as e:
+            print(f"Error searching entities in content: {e}")
+        
+        return entities
+    
+    def build_entity_context(
+        self,
+        related_entities: List[Dict[str, Any]],
+        max_memories_per_entity: int = 3
+    ) -> str:
+        """Build a context string from related entity documents.
+        
+        Args:
+            related_entities: List of entity documents to build context from
+            max_memories_per_entity: Maximum number of memory contexts to include per entity
+            
+        Returns:
+            Context string summarizing related entities and their memories
+        """
+        if not related_entities:
+            return ""
+        
+        context_parts = []
+        
+        for entity in related_entities:
+            entity_title = entity.get('title', 'Unknown')
+            entity_type = entity.get('entity_type', 'entity')
+            entity_data = entity.get('entity_data', {})
+            linked_memories = entity.get('linked_memories', [])
+            
+            context_parts.append(f"--- Related {entity_type}: {entity_title} ---")
+            
+            # Add entity details
+            if entity_data.get('description'):
+                context_parts.append(f"Description: {entity_data['description']}")
+            if entity_data.get('role'):
+                context_parts.append(f"Role: {entity_data['role']}")
+            if entity_data.get('organization'):
+                context_parts.append(f"Organization: {entity_data['organization']}")
+            
+            # Add context from linked memories
+            if linked_memories:
+                context_parts.append("Previous conversations:")
+                memories_shown = 0
+                for memory_link in linked_memories[:max_memories_per_entity]:
+                    memory_id = memory_link.get('memory_id')
+                    memory_context = memory_link.get('context', '')
+                    
+                    if memory_id and memory_context:
+                        context_parts.append(f"  - [{memory_context[:100]}...]")
+                        memories_shown += 1
+                    elif memory_id:
+                        # Try to get memory summary
+                        try:
+                            memory_details = self.souvenir_assistant.get_email_memory(memory_id)
+                            if memory_details:
+                                topic = memory_details.get('email_thread', {}).get('subject', 'Email')
+                                context_parts.append(f"  - {topic[:80]}")
+                                memories_shown += 1
+                        except:
+                            pass
+                
+                if len(linked_memories) > max_memories_per_entity:
+                    context_parts.append(f"  ... and {len(linked_memories) - max_memories_per_entity} more")
+            
+            context_parts.append("")
+        
+        return "\n".join(context_parts)
+    
+    def get_or_create_entity(
+        self,
+        entity_type: str,
+        entity_name: str,
+        entity_data: Dict[str, Any],
+        linked_memory_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Find existing entity or create a new one.
+        
+        Args:
+            entity_type: Type of entity (person, organization, project, service)
+            entity_name: Name of the entity
+            entity_data: Entity data dictionary
+            linked_memory_id: Optional memory ID to link to this entity
+            
+        Returns:
+            Dictionary with entity information (existing or newly created)
+        """
+        # Try to find existing entity
+        result = self.souvenir_assistant.add_entity_memory(
+            entity_type=entity_type,
+            entity_name=entity_name,
+            entity_data=entity_data,
+            allow_duplicates=False,  # This will find existing or create new
+            linked_memory_id=linked_memory_id
+        )
+        
+        return result
+
+
 class SouvenirAssistant:
     """A personal memory assistant using LLM and LongTermMemory."""
     
@@ -522,6 +879,9 @@ class SouvenirAssistant:
         
         # Initialize thread builder for conversation reconstruction
         self.thread_builder = ThreadBuilder()
+        
+        # Initialize entity context builder for entity memory management
+        self.entity_context_builder = EntityContextBuilder(self)
     
     def get_stored_thread_ids(self) -> Set[str]:
         """Get all thread_ids already stored in the database.
@@ -1191,6 +1551,293 @@ Memories:
                 "ok": False,
                 "error": str(e)
             }
+
+    def add_entity_memory(
+        self,
+        entity_type: str,
+        entity_name: str,
+        entity_data: Dict[str, Any],
+        category: str = 'entity',
+        tags: Optional[List[str]] = None,
+        allow_duplicates: bool = False,
+        linked_memory_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Add an entity (person, organization, project, service) as a memory document.
+        
+        Entities are stored with specific media_type to enable querying by entity type.
+        The extra JSON field stores entity-specific metadata and cross-references to email memories.
+        
+        Args:
+            entity_type: Type of entity ('person', 'organization', 'project', 'service')
+            entity_name: Name/identifier of the entity
+            entity_data: Dictionary with entity-specific data (email, role, description, etc.)
+            category: Category for the memory (default: 'entity')
+            tags: Optional tags for the entity
+            allow_duplicates: If False, check for similar existing entities first
+            linked_memory_id: Optional ID of email memory to link to this entity
+            
+        Returns:
+            Dictionary with operation result
+        """
+        try:
+            import uuid
+            
+            # Validate entity type
+            valid_types = ['person', 'organization', 'project', 'service']
+            if entity_type not in valid_types:
+                return {"ok": False, "error": f"Invalid entity_type. Must be one of: {valid_types}"}
+            
+            # Build content for similarity check
+            content_for_check = entity_name + " " + entity_data.get("description", "")
+            
+            # Check for similar existing entities if duplicates not allowed
+            if not allow_duplicates and self.ltm.embeddings is not None and content_for_check.strip():
+                similar_docs = self.find_similar_documents(
+                    content_for_check, 
+                    top_k=3, 
+                    similarity_threshold=0.85
+                )
+                # Filter to same entity type
+                for sim_doc in similar_docs:
+                    doc = sim_doc.get("document", {})
+                    if doc.get("media_type") == entity_type:
+                        # Check if it's really the same entity (name similarity)
+                        doc_extra = doc.get("extra", {})
+                        existing_name = doc_extra.get("entity_data", {}).get("name", "")
+                        if existing_name.lower() in entity_name.lower() or entity_name.lower() in existing_name.lower():
+                            # Update entity with new memory link instead of creating duplicate
+                            if linked_memory_id:
+                                update_result = self.update_entity_with_memory(
+                                    sim_doc["document_id"], 
+                                    linked_memory_id
+                                )
+                                return {
+                                    "ok": True,
+                                    "id": sim_doc["document_id"],
+                                    "title": doc_extra.get("title", entity_name),
+                                    "category": category,
+                                    "chunks_created": 0,
+                                    "message": "Entity already exists, updated with new memory link",
+                                    "updated": True,
+                                    "existing_document": doc
+                                }
+            
+            # Generate a unique ID for the entity
+            entity_id = str(uuid.uuid4())[:8]
+            
+            # Build title
+            entity_icons = {
+                'person': '👤',
+                'organization': '🏢',
+                'project': '📁',
+                'service': '🔧'
+            }
+            icon = entity_icons.get(entity_type, '📄')
+            title = f"{icon} {entity_name}"
+            
+            # Prepare extra metadata with entity data
+            import datetime
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            
+            # Build linked_memories list if provided
+            linked_memories = []
+            if linked_memory_id:
+                linked_memories.append({
+                    "memory_id": linked_memory_id,
+                    "linked_at": now
+                })
+            
+            extra = {
+                'title': title,
+                'tags': tags or [entity_type],
+                'entity_type': entity_type,
+                'entity_data': {
+                    'name': entity_name,
+                    **entity_data
+                },
+                'first_seen': now,
+                'last_seen': now,
+                'linked_memories': linked_memories
+            }
+            
+            # Insert the document with entity type as media_type
+            content_preview = entity_data.get("description", entity_name)[:500]
+            self.ltm.db_manager.insert_document(
+                doc_id=entity_id,
+                source_path=f"entity:{entity_type}:{entity_id}",
+                rel_path=None,
+                media_type=entity_type,  # Store entity type as media_type
+                language='en',
+                sha256='',
+                size_bytes=len(content_preview),
+                category=category,
+                extra=extra
+            )
+            
+            # Create chunks for entity data
+            chunk_ordinal = 0
+            
+            # Chunk 1: Entity Summary
+            summary_content = f"Entity: {entity_name}\nType: {entity_type}"
+            if entity_data.get("description"):
+                summary_content += f"\nDescription: {entity_data['description']}"
+            self.ltm.add_memory_chunk(
+                entity_id, chunk_ordinal, 1, len(summary_content.split('\n')),
+                summary_content, 'entity_summary', entity_name[:50], None
+            )
+            chunk_ordinal += 1
+            
+            # Chunk 2: Entity Details (role, email, etc.)
+            details_lines = []
+            if entity_data.get("role"):
+                details_lines.append(f"Role: {entity_data['role']}")
+            if entity_data.get("email"):
+                details_lines.append(f"Email: {entity_data['email']}")
+            if entity_data.get("organization"):
+                details_lines.append(f"Organization: {entity_data['organization']}")
+            if entity_data.get("status"):
+                details_lines.append(f"Status: {entity_data['status']}")
+            if entity_data.get("provider"):
+                details_lines.append(f"Provider: {entity_data['provider']}")
+            
+            if details_lines:
+                details_content = "\n".join(details_lines)
+                self.ltm.add_memory_chunk(
+                    entity_id, chunk_ordinal, 1, len(details_lines),
+                    details_content, 'entity_details', None, None, embed=False
+                )
+                chunk_ordinal += 1
+            
+            # Chunk 3: Related Information
+            if entity_data.get("related_info"):
+                related_content = f"Related Info: {entity_data['related_info']}"
+                self.ltm.add_memory_chunk(
+                    entity_id, chunk_ordinal, 1, len(related_content.split('\n')),
+                    related_content, 'entity_related', None, None
+                )
+                chunk_ordinal += 1
+            
+            return {
+                "ok": True,
+                "id": entity_id,
+                "title": title,
+                "category": category,
+                "entity_type": entity_type,
+                "chunks_created": chunk_ordinal,
+                "message": f"Entity '{entity_name}' added successfully as {entity_type}! (ID: {entity_id})"
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+    
+    def update_entity_with_memory(
+        self,
+        entity_id: str,
+        memory_id: str,
+        memory_context: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Update an entity document with a new linked email memory.
+        
+        Args:
+            entity_id: The ID of the entity document to update
+            memory_id: The ID of the email memory to link
+            memory_context: Optional context summary of the memory
+            
+        Returns:
+            Dictionary with operation result
+        """
+        try:
+            import datetime
+            
+            # Get current entity document
+            details = self.ltm.get_memory(entity_id)
+            if not details:
+                return {"ok": False, "error": "Entity not found"}
+            
+            doc = details["document"]
+            extra = doc.get("extra", {})
+            
+            # Update linked_memories
+            linked_memories = extra.get("linked_memories", [])
+            now = datetime.datetime.utcnow().isoformat() + "Z"
+            
+            # Check if this memory is already linked
+            for link in linked_memories:
+                if link.get("memory_id") == memory_id:
+                    # Update existing link
+                    link["linked_at"] = now
+                    if memory_context:
+                        link["context"] = memory_context
+                    break
+            else:
+                # Add new link
+                new_link = {
+                    "memory_id": memory_id,
+                    "linked_at": now
+                }
+                if memory_context:
+                    new_link["context"] = memory_context
+                linked_memories.append(new_link)
+            
+            # Update last_seen
+            extra["last_seen"] = now
+            extra["linked_memories"] = linked_memories
+            
+            # Update document in database
+            self.ltm.db_manager.update_document(
+                entity_id,
+                extra=extra
+            )
+            
+            return {
+                "ok": True,
+                "id": entity_id,
+                "message": f"Entity updated with memory link"
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e)
+            }
+    
+    def get_entity_memory(self, entity_id: str) -> Optional[Dict[str, Any]]:
+        """Get an entity memory by ID with all its details.
+        
+        Args:
+            entity_id: The ID of the entity
+            
+        Returns:
+            Dictionary with entity details and linked memories, or None if not found
+        """
+        try:
+            details = self.ltm.get_memory(entity_id)
+            if not details:
+                return None
+            
+            doc = details["document"]
+            chunks = details["chunks"]
+            
+            return {
+                "ok": True,
+                "id": entity_id,
+                "title": doc.get("extra", {}).get("title", ""),
+                "entity_type": doc.get("media_type", ""),
+                "entity_data": doc.get("extra", {}).get("entity_data", {}),
+                "category": doc.get("category", "entity"),
+                "tags": doc.get("extra", {}).get("tags", []),
+                "first_seen": doc.get("extra", {}).get("first_seen", ""),
+                "last_seen": doc.get("extra", {}).get("last_seen", ""),
+                "linked_memories": doc.get("extra", {}).get("linked_memories", []),
+                "chunks": chunks,
+                "created_at": doc.get("created_at", "")
+            }
+        except Exception as e:
+            return {
+                "ok": False,
+                "error": str(e)
+            }
     
     def get_email_memory(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get an email memory by ID with all its chunks.
@@ -1288,6 +1935,212 @@ Memories:
             query=participant_name,
             top_k=top_k
         )
+    
+    # ========== Entity Query Methods ==========
+    
+    def get_person_knowledge(self, name_or_email: str) -> Dict[str, Any]:
+        """Get all known information about a person from entity memories.
+        
+        Args:
+            name_or_email: Name or email address of the person
+            
+        Returns:
+            Dictionary with person's known information and linked memories
+        """
+        # Try to find by email first
+        if '@' in name_or_email:
+            entities = self.entity_context_builder._find_entity_by_value('person', 'email', name_or_email)
+            if entities:
+                return self._build_entity_knowledge_response(entities[0])
+        
+        # Try to find by name
+        entities = self.entity_context_builder._find_entity_by_value('person', 'name', name_or_email)
+        if entities:
+            return self._build_entity_knowledge_response(entities[0])
+        
+        # Also search in linked memories from email participants
+        email_results = self.search_by_participant(name_or_email, top_k=10)
+        
+        return {
+            "ok": True,
+            "found": False,
+            "name": name_or_email,
+            "message": "No entity found. Showing email memories with this participant instead.",
+            "email_memories": email_results
+        }
+    
+    def get_organization_info(self, org_name: str) -> Dict[str, Any]:
+        """Get organization-related memories.
+        
+        Args:
+            org_name: Name of the organization
+            
+        Returns:
+            Dictionary with organization's known information and linked memories
+        """
+        entities = self.entity_context_builder._find_entity_by_value('organization', 'name', org_name)
+        if entities:
+            return self._build_entity_knowledge_response(entities[0])
+        
+        # Search in email content for organization mentions
+        search_results = self.search_souvenirs(org_name, top_k=10)
+        
+        return {
+            "ok": True,
+            "found": False,
+            "name": org_name,
+            "message": "No organization entity found. Showing related email memories.",
+            "related_memories": search_results
+        }
+    
+    def get_project_info(self, project_name: str) -> Dict[str, Any]:
+        """Get project-related memories.
+        
+        Args:
+            project_name: Name of the project
+            
+        Returns:
+            Dictionary with project's known information and linked memories
+        """
+        entities = self.entity_context_builder._find_entity_by_value('project', 'name', project_name)
+        if entities:
+            return self._build_entity_knowledge_response(entities[0])
+        
+        search_results = self.search_souvenirs(project_name, top_k=10)
+        
+        return {
+            "ok": True,
+            "found": False,
+            "name": project_name,
+            "message": "No project entity found. Showing related email memories.",
+            "related_memories": search_results
+        }
+    
+    def list_entities(self, entity_type: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+        """List all entities of a specific type or all entities.
+        
+        Args:
+            entity_type: Optional entity type to filter (person/organization/project/service)
+            limit: Maximum number of entities to return
+            
+        Returns:
+            List of entity documents
+        """
+        try:
+            # Get all documents with entity category
+            all_docs = self.ltm.db_manager.get_all_documents()
+            
+            entities = []
+            for doc in all_docs:
+                doc_id = doc[0]
+                details = self.ltm.get_memory(doc_id)
+                if details:
+                    doc_data = details.get("document", {})
+                    media_type = doc_data.get("media_type", "")
+                    
+                    # Filter by entity type if specified
+                    if entity_type and media_type != entity_type:
+                        continue
+                    
+                    # Only include entity types
+                    if media_type in ['person', 'organization', 'project', 'service']:
+                        extra = doc_data.get("extra", {})
+                        entities.append({
+                            "id": doc_id,
+                            "title": extra.get("title", ""),
+                            "entity_type": media_type,
+                            "entity_data": extra.get("entity_data", {}),
+                            "first_seen": extra.get("first_seen", ""),
+                            "last_seen": extra.get("last_seen", ""),
+                            "linked_memories_count": len(extra.get("linked_memories", []))
+                        })
+            
+            return entities[:limit]
+        except Exception as e:
+            print(f"Error listing entities: {e}")
+            return []
+    
+    def search_entities(self, query: str, entity_types: Optional[List[str]] = None, 
+                       top_k: int = 20) -> List[Dict[str, Any]]:
+        """Search across all entity documents.
+        
+        Args:
+            query: Search query
+            entity_types: Optional list of entity types to filter
+            top_k: Maximum number of results
+            
+        Returns:
+            List of matching entity documents
+        """
+        # Search in entity category
+        results = self.ltm.search_souvenirs(query, category='entity', limit=top_k)
+        
+        entities = []
+        for r in results:
+            doc_id = r.get('document_id')
+            if doc_id:
+                details = self.ltm.get_memory(doc_id)
+                if details:
+                    doc_data = details.get("document", {})
+                    media_type = doc_data.get("media_type", "")
+                    
+                    # Filter by entity type if specified
+                    if entity_types and media_type not in entity_types:
+                        continue
+                    
+                    extra = doc_data.get("extra", {})
+                    entities.append({
+                        "id": doc_id,
+                        "title": extra.get("title", ""),
+                        "entity_type": media_type,
+                        "entity_data": extra.get("entity_data", {}),
+                        "linked_memories": extra.get("linked_memories", []),
+                        "similarity_score": r.get("score", 0)
+                    })
+        
+        return entities
+    
+    def _build_entity_knowledge_response(self, entity: Dict[str, Any]) -> Dict[str, Any]:
+        """Build a comprehensive knowledge response for an entity.
+        
+        Args:
+            entity: Entity dictionary from find_related_entities
+            
+        Returns:
+            Formatted response with entity knowledge
+        """
+        entity_id = entity.get('id')
+        entity_type = entity.get('entity_type', 'entity')
+        entity_data = entity.get('entity_data', {})
+        linked_memories = entity.get('linked_memories', [])
+        
+        # Get linked memory details
+        linked_memories_details = []
+        for memory_link in linked_memories[:10]:
+            memory_id = memory_link.get('memory_id')
+            if memory_id:
+                try:
+                    memory_details = self.get_email_memory(memory_id)
+                    if memory_details:
+                        linked_memories_details.append({
+                            "id": memory_id,
+                            "title": memory_details.get("title", ""),
+                            "category": memory_details.get("category", ""),
+                            "created_at": memory_details.get("created_at", ""),
+                            "context": memory_link.get("context", "")
+                        })
+                except:
+                    pass
+        
+        return {
+            "ok": True,
+            "found": True,
+            "id": entity_id,
+            "entity_type": entity_type,
+            "entity_data": entity_data,
+            "linked_memories": linked_memories_details,
+            "total_memories": len(linked_memories)
+        }
     
     def search_semantic(self, query: str, top_k: int = 20, similarity_threshold: float = 0.75) -> List[Dict[str, Any]]:
         """Search for souvenirs using semantic embeddings.

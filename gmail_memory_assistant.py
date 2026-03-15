@@ -860,6 +860,38 @@ class GmailMemoryAssistant:
                         tags.append(low_label)
             tags = list(set(tags))[:15]
             
+            # ===== NEW: Entity Context Building =====
+            # Extract entities from email content for entity memory management
+            email_content = ""
+            for email in thread_emails:
+                email_content += email.get('body', '') + " " + email.get('subject', '') + " "
+            
+            participants = conversation_info.get('participants', [])
+            for email in thread_emails:
+                if email.get('from'):
+                    participants.append(email.get('from'))
+                if email.get('to'):
+                    participants.append(email.get('to'))
+            participants = list(set(participants))
+            
+            # Find related entities in database
+            related_entities = self.souvenir_assistant.entity_context_builder.find_related_entities(
+                email_content=email_content,
+                participants=participants
+            )
+            
+            # Build context from related entities (for richer memory)
+            entity_context = self.souvenir_assistant.entity_context_builder.build_entity_context(
+                related_entities,
+                max_memories_per_entity=2
+            )
+            
+            # Add entity context to conversation info if we have related entities
+            if entity_context:
+                conversation_info['entity_context'] = entity_context
+                tags.append('has_entity_context')
+            # ===== End Entity Context Building =====
+            
             # Add thread memory using new multi-chunk method
             result = self.souvenir_assistant.add_email_memory(
                 thread_emails=thread_emails,
@@ -871,6 +903,70 @@ class GmailMemoryAssistant:
             
             if result.get('ok'):
                 memories_created += 1
+                memory_id = result.get('id')
+                
+                # ===== NEW: Create/Update Entity Memories =====
+                # Extract enhanced entities and create/update entity documents
+                enhanced_result = self.souvenir_assistant.extractor.extract_entities_enhanced(email_content)
+                if enhanced_result.get('ok'):
+                    entity_data = enhanced_result.get('data', {})
+                    
+                    # Process people
+                    for person in entity_data.get('people', []):
+                        if person.get('name'):
+                            self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                                entity_type='person',
+                                entity_name=person['name'],
+                                entity_data={
+                                    'email': person.get('email'),
+                                    'role': person.get('role'),
+                                    'organization': person.get('organization'),
+                                    'description': f"Contact from email thread: {conversation_info.get('topic', '')}"
+                                },
+                                linked_memory_id=memory_id
+                            )
+                    
+                    # Process organizations
+                    for org in entity_data.get('organizations', []):
+                        if org.get('name'):
+                            self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                                entity_type='organization',
+                                entity_name=org['name'],
+                                entity_data={
+                                    'type': org.get('type'),
+                                    'relationship': org.get('relationship'),
+                                    'description': f"Organization mentioned in email thread"
+                                },
+                                linked_memory_id=memory_id
+                            )
+                    
+                    # Process projects
+                    for project in entity_data.get('projects', []):
+                        if project.get('name'):
+                            self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                                entity_type='project',
+                                entity_name=project['name'],
+                                entity_data={
+                                    'status': project.get('status'),
+                                    'participants': project.get('participants', []),
+                                    'description': project.get('description', '')
+                                },
+                                linked_memory_id=memory_id
+                            )
+                    
+                    # Process services
+                    for service in entity_data.get('services', []):
+                        if service.get('name'):
+                            self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                                entity_type='service',
+                                entity_name=service['name'],
+                                entity_data={
+                                    'provider': service.get('provider'),
+                                    'description': service.get('description', '')
+                                },
+                                linked_memory_id=memory_id
+                            )
+                # ===== End Entity Memory Creation =====
             
             # Step 8: Store individual emails within thread if enabled
             if store_individual_emails:
@@ -959,12 +1055,14 @@ class GmailMemoryAssistant:
         # Extract basic info from the email
         subject = email.get('subject', 'No Subject')
         sender = email.get('from', 'Unknown')
+        recipient = email.get('to', '')
         snippet = email.get('snippet', '')
+        body = email.get('body', '')
         
         # Create a simple conversation_info structure for single email
         conversation_info = {
             "topic": subject,
-            "participants": [sender],
+            "participants": [sender, recipient] if recipient else [sender],
             "key_points": [snippet] if snippet else [],
             "action_items": [],
             "dates": [],
@@ -988,8 +1086,31 @@ class GmailMemoryAssistant:
                 tags.append(low_label)
         tags = list(set(tags))[:15]
         
-        # Create single email memory using add_email_memory with single email
-        return self.souvenir_assistant.add_email_memory(
+        # ===== NEW: Entity Context Building for Single Emails =====
+        email_content = body + " " + subject
+        participants = [sender]
+        if recipient:
+            participants.append(recipient)
+        
+        # Find related entities in database
+        related_entities = self.souvenir_assistant.entity_context_builder.find_related_entities(
+            email_content=email_content,
+            participants=participants
+        )
+        
+        # Build context from related entities
+        entity_context = self.souvenir_assistant.entity_context_builder.build_entity_context(
+            related_entities,
+            max_memories_per_entity=2
+        )
+        
+        # Add entity context to conversation info if we have related entities
+        if entity_context:
+            conversation_info['entity_context'] = entity_context
+            tags.append('has_entity_context')
+        
+        # Create single email memory first to get memory_id
+        result = self.souvenir_assistant.add_email_memory(
             thread_emails=[email],
             conversation_info=conversation_info,
             category=category,
@@ -997,6 +1118,74 @@ class GmailMemoryAssistant:
             is_single_email=True,
             thread_id=thread_id
         )
+        
+        # If memory created successfully, create/update entity memories
+        if result.get('ok'):
+            memory_id = result.get('id')
+            
+            # Extract enhanced entities
+            enhanced_result = self.souvenir_assistant.extractor.extract_entities_enhanced(email_content)
+            if enhanced_result.get('ok'):
+                entity_data = enhanced_result.get('data', {})
+                
+                # Process people
+                for person in entity_data.get('people', []):
+                    if person.get('name'):
+                        self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                            entity_type='person',
+                            entity_name=person['name'],
+                            entity_data={
+                                'email': person.get('email'),
+                                'role': person.get('role'),
+                                'organization': person.get('organization'),
+                                'description': f"Contact from email: {subject}"
+                            },
+                            linked_memory_id=memory_id
+                        )
+                
+                # Process organizations
+                for org in entity_data.get('organizations', []):
+                    if org.get('name'):
+                        self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                            entity_type='organization',
+                            entity_name=org['name'],
+                            entity_data={
+                                'type': org.get('type'),
+                                'relationship': org.get('relationship'),
+                                'description': f"Organization mentioned in email"
+                            },
+                            linked_memory_id=memory_id
+                        )
+                
+                # Process projects
+                for project in entity_data.get('projects', []):
+                    if project.get('name'):
+                        self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                            entity_type='project',
+                            entity_name=project['name'],
+                            entity_data={
+                                'status': project.get('status'),
+                                'participants': project.get('participants', []),
+                                'description': project.get('description', '')
+                            },
+                            linked_memory_id=memory_id
+                        )
+                
+                # Process services
+                for service in entity_data.get('services', []):
+                    if service.get('name'):
+                        self.souvenir_assistant.entity_context_builder.get_or_create_entity(
+                            entity_type='service',
+                            entity_name=service['name'],
+                            entity_data={
+                                'provider': service.get('provider'),
+                                'description': service.get('description', '')
+                            },
+                            linked_memory_id=memory_id
+                        )
+        # ===== End Entity Context Building for Single Emails =====
+        
+        return result
     
     def analyze_email_memories(self) -> Dict[str, Any]:
         """Analyze all email memories to extract high-level insights.
@@ -1227,9 +1416,13 @@ class GmailMemoryAssistant:
             print("  5. View current memories")
             print("  6. Ask about memories")
             print("  7. Get summary of memory")
-            print("  8. Quit")
+            print("  8. View known people/contacts")
+            print("  9. View organizations")
+            print(" 10. View projects")
+            print(" 11. Search entity knowledge (what do I know about X)")
+            print(" 12. Quit")
             
-            choice = input("\nEnter choice (1-8): ").strip()
+            choice = input("\nEnter choice (1-12): ").strip()
             
             if choice == "1":
                 # Browse and select
@@ -1303,7 +1496,97 @@ class GmailMemoryAssistant:
             
             elif choice == "7":
                 self.souvenir_assistant.ltm.print_cluster_summary(20, chunk_types=["email_original"])
+            
             elif choice == "8":
+                # View known people/contacts
+                print("\n👥 Known People/Contacts:")
+                people = self.souvenir_assistant.list_entities(entity_type='person', limit=20)
+                if people:
+                    for i, p in enumerate(people, 1):
+                        entity_data = p.get('entity_data', {})
+                        print(f"\n{i}. {p.get('title', 'Unknown')}")
+                        print(f"   Email: {entity_data.get('email', 'N/A')}")
+                        print(f"   Role: {entity_data.get('role', 'N/A')}")
+                        print(f"   Organization: {entity_data.get('organization', 'N/A')}")
+                        print(f"   Linked memories: {p.get('linked_memories_count', 0)}")
+                else:
+                    print("No person entities found yet.")
+            
+            elif choice == "9":
+                # View organizations
+                print("\n🏢 Known Organizations:")
+                orgs = self.souvenir_assistant.list_entities(entity_type='organization', limit=20)
+                if orgs:
+                    for i, o in enumerate(orgs, 1):
+                        entity_data = o.get('entity_data', {})
+                        print(f"\n{i}. {o.get('title', 'Unknown')}")
+                        print(f"   Type: {entity_data.get('type', 'N/A')}")
+                        print(f"   Relationship: {entity_data.get('relationship', 'N/A')}")
+                        print(f"   Linked memories: {o.get('linked_memories_count', 0)}")
+                else:
+                    print("No organization entities found yet.")
+            
+            elif choice == "10":
+                # View projects
+                print("\n📁 Known Projects:")
+                projects = self.souvenir_assistant.list_entities(entity_type='project', limit=20)
+                if projects:
+                    for i, p in enumerate(projects, 1):
+                        entity_data = p.get('entity_data', {})
+                        print(f"\n{i}. {p.get('title', 'Unknown')}")
+                        print(f"   Status: {entity_data.get('status', 'N/A')}")
+                        print(f"   Description: {entity_data.get('description', 'N/A')[:100]}")
+                        print(f"   Linked memories: {p.get('linked_memories_count', 0)}")
+                else:
+                    print("No project entities found yet.")
+            
+            elif choice == "11":
+                # Search entity knowledge
+                entity_query = input("\n🔍 Enter person, organization, or project name: ").strip()
+                if entity_query:
+                    # Try as person first
+                    result = self.souvenir_assistant.get_person_knowledge(entity_query)
+                    if result.get('found'):
+                        print(f"\n📚 Knowledge about {entity_query}:")
+                        entity_data = result.get('entity_data', {})
+                        print(f"   Type: {result.get('entity_type', 'N/A')}")
+                        for key, value in entity_data.items():
+                            if value:
+                                print(f"   {key.capitalize()}: {value}")
+                        print(f"\n   Linked memories ({result.get('total_memories', 0)}):")
+                        for memory in result.get('linked_memories', [])[:5]:
+                            print(f"   - {memory.get('title', 'Unknown')}")
+                    else:
+                        # Try organization
+                        result = self.souvenir_assistant.get_organization_info(entity_query)
+                        if result.get('found'):
+                            print(f"\n📚 Knowledge about {entity_query}:")
+                            entity_data = result.get('entity_data', {})
+                            print(f"   Type: {result.get('entity_type', 'N/A')}")
+                            for key, value in entity_data.items():
+                                if value:
+                                    print(f"   {key.capitalize()}: {value}")
+                            print(f"\n   Linked memories ({result.get('total_memories', 0)}):")
+                            for memory in result.get('linked_memories', [])[:5]:
+                                print(f"   - {memory.get('title', 'Unknown')}")
+                        else:
+                            # Try project
+                            result = self.souvenir_assistant.get_project_info(entity_query)
+                            if result.get('found'):
+                                print(f"\n📚 Knowledge about {entity_query}:")
+                                entity_data = result.get('entity_data', {})
+                                print(f"   Type: {result.get('entity_type', 'N/A')}")
+                                for key, value in entity_data.items():
+                                    if value:
+                                        print(f"   {key.capitalize()}: {value}")
+                                print(f"\n   Linked memories ({result.get('total_memories', 0)}):")
+                                for memory in result.get('linked_memories', [])[:5]:
+                                    print(f"   - {memory.get('title', 'Unknown')}")
+                            else:
+                                print(f"\n❓ No entity found for '{entity_query}'")
+                                print("   Try searching for a specific person, organization, or project.")
+            
+            elif choice == "12":
                 print("\n👋 Goodbye!")
                 break
             
