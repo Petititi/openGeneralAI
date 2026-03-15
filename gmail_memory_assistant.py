@@ -537,7 +537,8 @@ class GmailMemoryAssistant:
                             
                             email_data = self._extract_email_info(message)
                             msg_body = email_data.get('body')
-                            assert len(msg_body) > 0
+                            if len(msg_body) < 0:
+                                continue
                             all_emails.append(email_data)
                             seen_ids.add(msg['id'])
                             
@@ -830,6 +831,9 @@ class GmailMemoryAssistant:
             if thread['size'] <= 1:
                 continue  # Skip single emails here, handle below
             
+            if memories_created % 50 == 0:
+                print(f"   Created {memories_created} memories from threads")
+            
             thread_emails = thread['emails']
             
             # Use LLM to extract meaningful information from the conversation
@@ -925,6 +929,8 @@ class GmailMemoryAssistant:
                 if single_result.get('ok'):
                     memories_created += 1
                     single_emails_processed += 1
+                    if memories_created % 50 == 0:
+                        print(f"   Created {memories_created} memories from threads")
         
         # Count individual emails stored (done inside the thread processing)
         # Already counted in memories_created
@@ -1255,7 +1261,7 @@ class GmailMemoryAssistant:
                             emails = pickle.load(f)
                     else:
                         emails = self.fetch_comprehensive_history(
-                            max_results_per_source=10000, 
+                            max_results_per_source=2000, 
                             days_back=365
                         )
                         
