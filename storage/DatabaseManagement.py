@@ -166,6 +166,23 @@ class DatabaseManager:
             cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_document_category ON documents(category)
             """)
+
+            # Create link table for managing relationships between documents
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS links (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_doc_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+            target_doc_id TEXT REFERENCES documents(id) ON DELETE CASCADE,
+            description TEXT,
+            created_at TEXT,
+            UNIQUE(source_doc_id, target_doc_id)
+            )""")
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_links_source ON links(source_doc_id)
+            """)
+            cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_links_target ON links(target_doc_id)
+            """)
             
             # Initialize default categories
             self._init_default_categories()
@@ -856,6 +873,78 @@ class DatabaseManager:
                     "source_path": row[8], "language": row[9]
                 })
             return results
+
+    def insert_link(self, source_doc_id: str, target_doc_id: str, description: str = None) -> int:
+        """Insert a link between two documents."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                INSERT OR IGNORE INTO links (source_doc_id, target_doc_id, description, created_at)
+                VALUES (?, ?, ?, ?)
+            """, (source_doc_id, target_doc_id, description, now_iso()))
+            self.conn.commit()
+            return cur.lastrowid
+
+    def get_links_for_document(self, doc_id: str, link_type: str = 'source') -> List[Dict]:
+        """Get all links for a document.
+        
+        Args:
+            doc_id: The document ID
+            link_type: 'source' to get links where doc is source, 'target' to get links where doc is target
+        """
+        with self._lock:
+            cur = self.conn.cursor()
+            if link_type == 'source':
+                cur.execute("""
+                    SELECT l.id, l.source_doc_id, l.target_doc_id, l.description, l.created_at,
+                           d.title as target_title, d.category as target_category
+                    FROM links l
+                    JOIN documents d ON l.target_doc_id = d.id
+                    WHERE l.source_doc_id = ?
+                    ORDER BY l.created_at
+                """, (doc_id,))
+            else:
+                cur.execute("""
+                    SELECT l.id, l.source_doc_id, l.target_doc_id, l.description, l.created_at,
+                           d.title as target_title, d.category as target_category
+                    FROM links l
+                    JOIN documents d ON l.source_doc_id = d.id
+                    WHERE l.target_doc_id = ?
+                    ORDER BY l.created_at
+                """, (doc_id,))
+            
+            results = []
+            for row in cur.fetchall():
+                results.append({
+                    "id": row[0],
+                    "source_doc_id": row[1],
+                    "target_doc_id": row[2],
+                    "description": row[3],
+                    "created_at": row[4],
+                    "target_title": row[5] if len(row) > 5 else None,
+                    "target_category": row[6] if len(row) > 6 else None
+                })
+            return results
+
+    def delete_link(self, source_doc_id: str, target_doc_id: str) -> bool:
+        """Delete a link between two documents."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                DELETE FROM links WHERE source_doc_id = ? AND target_doc_id = ?
+            """, (source_doc_id, target_doc_id))
+            self.conn.commit()
+            return cur.rowcount > 0
+
+    def update_link_description(self, source_doc_id: str, target_doc_id: str, description: str) -> bool:
+        """Update the description of a link."""
+        with self._lock:
+            cur = self.conn.cursor()
+            cur.execute("""
+                UPDATE links SET description = ? WHERE source_doc_id = ? AND target_doc_id = ?
+            """, (description, source_doc_id, target_doc_id))
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def close(self):
         with self._lock:

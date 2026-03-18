@@ -463,22 +463,26 @@ class EntityContextBuilder:
                             if field == 'email':
                                 entity_email = entity_data.get('email', '').lower()
                                 if entity_email and value.lower() in entity_email:
+                                    # Get linked memories from links table
+                                    linked_memories = self.get_linked_memories(doc_id)
                                     entities.append({
                                         'id': doc_id,
                                         'title': extra.get('title', ''),
                                         'entity_type': entity_type,
                                         'entity_data': entity_data,
-                                        'linked_memories': extra.get('linked_memories', [])
+                                        'linked_memories': linked_memories
                                     })
                             elif field == 'name':
                                 entity_name = entity_data.get('name', '').lower()
                                 if entity_name and value.lower() in entity_name:
+                                    # Get linked memories from links table
+                                    linked_memories = self.get_linked_memories(doc_id)
                                     entities.append({
                                         'id': doc_id,
                                         'title': extra.get('title', ''),
                                         'entity_type': entity_type,
                                         'entity_data': entity_data,
-                                        'linked_memories': extra.get('linked_memories', [])
+                                        'linked_memories': linked_memories
                                     })
             
             return entities
@@ -518,12 +522,14 @@ class EntityContextBuilder:
                         extra = doc.get('extra', {})
                         entity_data = extra.get('entity_data', {})
                         
+                        # Get linked memories from links table
+                        linked_memories = self.get_linked_memories(doc_id)
                         entities.append({
                             'id': doc_id,
                             'title': extra.get('title', ''),
                             'entity_type': doc.get('media_type', ''),
                             'entity_data': entity_data,
-                            'linked_memories': extra.get('linked_memories', [])
+                            'linked_memories': linked_memories
                         })
         except Exception as e:
             print(f"Error searching entities in content: {e}")
@@ -1391,14 +1397,7 @@ Memories:
             import datetime
             now = datetime.datetime.utcnow().isoformat() + "Z"
             
-            # Build linked_memories list if provided
-            linked_memories = []
-            if linked_memory_id:
-                linked_memories.append({
-                    "memory_id": linked_memory_id,
-                    "linked_at": now
-                })
-            
+            # Build extra dict - linked_memories will be stored in the links table
             extra = {
                 'title': title,
                 'tags': tags or [entity_type],
@@ -1408,8 +1407,7 @@ Memories:
                     **entity_data
                 },
                 'first_seen': now,
-                'last_seen': now,
-                'linked_memories': linked_memories
+                'last_seen': now
             }
             
             # Insert the document with entity type as media_type
@@ -1425,6 +1423,14 @@ Memories:
                 category=category,
                 extra=extra
             )
+            
+            # Create link in the links table if linked_memory_id is provided
+            if linked_memory_id:
+                self.ltm.db_manager.insert_link(
+                    source_doc_id=entity_id,
+                    target_doc_id=linked_memory_id,
+                    description=memory_context if 'memory_context' in locals() else None
+                )
             
             # Create chunks for entity data
             chunk_ordinal = 0
@@ -1510,32 +1516,26 @@ Memories:
             
             doc = details["document"]
             extra = doc.get("extra", {})
-            
-            # Update linked_memories
-            linked_memories = extra.get("linked_memories", [])
             now = datetime.datetime.utcnow().isoformat() + "Z"
             
-            # Check if this memory is already linked
-            for link in linked_memories:
-                if link.get("memory_id") == memory_id:
-                    # Update existing link
-                    link["linked_at"] = now
-                    if memory_context:
-                        link["context"] = memory_context
-                    break
-            else:
-                # Add new link
-                new_link = {
-                    "memory_id": memory_id,
-                    "linked_at": now
-                }
-                if memory_context:
-                    new_link["context"] = memory_context
-                linked_memories.append(new_link)
+            # Use the links table instead of JSON manipulation
+            # Try to update existing link description first
+            existing_links = self.ltm.db_manager.get_links_for_document(entity_id, link_type='source')
+            link_exists = any(link['target_doc_id'] == memory_id for link in existing_links)
             
-            # Update last_seen
+            if link_exists:
+                # Update existing link description
+                self.ltm.db_manager.update_link_description(entity_id, memory_id, memory_context)
+            else:
+                # Create new link
+                self.ltm.db_manager.insert_link(
+                    source_doc_id=entity_id,
+                    target_doc_id=memory_id,
+                    description=memory_context
+                )
+            
+            # Update last_seen in extra
             extra["last_seen"] = now
-            extra["linked_memories"] = linked_memories
             
             # Update document in database
             self.ltm.db_manager.update_document(
@@ -1553,6 +1553,38 @@ Memories:
                 "ok": False,
                 "error": str(e)
             }
+
+    def get_linked_memories(self, entity_id: str) -> List[Dict[str, Any]]:
+        """Get all memories linked to an entity from the links table.
+        
+        Args:
+            entity_id: The ID of the entity
+            
+        Returns:
+            List of linked memory details
+        """
+        try:
+            links = self.ltm.db_manager.get_links_for_document(entity_id, link_type='source')
+            linked_memories = []
+            for link in links:
+                memory_id = link.get('target_doc_id')
+                if memory_id:
+                    try:
+                        memory_details = self.get_email_memory(memory_id)
+                        if memory_details:
+                            linked_memories.append({
+                                "id": memory_id,
+                                "title": memory_details.get("title", ""),
+                                "category": memory_details.get("category", ""),
+                                "created_at": memory_details.get("created_at", ""),
+                                "description": link.get("description", ""),
+                                "linked_at": link.get("created_at", "")
+                            })
+                    except:
+                        pass
+            return linked_memories
+        except Exception as e:
+            return []
     
     def get_entity_memory(self, entity_id: str) -> Optional[Dict[str, Any]]:
         """Get an entity memory by ID with all its details.
@@ -1571,6 +1603,9 @@ Memories:
             doc = details["document"]
             chunks = details["chunks"]
             
+            # Get linked memories from the links table
+            linked_memories = self.get_linked_memories(entity_id)
+            
             return {
                 "ok": True,
                 "id": entity_id,
@@ -1581,7 +1616,7 @@ Memories:
                 "tags": doc.get("extra", {}).get("tags", []),
                 "first_seen": doc.get("extra", {}).get("first_seen", ""),
                 "last_seen": doc.get("extra", {}).get("last_seen", ""),
-                "linked_memories": doc.get("extra", {}).get("linked_memories", []),
+                "linked_memories": linked_memories,
                 "chunks": chunks,
                 "created_at": doc.get("created_at", "")
             }
@@ -1817,6 +1852,8 @@ Memories:
                     # Only include entity types
                     if media_type in ['person', 'organization', 'project', 'service']:
                         extra = doc_data.get("extra", {})
+                        # Get linked memories count from links table
+                        linked_memories = self.get_linked_memories(doc_id)
                         entities.append({
                             "id": doc_id,
                             "title": extra.get("title", ""),
@@ -1824,7 +1861,7 @@ Memories:
                             "entity_data": extra.get("entity_data", {}),
                             "first_seen": extra.get("first_seen", ""),
                             "last_seen": extra.get("last_seen", ""),
-                            "linked_memories_count": len(extra.get("linked_memories", []))
+                            "linked_memories_count": len(linked_memories)
                         })
             
             return entities[:limit]
@@ -1861,12 +1898,14 @@ Memories:
                         continue
                     
                     extra = doc_data.get("extra", {})
+                    # Get linked memories from links table
+                    linked_memories = self.get_linked_memories(doc_id)
                     entities.append({
                         "id": doc_id,
                         "title": extra.get("title", ""),
                         "entity_type": media_type,
                         "entity_data": extra.get("entity_data", {}),
-                        "linked_memories": extra.get("linked_memories", []),
+                        "linked_memories": linked_memories,
                         "similarity_score": r.get("score", 0)
                     })
         
@@ -1884,25 +1923,21 @@ Memories:
         entity_id = entity.get('id')
         entity_type = entity.get('entity_type', 'entity')
         entity_data = entity.get('entity_data', {})
+        
+        # Get linked memories from the entity (already resolved from links table)
         linked_memories = entity.get('linked_memories', [])
         
-        # Get linked memory details
+        # The linked_memories already contains detailed info from get_linked_memories
+        # Just format it for response
         linked_memories_details = []
         for memory_link in linked_memories[:10]:
-            memory_id = memory_link.get('memory_id')
-            if memory_id:
-                try:
-                    memory_details = self.get_email_memory(memory_id)
-                    if memory_details:
-                        linked_memories_details.append({
-                            "id": memory_id,
-                            "title": memory_details.get("title", ""),
-                            "category": memory_details.get("category", ""),
-                            "created_at": memory_details.get("created_at", ""),
-                            "context": memory_link.get("context", "")
-                        })
-                except:
-                    pass
+            linked_memories_details.append({
+                "id": memory_link.get("id", ""),
+                "title": memory_link.get("title", ""),
+                "category": memory_link.get("category", ""),
+                "created_at": memory_link.get("created_at", ""),
+                "context": memory_link.get("description", "")
+            })
         
         return {
             "ok": True,
