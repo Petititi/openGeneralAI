@@ -35,224 +35,6 @@ import re
 import json
 
 
-class LLMExtractor:
-    """Generic LLM-based information extractor for any text content.
-    
-    This class uses an LLM to extract structured, meaningful information from
-    unstructured text like emails, messages, or documents.
-    """
-    
-    def __init__(self, cfg: Optional[Any] = None):
-        """Initialize LLM extractor.
-        
-        Args:
-            cfg: Optional configuration object with 'model' attribute. 
-                 If not provided, uses default litellm settings.
-        """
-        self.cfg = cfg
-        self.model = cfg.model if cfg else "gpt-4o-mini"
-    
-    def clean_email_thread(self, text):
-        text = re.sub(r'\[cid:.*?\]', '', text)
-        text = re.sub(r'\[https?://.*?\]', '', text)
-        
-        text = re.sub(r'<mailto:.*?>', '', text)
-        
-        text = re.sub(r'[ \t]+', ' ', text)
-        
-        text = re.sub(r'\n{2,}', '\n\n', text)
-        
-        text = re.sub(r'.*Office 365.*', '', text)
-        text = re.sub(r'.*Unknown To address.*', '', text)
-        text = re.sub(r'.*Action Required.*', '', text)
-        
-        text = text.strip()
-        
-        return text
-    
-    def extract(self, content: str, extraction_type: str = "general", 
-                custom_prompt: Optional[str] = None) -> Dict[str, Any]:
-        """Extract meaningful information from content using LLM.
-        
-        Args:
-            content: The text content to extract information from
-            extraction_type: Type of extraction ('general', 'email', 'conversation', 'meeting')
-            custom_prompt: Optional custom prompt for specialized extraction
-            
-        Returns:
-            Dictionary with extracted information fields
-        """
-        reduced_content = self.clean_email_thread(content)
-        if not reduced_content:
-            return {"ok": False, "error": "Empty content"}
-        
-        # Build extraction prompt based on type
-        if custom_prompt:
-            prompt = custom_prompt
-        else:
-            prompt = self._build_extraction_prompt(reduced_content, extraction_type)
-        
-        try:
-            response = litellm.completion(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert information extraction assistant. Extract structured, meaningful information from the given content. Return valid JSON only. Respect language of content."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"}
-            )
-            
-            result = response.choices[0].message.content
-            
-            # Parse JSON response
-            try:
-                extracted = json.loads(result)
-                return {"ok": True, "data": extracted}
-            except json.JSONDecodeError:
-                # Try to extract JSON from the response
-                json_match = re.search(r'\{.*\}', result, re.DOTALL)
-                if json_match:
-                    extracted = json.loads(json_match.group())
-                    return {"ok": True, "data": extracted}
-                return {"ok": False, "error": "Could not parse JSON from LLM response"}
-                
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-    
-    def extract_entities_enhanced(self, content: str) -> Dict[str, Any]:
-        """Extract detailed entity information from email content.
-        
-        This method extracts more specific entity information including:
-        - Person: name, email, role, organization
-        - Organization: name, type, relationship (client/vendor/partner)
-        - Project: name, status, participants, description
-        - Service: name, provider, description
-        
-        Args:
-            content: The text content to extract entities from
-            
-        Returns:
-            Dictionary with detailed entity information
-        """
-        prompt = f"""
-Content:
----
-{content[:3000]}
----
-
-Extract detailed entity information from the content above. Return a JSON object with these fields:
-
-{{
-    "people": [
-        {{
-            "name": "full name or null if not found",
-            "email": "email address or null if not found", 
-            "role": "job title/role or null if not found",
-            "organization": "company/org name or null if not found"
-        }}
-    ],
-    "organizations": [
-        {{
-            "name": "organization name",
-            "type": "type of organization (client/vendor/partner/competitor/other)",
-            "relationship": "how this org relates to you (client/vendor/partner/other)"
-        }}
-    ],
-    "projects": [
-        {{
-            "name": "project name",
-            "status": "active/completed/pending/unknown",
-            "participants": ["list of participants"],
-            "description": "brief description of the project"
-        }}
-    ],
-    "services": [
-        {{
-            "name": "service/product name",
-            "provider": "provider/vendor name or null",
-            "description": "brief description of the service"
-        }}
-    ]
-}}
-
-Return valid JSON only. If no entities of a type are found, use empty arrays [].
-"""
-        try:
-            response = litellm.completion(
-                model=self.model,
-                messages=[
-                    {"role": "system", "content": "You are an expert entity extraction assistant. Extract structured entity information from the given content. Return valid JSON only."},
-                    {"role": "user", "content": prompt}
-                ],
-                temperature=0.3,
-                response_format={"type": "json_object"}
-            )
-            
-            result = response.choices[0].message.content
-            
-            try:
-                extracted = json.loads(result)
-                return {"ok": True, "data": extracted}
-            except json.JSONDecodeError:
-                json_match = re.search(r'\{.*\}', result, re.DOTALL)
-                if json_match:
-                    extracted = json.loads(json_match.group())
-                    return {"ok": True, "data": extracted}
-                return {"ok": False, "error": "Could not parse JSON from LLM response"}
-                
-        except Exception as e:
-            return {"ok": False, "error": str(e)}
-    
-    def _build_extraction_prompt(self, content: str, extraction_type: str) -> str:
-        """Build extraction prompt based on type."""
-        
-        base_prompt = f"""
-Content:
----
-{content[:3000]}
----
-
-Return a JSON object with these fields:
-"""
-        base_prompt = base_prompt + """
-{
-    "summary": "2-3 sentence summary of the content, same language as content",
-    "participants": ["list of participants"],
-    "entities": {"people": [], "organizations": [], "locations": []},
-    "key_points": ["main points discussed"],
-    "action_items": ["any tasks or actions mentioned"],
-    "important_dates": ["any dates or deadlines mentioned (DD-MM-YYYY hh:mm format)"],
-    "sentiment": "positive, neutral, or negative",
-    "urgency": "high, medium, or low",
-    "follow_ups": ["items that need follow-up"]
-}"""
-        return base_prompt
-    
-    def extract_batch(self, contents: List[str], extraction_type: str = "general",
-                      progress_callback: Optional[Callable[[int, int], None]] = None) -> List[Dict[str, Any]]:
-        """Extract information from multiple contents.
-        
-        Args:
-            contents: List of text contents to process
-            extraction_type: Type of extraction
-            progress_callback: Optional callback(current, total) for progress
-            
-        Returns:
-            List of extraction results
-        """
-        results = []
-        total = len(contents)
-        
-        for i, content in enumerate(contents):
-            result = self.extract(content, extraction_type)
-            results.append(result)
-            
-            if progress_callback:
-                progress_callback(i + 1, total)
-        
-        return results
-
 
 class ThreadBuilder:
     """Generic message thread builder that reconstructs conversations.
@@ -748,11 +530,7 @@ class EntityContextBuilder:
         
         return entities
     
-    def build_entity_context(
-        self,
-        related_entities: List[Dict[str, Any]],
-        max_memories_per_entity: int = 3
-    ) -> str:
+    def build_entity_context(self, related_entities: List[Dict[str, Any]], max_mem: int = 3) -> str:
         """Build a context string from related entity documents.
         
         Args:
@@ -769,54 +547,22 @@ class EntityContextBuilder:
         
         for entity in related_entities:
             entity_title = entity.get('title', 'Unknown')
-            entity_type = entity.get('entity_type', 'entity')
-            entity_data = entity.get('entity_data', {})
-            linked_memories = entity.get('linked_memories', [])
+            entity_type = entity.get('entity_type', 'person')
             
-            context_parts.append(f"--- Related {entity_type}: {entity_title} ---")
-            
-            # Add entity details
-            if entity_data.get('description'):
-                context_parts.append(f"Description: {entity_data['description']}")
-            if entity_data.get('role'):
-                context_parts.append(f"Role: {entity_data['role']}")
-            if entity_data.get('organization'):
-                context_parts.append(f"Organization: {entity_data['organization']}")
-            
-            # Add context from linked memories
-            if linked_memories:
-                context_parts.append("Previous conversations:")
-                memories_shown = 0
-                for memory_link in linked_memories[:max_memories_per_entity]:
-                    memory_id = memory_link.get('memory_id')
-                    memory_context = memory_link.get('context', '')
-                    
-                    if memory_id and memory_context:
-                        context_parts.append(f"  - [{memory_context[:100]}...]")
-                        memories_shown += 1
-                    elif memory_id:
-                        # Try to get memory summary
-                        try:
-                            memory_details = self.souvenir_assistant.get_email_memory(memory_id)
-                            if memory_details:
-                                topic = memory_details.get('email_thread', {}).get('subject', 'Email')
-                                context_parts.append(f"  - {topic[:80]}")
-                                memories_shown += 1
-                        except:
-                            pass
-                
-                if len(linked_memories) > max_memories_per_entity:
-                    context_parts.append(f"  ... and {len(linked_memories) - max_memories_per_entity} more")
-            
-            context_parts.append("")
+            souvenirs = self.souvenir_assistant.get_souvenirs_by_title(title=entity_title, category=entity_type, limit=max_mem)
+            if souvenirs:
+                context_parts.append(f"--- Related {entity_type}: {entity_title} ---")
+                for souvenir in souvenirs:
+                    context_parts.append(souvenir["description"])
         
         return "\n".join(context_parts)
     
-    def get_or_create_entity(
+    def update_or_create_entity(
         self,
         entity_type: str,
         entity_name: str,
         entity_data: Dict[str, Any],
+        new_content: str,
         linked_memory_id: Optional[str] = None
     ) -> Dict[str, Any]:
         """Find existing entity or create a new one.
@@ -830,14 +576,25 @@ class EntityContextBuilder:
         Returns:
             Dictionary with entity information (existing or newly created)
         """
-        # Try to find existing entity
-        result = self.souvenir_assistant.add_entity_memory(
-            entity_type=entity_type,
-            entity_name=entity_name,
-            entity_data=entity_data,
-            allow_duplicates=False,  # This will find existing or create new
-            linked_memory_id=linked_memory_id
-        )
+        # convert entity_data to string:
+        entity_data_str = json.dumps(entity_data)
+
+        # ask an llm to improve the entity data with the available context:
+        new_datas=self.souvenir_assistant.extractor.extract(entity_data_str,"entity_info",additional_info=new_content)
+        if new_datas.get("ok"):
+            data = new_datas.get("data", {})
+            if data.get("validity") == "false":
+                return {"ok": False, "error": "Entity data not valid or useful according to LLM", "description": data.get("description")}
+            elif data.get("completeness") == "false" and data.get("description"):
+                entity_data["souvenirs"] = data.get("description")
+
+                result = self.souvenir_assistant.add_entity_memory(
+                    entity_type=entity_type,
+                    entity_name=entity_name,
+                    entity_data=entity_data,
+                    allow_duplicates=False,  # This will find existing or create new
+                    linked_memory_id=linked_memory_id
+                )
         
         return result
 
@@ -875,7 +632,7 @@ class SouvenirAssistant:
             print("Warning: LLM not configured. Some features may not work.")
         
         # Initialize LLM extractor for rich information extraction
-        self.extractor = LLMExtractor(self.cfg)
+        self.extractor = LLMExtractor(self.cfg.model)
         
         # Initialize thread builder for conversation reconstruction
         self.thread_builder = ThreadBuilder()
@@ -912,6 +669,8 @@ class SouvenirAssistant:
                     thread_id = email_thread.get("thread_id")
                     if thread_id:
                         stored_thread_ids.add(thread_id)
+                    else:
+                        stored_thread_ids.add(doc_id)
             
             return stored_thread_ids
             
@@ -958,11 +717,12 @@ class SouvenirAssistant:
             use_body_similarity=use_body_similarity
         )
     
-    def process_conversation_for_memory(self, messages: List[Dict]) -> Dict[str, Any]:
+    def process_conversation_for_memory(self, messages: List[Dict], context: str) -> Dict[str, Any]:
         """Process a conversation/thread and extract meaningful information using LLM.
         
         Args:
             messages: List of message dictionaries in chronological order
+            context: optional informations about participants
             
         Returns:
             Dictionary with extracted info: topic, participants, key_points, etc.
@@ -971,40 +731,30 @@ class SouvenirAssistant:
             return {"ok": False, "error": "No messages provided"}
         
         # Build conversation content
-        conversation_content = self._format_conversation_for_extraction(messages)
+        conversation_content = self._format_conversation_for_extraction(messages, context)
         
         # Use LLM to extract information
-        result = self.extractor.extract(conversation_content, extraction_type="conversation")
+        result = self.extractor.extract(conversation_content, extraction_type="general")
         
         if not result.get("ok"):
             return {
                 "ok": False,
                 "error": result.get("error", "Extraction failed"),
-                "topic": "",
-                "participants": [],
-                "key_points": [],
-                "tags": ["conversation"]
             }
         
         data = result.get("data", {})
         
-        # Build tags
-        tags = ["conversation"]
-        if data.get("action_items"):
-            tags.append("action_required")
-        
         return {
             "ok": True,
-            "topic": data.get("summary", ""),
-            "participants": data.get("participants", []),
+            "summary": data.get("summary", ""),
             "entities": data.get("entities", {'people':[], 'organizations':[], 'locations':[]}),
             "key_points": data.get("key_points", []),
-            "action_items": data.get("action_items", []),
             "important_dates": data.get("important_dates", []),
-            "follow_ups": data.get("follow_ups", []),
+            "action_items": data.get("action_items", []),
             "sentiment": data.get("sentiment", "neutral"),
+            "follow_ups": data.get("follow_ups", []),
             "urgency": data.get("urgency", ""),
-            "tags": list(set(tags))
+            "long_term_impact": data.get("long_term_impact", ""),
         }
     
     def _format_email_for_extraction(self, email: Dict) -> str:
@@ -1050,12 +800,14 @@ class SouvenirAssistant:
         normalized = re.sub(r"\s+", " ", text.strip().lower())
         return hashlib.sha1(normalized.encode("utf-8")).hexdigest()
 
-    def _format_conversation_for_extraction(self, messages: List[Dict]) -> str:
+    def _format_conversation_for_extraction(self, messages: List[Dict], context: str) -> str:
         """
         Format conversation for LLM extraction.
         Deduplicate content at paragraph level instead of message level.
         """
         lines = []
+        if context:
+            lines.append(context)
         seen_paragraph_hashes = set()
         for i, msg in enumerate(messages):
             raw_body = msg.get("body", "")
@@ -1838,6 +1590,26 @@ Memories:
                 "ok": False,
                 "error": str(e)
             }
+        
+    def get_souvenirs_by_title(self, title, category=None, media_type=None, limit: int = 15):
+        """Get a souvenir using a media type and a title
+        
+        Args:
+            memory_id: The ID of the email memory
+            
+        Returns:
+            Dictionary with memory details and all chunks, or None if not found
+        """
+        output = []
+        docs_ids = self.ltm.db_manager.search_document_by_title(category=category, media_type=media_type, query=title, limit=limit)
+        for doc in docs_ids:
+            if doc["similarity_score"] < 0.9:
+                continue
+            output.append(doc)
+
+        return output
+
+
     
     def get_email_memory(self, memory_id: str) -> Optional[Dict[str, Any]]:
         """Get an email memory by ID with all its chunks.

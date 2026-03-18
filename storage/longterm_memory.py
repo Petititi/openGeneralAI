@@ -145,6 +145,12 @@ class LongTermMemory:
             return None
         return self.embeddings.dim
 
+    def close(self):
+        """Ferme les ressources (connexion DB, embeddings)."""
+        if self.db:
+            self.db.close()
+        self._embeddings = None
+
     # ---------- API publique ----------
 
     def add(self, path: str, rel_to: Optional[str] = None, extra: Optional[Dict] = None) -> Tuple[str, bool]:
@@ -197,7 +203,7 @@ class LongTermMemory:
 
         # Insérer le document
         self.db.insert_document(
-            doc_id, str(p.resolve()), rel_path, media_type, language, doc_id, len(data), extra
+            doc_id, str(p.resolve()), rel_path, rel_path, media_type, language, doc_id, len(data), 'general', extra
         )
 
         # Insérer les imports

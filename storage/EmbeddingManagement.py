@@ -18,7 +18,7 @@ class EmbeddingManager:
     def __init__(self, faiss_index_path: str = "faiss.index",
                  model_name: str = "mixedbread-ai/mxbai-embed-large-v1"):
         self.faiss_index_path = faiss_index_path
-        self.model = SentenceTransformer(model_name)
+        self.model = SentenceTransformer(model_name, local_files_only=True)
         self.dim = self.model.get_sentence_embedding_dimension()
         self.index = faiss.IndexFlatIP(self.dim)
         self._load_faiss()

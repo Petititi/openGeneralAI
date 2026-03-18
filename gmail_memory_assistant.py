@@ -19,11 +19,7 @@ import base64
 import pickle
 from pathlib import Path
 from datetime import datetime, timedelta
-from typing import Optional, List, Dict, Any
-
-# Load environment variables from .env file
-from dotenv import load_dotenv
-load_dotenv()
+from typing import Optional, List, Dict, Any, Set
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -34,6 +30,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
+import configurator
 from souvenir_assistant import SouvenirAssistant
 
 
@@ -43,9 +40,11 @@ SCOPES = [
     'https://www.googleapis.com/auth/gmail.labels'
 ]
 
-TOKEN_FILE = 'gmail_token.pickle'
-CREDS_FILE = 'gmail_credentials.json'
-MAILS_FILE = 'mails.pickle'
+
+# --- Various global config:
+ROOT_FOLDER = Path(__file__).parent
+CONFIG_PATH = ROOT_FOLDER / "config_gmail.json"
+ENV_PATH = ROOT_FOLDER / ".env"
 
 
 class GmailMemoryAssistant:
@@ -57,6 +56,12 @@ class GmailMemoryAssistant:
         self.credentials = None
         self.souvenir_assistant = SouvenirAssistant(db_path=souvenir_db, enable_embeddings=True)
         self.user_email = None
+        
+        # --- Configuration creation
+        self.cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+        self.TOKEN_FILE = self.cfg._cfg["TOKEN_FILE"]
+        self.MAILS_FILE = self.cfg._cfg["MAILS_FILE"]
+        self.DEBUG = self.cfg._cfg["DEBUG"] == "True"
     
     def get_credentials_interactive(self) -> Optional[Credentials]:
         """
@@ -226,12 +231,12 @@ class GmailMemoryAssistant:
     
     def _load_existing_token(self) -> Optional[Credentials]:
         """Load existing OAuth token from file."""
-        if not os.path.exists(TOKEN_FILE):
+        if not os.path.exists(self.TOKEN_FILE):
             print("❌ No existing token file found")
             return None
         
         try:
-            with open(TOKEN_FILE, 'rb') as f:
+            with open(self.TOKEN_FILE, 'rb') as f:
                 self.credentials = pickle.load(f)
             
             # Check if token is valid
@@ -255,7 +260,7 @@ class GmailMemoryAssistant:
         """Save credentials to token file."""
         if self.credentials:
             try:
-                with open(TOKEN_FILE, 'wb') as f:
+                with open(self.TOKEN_FILE, 'wb') as f:
                     pickle.dump(self.credentials, f)
                 print("💾 Token saved for future use")
             except Exception as e:
@@ -309,6 +314,8 @@ class GmailMemoryAssistant:
         Returns:
             Combined list of all emails
         """
+        if not self.credentials:
+            self.credentials = self.get_credentials_interactive()
         if not self.service:
             print("❌ Not connected to Gmail")
             return []
@@ -489,8 +496,8 @@ class GmailMemoryAssistant:
                 
                 # Iteratively fetch more pages until we reach max_results_per_source
                 iteration = 1
-                while page_token and len(seen_ids) < max_results_per_source:
-                    remaining = max_results_per_source - len(seen_ids)
+                while page_token and len(messages) < max_results_per_source:
+                    remaining = max_results_per_source - len(messages)
                     if remaining <= 0:
                         break
                     
@@ -750,7 +757,7 @@ class GmailMemoryAssistant:
         
         return "\n".join(lines)
     
-    def create_memories_from_emails(self, emails: List[Dict], include_single_emails: bool = True, store_individual_emails: bool = True) -> Dict[str, Any]:
+    def create_memories_from_emails(self, emails: List[Dict]) -> Dict[str, Any]:
         """Create souvenirs from extracted email data.
         
         Args:
@@ -776,31 +783,11 @@ class GmailMemoryAssistant:
         )
         
         # Only count threads with more than 1 email
-        thread_count = sum(1 for t in threads.values() if t['size'] > 1)
-        print(f"   Found {thread_count} email conversations (threads with multiple messages)")
+        thread_count = len(threads)
+        print(f"   Found {thread_count} email conversations")
         
-        # Identify single emails (emails not part of any thread with multiple messages)
-        single_emails = []
-        for email in emails:
-            thread_id = email.get('thread_id')
-            if thread_id and thread_id in threads:
-                if threads[thread_id]['size'] == 1:
-                    # This is a single email in its thread
-                    single_emails.append(email)
-            else:
-                # No thread ID at all - treat as single
-                single_emails.append(email)
         
-        if include_single_emails:
-            print(f"   Found {len(single_emails)} single emails (not part of threads)")
-        else:
-            print(f"   Skipping {len(single_emails)} single emails (include_single_emails=False)")
-        
-        # Step 8: Email-level granularity option
-        if store_individual_emails and thread_count > 0:
-            print(f"   Will store individual emails within threads (store_individual_emails=True)")
-        
-        if thread_count == 0 and len(single_emails) == 0:
+        if thread_count == 0:
             return {
                 "ok": True,
                 "memories_created": 0,
@@ -828,63 +815,94 @@ class GmailMemoryAssistant:
         
         # Process threads (conversations with multiple emails)
         for thread_id, thread in threads.items():
-            if thread['size'] <= 1:
-                continue  # Skip single emails here, handle below
-            
             if memories_created % 50 == 0:
                 print(f"   Created {memories_created} memories from threads")
             
             thread_emails = thread['emails']
+
+            def clean_mail(mail_address):
+                if "<" in mail_address:
+                    name, mail = mail_address.split("<")
+                    name = name.strip()
+                    mail = mail.strip()
+                    mail = mail[:-1]
+                else:
+                    name = ""
+                    mail = mail_address
+                if name.startswith('"'):
+                    name = name[1:-1]
+                if name:
+                    name = " ".join([part.capitalize() for part in name.split()])
+                return name, mail
+            # get all participant from this thread:
+            participants = {}
+            for email in thread_emails:
+                for field in ["sender", "to", "cc", "bcc", "reply_to"]:
+                    mail_participant = email[field]
+                    if mail_participant:
+                        if "," in mail_participant:
+                            mail_participants = mail_participant.split(",")
+                        else:
+                            mail_participants = [mail_participant]
+                        for single_mail in mail_participants:
+                            name, mail = clean_mail(single_mail)
+                            if mail not in participants:
+                                participants[mail] = name
+
+            context = ""
+            participants_infos = {}
+            for mail_address, name in participants.items():
+                souvenirs = self.souvenir_assistant.get_souvenirs_by_title(title=name, category="person")
+                participant_info = {
+                    "name": name,
+                    "email": mail_address,
+                    "souvenirs": []
+                }
+                for souvenir in souvenirs:
+                    participant_info["souvenirs"].append({
+                        "title": souvenir["title"],
+                        "description": souvenir["description"]
+                    })
+                    context += f'{souvenir["title"]}: {souvenir["description"]}\n-----\n'
+                participants_infos[name] = participant_info
+
             
             # Use LLM to extract meaningful information from the conversation
-            conversation_info = self.souvenir_assistant.process_conversation_for_memory(thread_emails)
-            
-            # Determine category based on labels from all emails in thread
-            category = ''
-            for email in thread_emails:
-                if category:
-                    break
-                for label in email.get('labels', []):
-                    if label in categories_map:
-                        category = categories_map[label]
-                        break
-            if not category:
-                category = 'email_conversation'
-            
-            # Use tags from LLM extraction, add labels
-            tags = conversation_info.get("tags", ["conversation"])
-            for email in thread_emails:
-                for label in email.get('labels', []):
-                    low_label = label.lower()
-                    if low_label not in tags:
-                        tags.append(low_label)
-            tags = list(set(tags))[:15]
-            
-            # ===== NEW: Entity Context Building =====
-            # Extract entities from email content for entity memory management
-            email_content = ""
-            for email in thread_emails:
-                email_content += email.get('body', '') + " " + email.get('subject', '') + " "
-            
-            participants = conversation_info.get('participants', [])
-            for email in thread_emails:
-                if email.get('from'):
-                    participants.append(email.get('from'))
-                if email.get('to'):
-                    participants.append(email.get('to'))
-            participants = list(set(participants))
-            
-            # Find related entities in database
-            related_entities = self.souvenir_assistant.entity_context_builder.find_related_entities(
-                email_content=email_content,
-                participants=participants
-            )
-            
-            # Build context from related entities (for richer memory)
-            entity_context = self.souvenir_assistant.entity_context_builder.build_entity_context(
-                related_entities,
-                max_memories_per_entity=2
-            )
+            conversation_info = self.souvenir_assistant.process_conversation_for_memory(thread_emails, context)
+            if not conversation_info["ok"]:
+                # skip this problematic email
+                if self.DEBUG:
+                    print("error during processing")
+                continue
+            """
+            summary
+            entities": {'people':[], 'organizations':[], 'locations':[]}
+            key_points
+            important_dates
+            action_items
+            sentiment
+            follow_ups
+            urgency
+            long_term_impact """
+
+            # do we need to update persons informations:
+            conversation_summary = conversation_info.get("summary", "")
+            for name, datas in participants_infos.items():
+                self.souvenir_assistant.entity_context_builder.update_or_create_entity(
+                    entity_type='person',
+                    entity_name=name,
+                    entity_data={
+                        'email': datas["email"],
+                        'name': name,
+                        'souvenirs': datas["souvenirs"],
+                    },
+                    new_content=conversation_summary,
+                    linked_memory_id=thread_id
+                )
+
+            # from here, we need to check if a memory is needed.
+            if conversation_info["long_term_impact"] < 3:
+                continue
             
             # Add entity context to conversation info if we have related entities
             if entity_context:
@@ -911,20 +929,6 @@ class GmailMemoryAssistant:
                 if enhanced_result.get('ok'):
                     entity_data = enhanced_result.get('data', {})
                     
-                    # Process people
-                    for person in entity_data.get('people', []):
-                        if person.get('name'):
-                            self.souvenir_assistant.entity_context_builder.get_or_create_entity(
-                                entity_type='person',
-                                entity_name=person['name'],
-                                entity_data={
-                                    'email': person.get('email'),
-                                    'role': person.get('role'),
-                                    'organization': person.get('organization'),
-                                    'description': f"Contact from email thread: {conversation_info.get('topic', '')}"
-                                },
-                                linked_memory_id=memory_id
-                            )
                     
                     # Process organizations
                     for org in entity_data.get('organizations', []):
@@ -1395,14 +1399,7 @@ class GmailMemoryAssistant:
         print("  4. Store them for future questions")
         
         # Get credentials
-        self.credentials = self.get_credentials_interactive()
-        
-        if self.credentials:
-            if not self.connect():
-                print("❌ Could not connect to Gmail")
-                return
-        else:
-            print("\n⚠️  Running without Gmail connection")
+        self.credentials = None
         
         # Main loop
         while True:
@@ -1449,17 +1446,17 @@ class GmailMemoryAssistant:
                 print("   Going back up to 1 year...")
                 confirm = input("Continue? (y/n): ").strip().lower()
                 if confirm == 'y':
-                    if os.path.exists(MAILS_FILE):
-                        with open(MAILS_FILE, 'rb') as f:
+                    if os.path.exists(self.MAILS_FILE):
+                        with open(self.MAILS_FILE, 'rb') as f:
                             emails = pickle.load(f)
                     else:
                         emails = self.fetch_comprehensive_history(
-                            max_results_per_source=2000, 
+                            max_results_per_source=200, 
                             days_back=365
                         )
                         
                         if emails:
-                            with open(MAILS_FILE, 'wb') as f:
+                            with open(self.MAILS_FILE, 'wb') as f:
                                 pickle.dump(emails, f)
                     if emails:
                         print(f"\n📧 Found {len(emails)} unique emails")

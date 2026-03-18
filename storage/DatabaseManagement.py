@@ -35,7 +35,7 @@ class DatabaseManager:
     # Prepared statement cache
     _PREPARED_STATEMENTS = {
         "insert_document": """
-            INSERT OR IGNORE INTO documents(id, source_path, rel_path, media_type, language, sha256, size_bytes, created_at, category, extra)
+            INSERT OR IGNORE INTO documents(id, source_path, title, media_type, language, sha256, size_bytes, created_at, category, extra)
             VALUES(?,?,?,?,?,?,?,?,?,?)
         """,
         "get_document": "SELECT * FROM documents WHERE id = ?",
@@ -86,7 +86,8 @@ class DatabaseManager:
             CREATE TABLE IF NOT EXISTS documents (
             id TEXT PRIMARY KEY,
             source_path TEXT NOT NULL,
-            rel_path TEXT,
+            description TEXT NOT NULL,
+            title TEXT,
             media_type TEXT,
             language TEXT,
             sha256 TEXT,
@@ -171,15 +172,17 @@ class DatabaseManager:
             
             self.conn.commit()
 
-    def insert_document(self, doc_id: str, source_path: str, rel_path: Optional[str],
+    def insert_document(self, doc_id: str, source_path: str, description: str, title: Optional[str],
                        media_type: str, language: Optional[str], sha256: str,
                        size_bytes: int, category: str = 'general', extra: Optional[Dict] = None) -> None:
         with self._lock:
             cur = self.conn.cursor()
+            # Ensure description is not None (has NOT NULL constraint)
+            description = description or ""
             cur.execute("""
-            INSERT OR IGNORE INTO documents(id, source_path, rel_path, media_type, language, sha256, size_bytes, created_at, category, extra)
-            VALUES(?,?,?,?,?,?,?,?,?,?)
-        """, (doc_id, source_path, rel_path, media_type, language, sha256, size_bytes, now_iso(), category, json.dumps(extra or {})))
+            INSERT OR IGNORE INTO documents(id, source_path, description, title, media_type, language, sha256, size_bytes, created_at, category, extra)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        """, (doc_id, source_path, description, title, media_type, language, sha256, size_bytes, now_iso(), category, json.dumps(extra or {})))
             self.conn.commit()
     
     def _init_default_categories(self):
@@ -191,6 +194,7 @@ class DatabaseManager:
             {'name': 'work', 'description': 'Work-related memories', 'color': '#10B981', 'icon': '💼', 'is_system': 1},
             {'name': 'object', 'description': 'Objects and items', 'color': '#F59E0B', 'icon': '📦', 'is_system': 1},
             {'name': 'person', 'description': 'People and contacts', 'color': '#EC4899', 'icon': '👤', 'is_system': 1},
+            {'name': 'organization', 'description': 'Organizations or groups', 'color': "#97EC48", 'icon': '👤', 'is_system': 1},
             {'name': 'location', 'description': 'Places and locations', 'color': '#8B5CF6', 'icon': '📍', 'is_system': 1},
             {'name': 'idea', 'description': 'Ideas and thoughts', 'color': '#06B6D4', 'icon': '💡', 'is_system': 1},
             {'name': 'travel', 'description': 'Travel and trips', 'color': '#EF4444', 'icon': '✈️', 'is_system': 1},
@@ -285,7 +289,7 @@ class DatabaseManager:
         self.insert_document(
             doc_id=doc_id,
             source_path=f"souvenir:{doc_id}",
-            rel_path=None,
+            title=None,
             media_type='text/plain',
             language='en',
             sha256='',
@@ -347,6 +351,54 @@ class DatabaseManager:
                     doc = dict(zip(columns, row))
                 results.append(doc)
             return results
+        
+    def search_document_by_title(self, category, media_type, query, limit=100):
+        with self._lock:
+            cur = self.conn.cursor()
+
+            # Split query into keywords
+            keywords = query.lower().split()
+            # Perform a separate query for each keyword and store results in sets
+            final_results = []
+            for keyword in keywords:
+                # Query for each keyword
+                sql = """
+                    SELECT id, title, description
+                    FROM documents
+                    WHERE title LIKE ?
+                """
+                params = [f'%{keyword}%']
+                if media_type is not None:
+                    sql += " AND media_type = ?"
+                    params.append(media_type)
+                if category is not None:
+                    sql += " AND category = ?"
+                    params.append(category)
+                sql += " LIMIT ?"
+                params.append(limit * 10)
+                cur.execute(sql, params)
+
+                # Fetch results for this keyword and store document IDs in a set
+                for row in cur.fetchall():
+                    # Handle both tuple and Row objects
+                    title = row[1]
+                    description = row[2]
+
+                    # Calculate the number of keyword matches in 'content' and 'extra'
+                    matches = sum(1 for kw in keywords if kw in title.lower())
+
+                    # Add match score to the document
+                    doc = {}
+                    doc['similarity_score'] = matches / len(keywords)
+                    doc['id'] = row[0]
+                    doc['title'] = title
+                    doc['description'] = description
+                    final_results.append(doc)
+
+            # Sort by match_score (higher is better) and limit to 'limit' number of results
+            sorted_results = sorted(final_results, key=lambda x: x['similarity_score'], reverse=True)
+            return sorted_results[:limit]
+
     
     def search_souvenirs(self, query: str, category: str = None, limit: int = 10) -> List[Dict]:
         """Search souvenirs by content using multiple queries and prioritizing documents with the most keyword matches."""

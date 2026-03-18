@@ -44,7 +44,8 @@ class LLMExtractor:
         content: str, 
         extraction_type: str = "general",
         custom_prompt: Optional[str] = None,
-        system_prompt: Optional[str] = None
+        system_prompt: Optional[str] = None,
+        additional_info: Optional[str] = None
     ) -> Dict[str, Any]:
         """Extract meaningful information from content using LLM.
         
@@ -67,7 +68,7 @@ class LLMExtractor:
         if custom_prompt:
             prompt = custom_prompt
         else:
-            prompt = self._build_extraction_prompt(content, extraction_type)
+            prompt = self._build_extraction_prompt(content, extraction_type, additional_info)
         
         # Default system prompt
         if system_prompt is None:
@@ -105,12 +106,13 @@ class LLMExtractor:
         except Exception as e:
             return {"ok": False, "error": str(e)}
     
-    def _build_extraction_prompt(self, content: str, extraction_type: str) -> str:
+    def _build_extraction_prompt(self, content: str, extraction_type: str, additional_info: Optional[str] = None) -> str:
         """Build extraction prompt based on type.
         
         Args:
             content: The content to extract from (will be truncated if too long)
             extraction_type: Type of extraction
+            additional_info: Additional information about the entity (if applicable)
             
         Returns:
             Formatted prompt string
@@ -118,9 +120,7 @@ class LLMExtractor:
         # Truncate content if too long
         max_content_length = {
             "general": 3000,
-            "email": 4000,
-            "conversation": 5000,
-            "meeting": 4000,
+            "user": 1000,
             "code": 6000,
         }.get(extraction_type, 3000)
         
@@ -129,45 +129,6 @@ class LLMExtractor:
         # Build prompt based on extraction type
         prompts = {
             "general": """
-Content:
----
-{truncated_content}
----
-
-Return a JSON object with these fields:
-{{
-    "summary": "2-3 sentence summary of the content, same language as content",
-    "participants": ["list of participants using email adresses if possible"],
-    "entities": {{"people": [], "organizations": [], "locations": []}},
-    "key_points": ["main points discussed"],
-    "action_items": ["any tasks or actions mentioned"],
-    "important_dates": ["any dates or deadlines mentioned (DD-MM-YYYY hh:mm format)"],
-    "sentiment": "positive, neutral, or negative",
-    "urgency": "high, medium, or low",
-    "follow_ups": ["items that need follow-up"]
-}}""",
-            
-            "email": """
-Email Content:
----
-{truncated_content}
----
-
-Analyze this email and return a JSON object with:
-{{
-    "summary": "2-3 sentence summary of the email",
-    "sender": "email address or name of sender",
-    "recipients": ["list of recipients"],
-    "subject": "email subject line",
-    "entities": {{"people": [], "organizations": [], "locations": []}},
-    "key_points": ["main points in the email"],
-    "action_items": ["any tasks or actions requested"],
-    "urgency": "high, medium, or low",
-    "requires_response": true or false,
-    "follow_ups": ["items that need follow-up"]
-}}""",
-            
-            "conversation": """
 Conversation Transcript:
 ---
 {truncated_content}
@@ -175,32 +136,30 @@ Conversation Transcript:
 
 Analyze this conversation and return a JSON object with:
 {{
-    "summary": "2-3 sentence summary of the conversation",
-    "participants": ["list of participants"],
+    "summary": "2-3 sentence summary of the conversation using language content",
     "entities": {{"people": [], "organizations": [], "locations": []}},
     "key_points": ["main topics discussed"],
-    "decisions": ["any decisions made"],
+    "important_dates": ["any dates or deadlines mentioned (DD-MM-YYYY hh:mm format)"],
     "action_items": ["tasks assigned or mentioned"],
     "sentiment": "positive, neutral, or negative",
-    "follow_ups": ["items that need follow-up"]
+    "follow_ups": ["items that need follow-up"],
+    "long_term_impact": 0<->10 (0: low content value, no need to remember; 10: very important)
 }}""",
-            
-            "meeting": """
-Meeting Notes:
+            "entity_info": """
+Knowledge about the entity:
 ---
 {truncated_content}
 ---
+Additional information about this entity:
+---
+{additional_info}
+---
 
-Analyze this meeting and return a JSON object with:
+Analyze this and return a JSON object with:
 {{
-    "summary": "2-3 sentence summary of the meeting",
-    "attendees": ["list of attendees"],
-    "agenda_items": ["topics discussed"],
-    "decisions": ["decisions made"],
-    "action_items": ["tasks assigned with owner and deadline"],
-    "next_meeting": "date/time if mentioned",
-    "key_points": ["important takeaways"],
-    "follow_ups": ["items that need follow-up"]
+    "validity": "true if the content is valid and useful for memory, false if it's not useful or just noise",
+    "completeness": "true if the content provides a complete picture of the entity, false if it's partial or missing key information",
+    "description": "short plain text description of the entity (not the content of the discussion) based on the content, using the discussion language, or null if not needed",
 }}""",
             
             "code": """
@@ -222,6 +181,8 @@ Analyze this code and return a JSON object with:
         }
         
         prompt_template = prompts.get(extraction_type, prompts["general"])
+        if additional_info is not None:
+            return prompt_template.format(additional_info=additional_info, truncated_content=truncated_content)
         return prompt_template.format(truncated_content=truncated_content)
     
     def extract_batch(
