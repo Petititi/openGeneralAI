@@ -8,9 +8,11 @@ the trace it writes in traces/ can be opened with the viewer (see viewer/README.
 import json
 import time
 from pathlib import Path
-from types import SimpleNamespace
+
+from unittest.mock import Mock
 
 import utils
+from opengeneralai.agent.context import MemoryContext
 from opengeneralai.agent.orchestrator import Orchestrator
 from opengeneralai.tools.registry import ToolRegistry
 
@@ -57,17 +59,18 @@ def test_plan_act_check_loop_fixes_the_script(fake_llm):
         # turn 4: the last step succeeded
         json.dumps({"status": "DONE"}),
     ])
-    cfg = SimpleNamespace(model="mistral/mistral-small-latest", user_lang="English")
-    orchestrator = Orchestrator(cfg, make_tools(fs))
+    orchestrator = Orchestrator(llm, make_tools(fs))
 
-    plan, cost = orchestrator.process_user_message("Script `loader.py` doesn't start. Fix the mistake.")
+    result = orchestrator.run("Script `loader.py` doesn't start. Fix the mistake.")
 
-    trace_file = orchestrator.last_trace.save(TRACES_DIR / "fake_file_editing.json")
+    trace_file = result.trace.save(TRACES_DIR / "fake_file_editing.json")
 
     assert fs.read("loader.py") == FIXED_LOADER
-    assert [step["status"] for step in plan["plan_steps"]] == ["done", "done", "done"]
+    assert result.done
+    assert [step["status"] for step in result.plan["plan_steps"]] == ["done", "done", "done"]
     assert len(llm.calls) == 7, "one LLM call per plan update and per action"
-    assert cost > 0
+    assert result.turns == 4
+    assert result.usage.total_tokens > 0 and result.cost > 0
 
     trace = json.loads(trace_file.read_text())
     phases = [node["phase"] for node in sorted(trace["nodes"].values(), key=lambda n: n["timestamp"])]
@@ -75,3 +78,42 @@ def test_plan_act_check_loop_fixes_the_script(fake_llm):
                       "plan/update", "act/run", "plan/update", "done"]
     tools_used = [n["tool_name"] for n in sorted(trace["nodes"].values(), key=lambda n: n["timestamp"]) if n["tool_name"]]
     assert tools_used == ["read_file", "edit_file", "bash"]
+
+
+def test_memory_context_is_retrieved_and_traced(fake_llm):
+    """The query analysis of the memory goes through the LLM and gets its own trace node."""
+    ltm = Mock()
+    ltm.search.return_value = [{
+        "chunk_id": 1, "content": "class Calculator:\n    def add(self, a, b):\n        return a + b",
+        "chunk_type": "class", "chunk_name": "Calculator", "source_path": "calc.py",
+        "start_line": 1, "end_line": 3, "language": "python",
+    }]
+    analysis = json.dumps({"should_search": True, "search_queries": ["calculator add"],
+                           "search_type": "keyword", "symbols": []})
+    llm = fake_llm([analysis, json.dumps({"plan_steps": [{"descr": "Explain add()", "status": "done"}]})])
+
+    result = Orchestrator(llm, ToolRegistry(), memory=MemoryContext(ltm)).run("How does Calculator add?")
+
+    context_nodes = [n for n in result.trace.nodes.values() if n.phase == "context"]
+    assert len(context_nodes) == 1
+    assert context_nodes[0].raw_response == analysis
+    planning_prompt = llm.calls[1]
+    assert "class Calculator" in planning_prompt[1]["content"], "the context follows the core prompt"
+    assert result.done and result.turns == 1
+
+
+def test_orchestrator_keeps_no_state_between_questions(fake_llm):
+    """Two questions on the same orchestrator: separate traces and usage."""
+    plan_done = json.dumps({"plan_steps": [{"descr": "Answer", "status": "done"}]})
+    llm = fake_llm([plan_done, plan_done])
+    orchestrator = Orchestrator(llm, ToolRegistry())
+
+    first = orchestrator.run("Question one")
+    second = orchestrator.run("Question two")
+
+    assert first.trace is not second.trace
+    root = second.trace.nodes[second.trace.root_id]
+    assert root.phase == "start" and root.parent_id is None
+    assert root.tags["QUESTION"] == "Question two"
+    assert first.usage == second.usage, "same-size questions: each result counts its own call only"
+    assert not any(n.phase == "context" for n in second.trace.nodes.values()), "no memory, no context node"

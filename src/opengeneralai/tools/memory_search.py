@@ -35,11 +35,12 @@ Type filter: {type_filter}
 Respond with ONLY a JSON object:
 {{"strategy": "CODE_DISCOVERY|SYMBOL_INSPECTION|FILE_ANALYSIS|CATALOG_BROWSE", "reasoning": "brief explanation"}}"""
     
-    def __init__(self, ltm: LongTermMemory, ask_llm: Callable[[List[dict]], str]):
+    needs_llm = True
+
+    def __init__(self, ltm: LongTermMemory):
         self.ltm = ltm
-        self.ask_llm = ask_llm
     
-    def _analyze_query(self, query: str, type_filter: str) -> Dict[str, str]:
+    def _analyze_query(self, query: str, type_filter: str, ask_llm: Callable[[List[dict]], str]) -> Dict[str, str]:
         """Use LLM to determine the best search strategy."""
         messages = [
             {
@@ -53,7 +54,7 @@ Respond with ONLY a JSON object:
         ]
         
         try:
-            response = self.ask_llm(messages)
+            response = ask_llm(messages)
             # Clean potential markdown code blocks
             response = response.strip()
             if response.startswith("```"):
@@ -170,13 +171,14 @@ Respond with ONLY a JSON object:
     def run(self, **kwargs) -> ToolResult:
         query = kwargs.get("query")
         type_filter = kwargs.get("type", "any")
+        ask_llm = kwargs["ask_llm"]  # given by the executor (needs_llm)
         
         if not query:
             return ToolResult(False, content="Missing 'query'", meta={"error": "Missing 'query'"})
         
         try:
             # Step 1: Analyze query to determine strategy
-            analysis = self._analyze_query(query, type_filter)
+            analysis = self._analyze_query(query, type_filter, ask_llm)
             strategy = analysis.get("strategy", "CODE_DISCOVERY")
             reasoning = analysis.get("reasoning", "")
             

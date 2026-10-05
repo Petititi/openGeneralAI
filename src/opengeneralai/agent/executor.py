@@ -1,24 +1,20 @@
 import json5
-from opengeneralai.config import AppConfig
-from typing import Tuple, Callable, List
+from typing import Callable, List, Optional, Tuple
 import json
 
 from opengeneralai.tools import registry as tools_module
 from opengeneralai.tracing.logger import TrajectoryLogger, _digest_messages
 
-class AgentError(Exception):
-    def __init__(self, message, tool_name):
-        super().__init__(message)
-
-        # Now for your custom code...
-        self.tool_name = tool_name
+from opengeneralai.errors import ToolCallError as AgentError
 
 class ActionAgent:
-    def __init__(self, cfg: AppConfig, logger: TrajectoryLogger, tools: tools_module.ToolRegistry, ask_llm: Callable[[List[dict]], str]):
-        self.cfg = cfg
+    def __init__(self, logger: TrajectoryLogger, tools: tools_module.ToolRegistry, ask_llm: Callable[[List[dict]], str],
+                 ask_llm_from_tool: Optional[Callable[[List[dict]], str]] = None):
         self.tools = tools
         self.logger = logger
         self.ask_llm = ask_llm
+        # Given to the tools that call the LLM themselves (Tool.needs_llm)
+        self.ask_llm_from_tool = ask_llm_from_tool or ask_llm
 
         self.core_prompt = """Tool discipline:
 * Use only explicitly named tools.
@@ -97,12 +93,15 @@ TOOLS:
             raise AgentError(f"Tool '{tool_name}' is not recognized.", tool_name)
 
         tool = self.tools.get(tool_name)
-        result = tool.run(**arguments)
+        call_args = dict(arguments)
+        if getattr(tool, "needs_llm", False):
+            call_args["ask_llm"] = self.ask_llm_from_tool
+        result = tool.run(**call_args)
         if not result.ok:
             if self.logger and node_id is not None:
                 self.logger.set_tool(tool_name=tool_name, tool_input=raw_response, error=f"Tool '{tool_name}'({arguments}) execution failed: {result.meta.get('error', 'Unknown error')}")
             raise AgentError(f"Tool '{tool_name}'({arguments}) execution failed: {result.meta.get('error', 'Unknown error')}", tool_name)
-        params = ",".join(result.meta.values())
+        params = ",".join(str(v) for v in result.meta.values())
         if self.logger and node_id is not None:
             self.logger.set_tool(tool_name=tool_name, tool_input=raw_response, tool_output=result)
         return f"Tool used: '{tool_name}'({params})\nContent:\n```\n{result.content}\n```", tool_name

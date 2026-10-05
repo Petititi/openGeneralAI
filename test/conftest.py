@@ -20,9 +20,10 @@ except ImportError:
     pass
 
 import copy
-from types import SimpleNamespace
 
 import pytest
+
+from opengeneralai.llm.client import LLMResponse, Usage
 
 
 def pytest_addoption(parser):
@@ -47,35 +48,28 @@ def pytest_collection_modifyitems(config, items):
 
 
 class FakeLLM:
-    """Scripted stand-in for litellm.completion.
+    """Scripted LLMClient: returns the given replies in order and records the messages of each
+    call, so that the agent loop runs without network, API key or randomness."""
 
-    Returns the given replies in order and records the messages of each call, so that
-    the agent loop can be tested without network, API key or randomness.
-    """
+    model = "fake/scripted"
 
     def __init__(self, replies):
         self.replies = list(replies)
         self.calls = []
 
-    def completion(self, model, messages, **kwargs):
+    def complete(self, messages):
         if not self.replies:
             raise AssertionError(f"FakeLLM: no scripted reply left for call #{len(self.calls) + 1}")
         self.calls.append(copy.deepcopy(messages))
-        content = self.replies.pop(0)
+        text = self.replies.pop(0)
         prompt_tokens = sum(len(str(m.get("content", ""))) for m in messages) // 4
-        completion_tokens = len(content) // 4
-        usage = {"prompt_tokens": prompt_tokens, "completion_tokens": completion_tokens,
-                 "total_tokens": prompt_tokens + completion_tokens}
-        return SimpleNamespace(choices=[SimpleNamespace(message={"content": content})], usage=usage)
+        return LLMResponse(text, Usage(prompt_tokens, len(text) // 4), duration_s=0.01)
+
+    def cost(self, usage):
+        return usage.prompt_tokens * 1e-6 + usage.completion_tokens * 2e-6
 
 
 @pytest.fixture
-def fake_llm(monkeypatch):
-    """Replace the LLM used by the orchestrator: fake_llm([reply1, reply2, ...]) returns the FakeLLM."""
-    def install(replies):
-        fake = FakeLLM(replies)
-        monkeypatch.setattr("opengeneralai.agent.orchestrator.litellm.completion", fake.completion)
-        monkeypatch.setattr("opengeneralai.agent.orchestrator.cost_per_token",
-                            lambda model, prompt_tokens, completion_tokens: (prompt_tokens * 1e-6, completion_tokens * 2e-6))
-        return fake
-    return install
+def fake_llm():
+    """fake_llm([reply1, reply2, ...]) returns a FakeLLM to give to the Orchestrator."""
+    return FakeLLM

@@ -1,4 +1,3 @@
-from opengeneralai.config import AppConfig
 import json5
 from typing import Tuple, Callable, List
 
@@ -6,8 +5,7 @@ from opengeneralai.tracing.logger import TrajectoryLogger, _digest_messages
 from opengeneralai.constants import AgentStatus, StepStatus
 
 class ReasoningAgent:
-    def __init__(self, cfg: AppConfig, logger: TrajectoryLogger, ask_llm: Callable[[List[dict]], str]):
-        self.cfg = cfg
+    def __init__(self, logger: TrajectoryLogger, ask_llm: Callable[[List[dict]], str]):
         self.logger = logger
         self.ask_llm = ask_llm
 

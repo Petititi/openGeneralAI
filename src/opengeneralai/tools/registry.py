@@ -23,6 +23,8 @@ class ToolResult:
 class Tool(ABC):
     name: str
     signature: str
+    # True for tools that call the LLM themselves: run() then receives ask_llm(messages) -> str
+    needs_llm: bool = False
 
     @abstractmethod
     def run(self, **kwargs) -> ToolResult: ...

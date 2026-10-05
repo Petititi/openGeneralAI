@@ -4,7 +4,9 @@ from pathlib import Path
 
 import pytest
 
+from opengeneralai.agent.context import MemoryContext
 from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.llm.client import LiteLLMClient
 from opengeneralai.config import AppConfig
 import utils
 from opengeneralai.tools.registry import ToolRegistry
@@ -55,10 +57,11 @@ def test_file_editing():
     # --- Configuration creation
     cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
-    orchestrator = Orchestrator(cfg, tools_registry)
-    result, cost = orchestrator.process_user_message("Script `loader.py` doesn't start. Fix the mistake.")
+    orchestrator = Orchestrator(LiteLLMClient(cfg.model), tools_registry, user_lang=cfg.user_lang)
+    run = orchestrator.run("Script `loader.py` doesn't start. Fix the mistake.")
+    result = run.plan
 
-    orchestrator.last_trace.save(TRACES_DIR / "file_editing_tools.json")
+    run.trace.save(TRACES_DIR / "file_editing_tools.json")
 
     assert result is not None
     assert "plan_steps" in result
@@ -252,10 +255,11 @@ def test_file_editing_only_bash():
     # --- Configuration creation
     cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
-    orchestrator = Orchestrator(cfg, tools_registry)
-    result, cost = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+    orchestrator = Orchestrator(LiteLLMClient(cfg.model), tools_registry, user_lang=cfg.user_lang)
+    run = orchestrator.run("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
+    result = run.plan
 
-    orchestrator.last_trace.save(TRACES_DIR / "file_editing_bash.json")
+    run.trace.save(TRACES_DIR / "file_editing_bash.json")
 
     assert result is not None
     assert "plan_steps" in result
@@ -333,21 +337,23 @@ def test_search_context_add_method():
     ENV_PATH = os.getcwd() + "/.env"
     cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
-    orchestrator = Orchestrator(cfg, tools_registry)
+    orchestrator = Orchestrator(LiteLLMClient(cfg.model), tools_registry, user_lang=cfg.user_lang,
+                                memory=MemoryContext(ltm))
 
-    tools_registry.register(SearchContext(ltm, ask_llm=orchestrator.safe_ask))
+    tools_registry.register(SearchContext(ltm))
     tools_registry.register(utils.ReadFile(fs))
     tools_registry.register(utils.EditFile(fs))
     tools_registry.register(utils.RunProg(fs, validation_lambda))
     
     # 6) Demander au LLM d'ajouter une méthode get_summary
-    result, cost = orchestrator.process_user_message(
+    run = orchestrator.run(
         "Add a method 'get_summary' to the LongTermMemory class "
         "that returns a summary of the memory statistics (documents, chunks, classes, functions)."
     )
+    result = run.plan
 
     # 7) Sauvegarder la trace pour debug
-    orchestrator.last_trace.save(TRACES_DIR / "search_context.json")
+    run.trace.save(TRACES_DIR / "search_context.json")
 
     # 8) Assertions
     assert result is not None

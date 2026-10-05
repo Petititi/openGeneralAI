@@ -5,7 +5,8 @@ import time, uuid, json, hashlib
 import copy
 from pathlib import Path
 
-Phase = Literal["start", "plan/create", "plan/update", "plan/recover", "act/run", "done"]
+# "context": memory search before planning; "act/llm": LLM call made by a tool during an action
+Phase = Literal["start", "context", "plan/create", "plan/update", "plan/recover", "act/run", "act/llm", "done"]
 
 def _digest_messages(messages: List[Dict[str, Any]]) -> str:
     joined = "\n".join(f"{m.get('role')}:{m.get('content','')}" for m in messages)
@@ -102,18 +103,32 @@ class TrajectoryLogger:
         self.current_node_id = node_id
         return node_id
 
+    def add_side_node(self, *, phase: Phase, turn: int, tags: Optional[Dict[str, Any]] = None) -> str:
+        """Add a child of the current node without making it the current node.
+
+        Used for the LLM calls a tool makes while the action node is still being filled.
+        """
+        current = self.current_node_id
+        node_id = self.add_node(phase=phase, turn=turn, tags=tags)
+        self.current_node_id = current
+        return node_id
+
     def current_node(self) -> LogNode:
         node_id = self.current_node_id
         if node_id is None:
             raise Exception("No current node: call add_node() first")
         return self.nodes[node_id]
 
-    def set_questions(self, prompt_messages: List[Dict[str, Any]]):
-        n = self.current_node()
+    def _node(self, node_id: Optional[str]) -> LogNode:
+        return self.nodes[node_id] if node_id else self.current_node()
+
+    def set_questions(self, prompt_messages: List[Dict[str, Any]], node_id: Optional[str] = None):
+        n = self._node(node_id)
         n.prompt_messages = copy.deepcopy(prompt_messages)
 
-    def set_response(self, raw_response: str, token_usage: Optional[List[int]] = None, duration_s: Optional[float] = None):
-        n = self.current_node()
+    def set_response(self, raw_response: str, token_usage: Optional[List[int]] = None, duration_s: Optional[float] = None,
+                     node_id: Optional[str] = None):
+        n = self._node(node_id)
         n.raw_response = raw_response
         n.token_usage = token_usage
         n.duration_s = duration_s

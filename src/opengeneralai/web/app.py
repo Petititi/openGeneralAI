@@ -7,7 +7,9 @@ import litellm
 
 from opengeneralai.llm import catalog as llm_interactions
 from opengeneralai.config import AppConfig
+from opengeneralai.agent.context import MemoryContext
 from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.llm.client import LiteLLMClient
 from opengeneralai.tools import registry as tools_module
 from opengeneralai.tools import memory_search as memory_tools_module
 from opengeneralai.memory.longterm_memory import LongTermMemory
@@ -55,9 +57,9 @@ ltm = LongTermMemory(
     faiss_index_path=cfg.faiss_index_path
 )
 ltm.add_folder(str(ROOT_FOLDER))
+memory = MemoryContext(ltm)
 tools_registry = tools_module.ToolRegistry()
-orchestrator = Orchestrator(cfg, tools_registry, ltm=ltm)
-tools_registry.register(memory_tools_module.SearchContext(ltm, ask_llm=orchestrator.safe_ask))
+tools_registry.register(memory_tools_module.SearchContext(ltm))
 
 
 @app.after_request
@@ -136,11 +138,13 @@ def ask():
         return jsonify({"ok": False, "answer": "Question cannot be empty or whitespace only."}), 400
     
     try:
-        plan, cost = orchestrator.process_user_message(sanitized_question)
+        # The model may change through /api/config: build the (stateless) orchestrator per request
+        orchestrator = Orchestrator(LiteLLMClient(cfg.model), tools_registry, user_lang=cfg.user_lang, memory=memory)
+        result = orchestrator.run(sanitized_question)
     except Exception as e:
         return jsonify({"ok": False, "answer": str(e)}), 400
 
-    return jsonify({"ok": True, "answer": format_answer(plan, cost)})
+    return jsonify({"ok": True, "answer": format_answer(result.plan, result.cost)})
 
 
 def format_answer(plan: dict, cost: float) -> str:

@@ -17,6 +17,8 @@ import pytest
 import json
 from unittest.mock import Mock, MagicMock, patch, create_autospec
 
+from opengeneralai.agent.context import MemoryContext
+
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -42,6 +44,14 @@ def config():
         pytest.skip("LLM not configured")
     
     return cfg
+
+
+def real_ask(config):
+    """Send messages to the configured LLM (these tests used to fall back without calling it:
+    the trace the orchestrator needed was not initialized)."""
+    from opengeneralai.llm.client import LiteLLMClient
+    client = LiteLLMClient(config.model)
+    return lambda messages: client.complete(messages).text
 
 
 @pytest.fixture
@@ -150,20 +160,13 @@ class TestRealLLMQueryAnalysis:
     
     def test_analyze_code_question_real_llm(self, config, mock_tools, mock_ltm):
         """Test LLM analysis of a code-related question"""
-        from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
+        orch = MemoryContext(mock_ltm)
+        ask = real_ask(config)
         
         query = "How does the Orchestrator class work?"
         
         # Call the real LLM for query analysis
-        result = orch._analyze_query_for_memory(query)
+        result = orch.analyze_query(query, ask)
         
         # Verify the result structure
         assert "should_search" in result
@@ -189,19 +192,12 @@ class TestRealLLMQueryAnalysis:
     
     def test_analyze_non_code_question_real_llm(self, config, mock_tools, mock_ltm):
         """Test LLM analysis of a non-code question"""
-        from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
+        orch = MemoryContext(mock_ltm)
+        ask = real_ask(config)
         
         query = "What is the capital of France?"
         
-        result = orch._analyze_query_for_memory(query)
+        result = orch.analyze_query(query, ask)
         
         assert "should_search" in result
         assert isinstance(result["should_search"], bool)
@@ -212,19 +208,12 @@ class TestRealLLMQueryAnalysis:
     
     def test_analyze_implementation_question_real_llm(self, config, mock_tools, mock_ltm):
         """Test LLM analysis of implementation questions"""
-        from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
+        orch = MemoryContext(mock_ltm)
+        ask = real_ask(config)
         
         query = "Find and show me the get_class_code method implementation"
         
-        result = orch._analyze_query_for_memory(query)
+        result = orch.analyze_query(query, ask)
         
         assert result["should_search"] is True
         assert len(result["symbols"]) > 0
@@ -239,17 +228,10 @@ class TestRealSymbolSearch:
     
     def test_search_existing_class(self, config, mock_tools, mock_ltm):
         """Test searching for a class"""
-        from opengeneralai.agent.orchestrator import Orchestrator
+        orch = MemoryContext(mock_ltm)
+        ask = real_ask(config)
         
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
-        
-        results = orch._search_symbol_comprehensive("Orchestrator")
+        results = orch.search_symbol("Orchestrator")
         
         assert len(results) > 0
         assert results[0].get("chunk_type") == "class"
@@ -257,17 +239,10 @@ class TestRealSymbolSearch:
     
     def test_search_function(self, config, mock_tools, mock_ltm):
         """Test searching for a function"""
-        from opengeneralai.agent.orchestrator import Orchestrator
+        orch = MemoryContext(mock_ltm)
+        ask = real_ask(config)
         
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
-        
-        results = orch._search_symbol_comprehensive("_get_relevant_context")
+        results = orch.search_symbol("_get_relevant_context")
         
         assert len(results) > 0
         print(f"\nFound {len(results)} results for '_get_relevant_context'")
@@ -278,43 +253,18 @@ class TestRealContextRetrieval:
     
     def test_get_relevant_context_class_query(self, config, mock_tools, mock_ltm):
         """Test retrieving context for a class-related query"""
-        from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
+        orch = MemoryContext(mock_ltm)
+        ask = real_ask(config)
         
         query = "How is the Orchestrator class implemented?"
         
-        context = orch._get_relevant_context(query)
+        context = orch.retrieve(query, ask)
         
         assert context is not None
         assert len(context) > 0
         assert "Orchestrator" in context
         
         print(f"\nContext length: {len(context)} chars")
-    
-    def test_get_relevant_context_no_ltm(self, config, mock_tools):
-        """Test context retrieval when no LTM is available"""
-        from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=None,
-                max_turn=3
-            )
-        
-        query = "Test query"
-        
-        context = orch._get_relevant_context(query)
-        
-        assert context == ""
 
 
 class TestRealIntegration:
@@ -322,20 +272,12 @@ class TestRealIntegration:
     
     def test_full_rag_pipeline(self, config, mock_tools, mock_ltm):
         """Test the complete RAG pipeline"""
-        from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3,
-                max_context_tokens=2000
-            )
+        orch = MemoryContext(mock_ltm, max_context_tokens=2000)
+        ask = real_ask(config)
         
         query = "Find the Orchestrator class and explain how it processes user messages"
         
-        context = orch._get_relevant_context(query)
+        context = orch.retrieve(query, ask)
         
         assert context is not None
         assert len(context) > 0
@@ -349,32 +291,18 @@ class TestRealIntegration:
         print(f"  Context length: {len(context)} chars")
     
     def test_memory_context_injection(self, config, mock_tools, mock_ltm):
-        """Test that memory context is properly injected into messages"""
+        """The memory context reaches the planning prompt, right after the core prompt"""
         from opengeneralai.agent.orchestrator import Orchestrator
-        
-        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
-            orch = Orchestrator(
-                cfg=config,
-                tools=mock_tools,
-                ltm=mock_ltm,
-                max_turn=3
-            )
-        
-        query = "How does the add method work?"
-        context = orch._get_relevant_context(query)
-        
-        messages = [
-            {"role": "system", "content": orch.core_prompt},
-            {"role": "user", "content": query}
-        ]
-        
-        enhanced_messages = orch._inject_memory_context(messages, context)
-        
-        assert len(enhanced_messages) > len(messages)
-        
-        print(f"\nContext injection test:")
-        print(f"  Original messages: {len(messages)}")
-        print(f"  Enhanced messages: {len(enhanced_messages)}")
+        from opengeneralai.llm.client import LiteLLMClient
+
+        orchestrator = Orchestrator(LiteLLMClient(config.model), mock_tools, memory=MemoryContext(mock_ltm), max_turns=1)
+        result = orchestrator.run("How does the add method work?")
+
+        plan_node = next(n for n in result.trace.nodes.values() if n.phase == "plan/create")
+        assert plan_node.prompt_messages[1]["content"].startswith("Relevant context from the codebase")
+
+        print("\nContext injection test:")
+        print(f"  Planning prompt: {len(plan_node.prompt_messages)} messages")
 
 
 if __name__ == "__main__":

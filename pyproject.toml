@@ -13,6 +13,7 @@ dependencies = [
     "Flask",
     "Flask-Cors",
     "litellm",
+    "openai",           # LiteLLM errors derive from openai.APIError
     "python-dotenv",
     "json5",
     "numpy",
