@@ -2,245 +2,122 @@
 
 ## Project Overview
 
-This is a **production-ready LLM reasoning agent framework** supporting multiple providers (OpenAI, Anthropic, Mistral, etc.) with a focus on structured agent loops, long-term memory, and observability. The system uses a **reasoning-then-action** architecture with trajectory logging and tree-based decision tracking.
+A **LLM reasoning agent** (plan → act → check) supporting the providers of LiteLLM, with a
+long-term memory of code and a trace of every run. It is the companion code of the blog series
+*Building LLM Coding Agents*: each article has a git tag (see `README.md`). Read
+`docs/ARCHITECTURE.md` first: layout, dependency rule, steps of a run, errors.
 
 ## Core Architecture
 
-### Agent Loop (Orchestrator Pattern)
-The system follows a **plan → act → verify** cycle coordinated by `Orchestrator`:
+`src/opengeneralai/` is an installable package (`pip install -e ".[dev]"`).
 
-1. **ReasoningAgent** creates/updates plans as JSON with structured steps (`descr`, `status`, `next_step_criteria`)
-2. **ActionAgent** executes tool calls strictly one-per-turn, outputting only JSON
-3. **TrajectoryLogger** maintains a tree of execution nodes with full prompt/response history
-4. Loop continues max 10 turns or until all plan steps are `"done"`
+### Agent loop (`agent/`)
+`Orchestrator.run(question) -> RunResult` (plan, done, turns, usage, cost, trace, error):
 
-**Key file**: `agents/orchestrator.py` - Study `process_user_message()` for the complete flow.
+1. `Planner` (`planner.py`) creates the plan, then after each action asks for a decision
+   (`NEXT_TASK`, `DONE`, `NEW_PLAN`) and writes a new plan from the existing one when needed.
+2. `Executor` (`executor.py`) asks for **one** tool call per turn and runs it.
+3. Everything that belongs to one question lives in a `Run` (`run.py`): trace, usage, turn.
+   **The orchestrator keeps no state between questions**: never store per-question data on it.
 
-### Message Scratchpad Pattern
-Messages accumulate as a "scratchpad" through `logger.get_current_interaction()`:
-- System prompts define agent behavior (reasoning rules, tool schemas)
-- User messages provide context and task descriptions  
-- Assistant responses contain plans or tool calls
-- Tool results feed back as user messages
+The plan is typed (`plan.py`: `Plan`, `Step`, `StepStatus`, `PlanDecision`). Parse LLM answers
+with `parse_plan`, `parse_decision`, `parse_action`, or `json_parsing.parse_llm_json`: they
+raise `PlanParseError` / `ToolCallError`, never return half-parsed dicts.
 
-**Critical**: `clean_message_history()` filters/limits context to prevent overflow. Always maintain message role discipline.
+### Conversation
+The prompt of each LLM call is: core system prompt, memory context (if any), the question, the
+last `history_size` messages (each action as an `assistant` message, followed by its result as
+a `user` message), then the system prompt of the step. Keep this role discipline.
 
-### Strict JSON Communication
-All agent responses MUST be valid JSON5:
-- **ReasoningAgent** outputs: `{"plan_steps": [{"descr": "...", "status": "done|todo", "next_step_criteria": "..."}]}`
-- **ActionAgent** outputs: `{"tool_name": "...", "arguments": {...}}`
-- No mixed text+JSON. Use `clean_raw_response()` to strip markdown code blocks.
-- Parsing failures trigger recovery via `improve_plan=True`
+### Prompts (`agent/prompts.py`)
+Every prompt of the loop is there, as a `str.format()` template (literal braces doubled).
+Do not write prompts inline in other modules. A tool owns the prompts of its own LLM calls.
 
-### Provider-Specific Quirks
-**Mistral devstral-small-250X models ignore system messages** - see `safe_ask()` in `orchestrator.py`:
-```python
-# Workaround: merge system messages into first user message
-if self.cfg.model.startswith("mistral/devstral-small-250"):
-    # Concatenate all system content to first user message
-```
-Always test new providers against this pattern.
+### LLM access (`llm/client.py`)
+The agent only knows `LLMClient` (`complete(messages) -> LLMResponse`, `cost(usage)`).
+`LiteLLMClient` holds the provider quirks (e.g. `mistral/devstral-small-250x` ignores system
+messages: `merge_system_messages`) and maps provider errors to `LLMError` subclasses. Test new
+providers against these quirks here, not in the agent.
 
-## Long-Term Memory System
+## Long-Term Memory (`memory/`)
 
-**File**: `storage/longterm_memory.py` - Three-layer architecture:
+- `database.py` (SQLite + FTS5): documents, chunks with tree-sitter metadata, imports.
+  Stores paths, not copies of the files.
+- `embeddings.py` (FAISS + SentenceTransformer, optional extra `embeddings`): normalized vectors,
+  class embedding = weighted average of its methods (`docs/memory/`). Call `persist()` after
+  bulk adds.
+- `longterm_memory.py`: `LongTermMemory`, hybrid search (keyword + semantic), `add_folder()`.
+  CLI: `python -m opengeneralai.memory.longterm_memory search "query" --mode hybrid`.
+- `agent/context.py`: `MemoryContext.retrieve(question, ask)` builds the code context added to
+  the prompts; its LLM call is traced in a `context` node.
 
-### 1. DatabaseManager (SQLite + FTS5)
-- Stores documents, chunks (with tree-sitter parsed metadata), imports
-- Full-text search via `chunks_fts` virtual table
-- Metadata queries: `get_class_code()`, `get_methods_by_class()`, `list_all_classes()`
-- **No file copying** - stores only paths; verify integrity with `check_file_integrity()`
+## Tool System (`tools/registry.py`)
 
-### 2. EmbeddingManager (FAISS + SentenceTransformer)
-- Uses `mixedbread-ai/mxbai-embed-large-v1` by default
-- L2-normalized vectors for cosine similarity via `IndexFlatIP`
-- **Class embedding strategy**: Weighted average of method embeddings (see `WEIGHTED_CLASS_EMBEDDING_DOC.md`)
-- Always call `persist()` after bulk adds
-
-### 3. LongTermMemory (Orchestrator)
-- **Hybrid search** (α=0.5): Min-max normalized keyword + semantic fusion
-- Tree-sitter parsing extracts: functions, classes, methods, imports for 15+ languages
-- CLI available: `python storage/longterm_memory.py search "query" --mode hybrid`
-
-**When indexing new files**: Use `add_folder()` for robustness - skips unparseable files with warnings.
-
-## Tool System
-
-**Registry pattern** in `agents/tools/ToolRegistry.py`:
 ```python
 class Tool(ABC):
     name: str
-    signature: str  # Shown to LLM in prompt
-    def run(self, **kwargs) -> ToolResult
+    signature: str          # shown to the LLM: must match the run() arguments
+    needs_llm: bool = False # True: run() also receives ask_llm(messages) -> str
+    def run(self, **kwargs) -> ToolResult: ...  # ToolResult(ok, content, meta={"error": ...})
 ```
 
-**ToolResult contract**:
-- `ok: bool` - Success flag (checked in `execute_action()`)
-- `content: str` - Main output returned to agent
-- `meta: Dict[str, Any]` - Logged metadata (params, errors)
+Register tools in a `ToolRegistry` given to the `Orchestrator`. Tools must not import `agent/`.
+Examples: `test/utils.py` (`ReadFile`, `EditFile`, `RunProg`), `tools/memory_search.py`.
 
-**Creating new tools**:
-1. Inherit from `Tool`, define `name` and `signature` (function-like syntax for LLM)
-2. Implement `run()` returning `ToolResult(ok=True, content="...", meta={...})`
-3. Register in orchestrator: `tools_registry.register(YourTool())`
+## Configuration
 
-See `test/utils.py` for minimal examples: `ReadFile`, `EditFile`, `RunProg`.
+`config.py` (`AppConfig`): `config.json` (provider, model, user_lang, memory paths) and the API
+keys in `.env` (`{PROVIDER}_API_KEY`). A missing `config.json` is created with defaults; an
+unknown provider or model is replaced, the other settings are kept. Only the web app and
+`apps/` use it: the agent receives plain values.
 
-## Configuration & Environment
+## Web app (`web/app.py`)
 
-**Two-file system**: `config.json` + `.env`
+`create_app(root, cfg, make_orchestrator)` builds the Flask app; nothing happens at import
+time. Errors meant for the user (`errors.py`) are returned as JSON (502 for LLM errors), other
+exceptions as a generic 500. Only `viewer/` and `traces/*.json` are served from the repository:
+never serve the project root (it holds `.env`). No inline script or style in the pages (CSP).
 
-- `AppConfig` (configurator.py) validates provider/model against LiteLLM's registry
-- API keys stored in `.env` as `{PROVIDER}_API_KEY` (e.g., `MISTRAL_API_KEY`)
-- Provider detection: `llm_interactions.get_providers_and_models()` queries LiteLLM
+## Tracing (`tracing/logger.py`)
 
-**Validation flow**:
-1. Check provider in `litellm.models_by_provider`
-2. Verify model in provider's model list
-3. Ensure API key exists via `get_env_name_for(provider)`
-4. `need_configuration` property gates UI redirects
-
-**Never hardcode API keys** - use `save_api_key()` to write to `.env` atomically.
-
-## Trajectory Logging & Debugging
-
-**Tree-based execution traces** via `TrajectoryLogger`:
-
-- Each `add_node()` creates a decision point with: `phase`, `turn`, `prompt_messages`, `raw_response`, `plan_snapshot`, `tool_name/input/output`
-- Each trace keeps its own current node (`current_node_id`): the next `add_node()` becomes its child
-- Export to JSON: `orchestrator.last_trace.save("traces/my_run.json")`
-
-**Debug workflow**:
-1. Run orchestrator, save trace: `orchestrator.last_trace.save("traces/my_run.json")`
-2. Open it with the viewer: http://localhost:12000/viewer/?trace=/traces/my_run.json (see `viewer/README.md`)
-3. Inspect tree in browser - nodes show full prompts, plans, tool calls
-4. Viewer: `viewer/` (static page, Cytoscape + custom rendering); `traces/examples/` holds real runs
-
-**Test pattern** (see `test/test_agent_loop.py`, scripted LLM with the `fake_llm` fixture):
-```python
-llm = fake_llm([plan_json, action_json, '{"status": "DONE"}'])  # one reply per LLM call
-orchestrator = Orchestrator(cfg, tools_registry)
-result, cost = orchestrator.process_user_message("Task...")
-orchestrator.last_trace.save(TRACES_DIR / "my_scenario.json")
-assert all(step["status"] == "done" for step in result["plan_steps"])
-```
+`TrajectoryLogger`: one node per step (`start`, `context`, `plan/create`, `plan/update`,
+`plan/recover`, `act/run`, `act/llm`, `done`) with the messages sent, the raw answer, the plan,
+the tool call, tokens and duration. `result.trace.save("traces/x.json")`, then open
+http://localhost:12000/viewer/?trace=/traces/x.json (`viewer/README.md`).
 
 ## Development Workflows
 
-### Running the Flask UI
-```bash
-PORT=12000 python app.py
-# Visit http://localhost:12000/ for chat UI
-# Visit http://localhost:12000/config for provider selection
-```
-
-### Testing with Custom Tools
-Create in-memory filesystem and validation lambdas (see `test/test_simple_scenario.py`):
-```python
-fs = InMemoryFS({"file.py": "content"})
-tools = ToolRegistry()
-tools.register(ReadFile(fs))
-orchestrator = Orchestrator(cfg, tools)
-```
-
-### Indexing Codebase for Memory
-```bash
-cd storage
-python longterm_memory.py index ../agents
-python longterm_memory.py search "tool execution" --mode hybrid
-python longterm_memory.py list-classes  # See all indexed classes
-```
-
-### Running Tests
 ```bash
 pip install -e ".[dev]"
 ruff check .
-pytest                # deterministic tests only (CI runs the same)
-pytest --run-llm      # also the tests marked `llm`, which call the configured LLM for real
+pytest              # no network, no API key: FakeLLM in test/conftest.py
+pytest --run-llm    # also the tests marked llm (real LLM, API key in .env)
+python app.py       # http://localhost:12000/
 ```
+
+Test pattern (`test/test_agent_loop.py`):
+```python
+llm = fake_llm([plan_json, action_json, '{"status": "DONE"}'])  # one reply per LLM call
+result = Orchestrator(llm, tools).run("Task...")
+result.trace.save(TRACES_DIR / "my_scenario.json")
+assert result.done and len(llm.calls) == 3
+```
+Scenario tools never execute the code written by the LLM (`simulate_loader` reads it with `ast`).
 
 ## Critical Conventions
 
-### 1. Turn Budget Enforcement
-**Max 6 turns per task** - hardcoded in reasoning agent prompts. Plans must include validation as final step.
-
-### 2. User Language Handling
-- Primary output language: `cfg.user_lang` (default: "English")
-- JSON keys never translated - only values shown to users
-- System prompts specify: `"Always reply in {self.cfg.user_lang}"`
-
-### 3. Token Usage Tracking
-Orchestrator accumulates: `self.token_count`, `self.in_token`, `self.out_token`
-- Per-response tracked in `safe_ask()` via `llm_response.usage`
-- Cost calculated: `litellm.cost_per_token(model, prompt_tokens, completion_tokens)`
-
-### 4. Error Recovery
-- **ReasoningAgent**: If plan update fails, retry with `improve_plan=True` (full re-plan)
-- **ActionAgent**: Tool failures set `error` field, feed back as user message
-- LiteLLM exceptions: Wrap in descriptive strings (`"Rate limit exceeded: try again later"`)
-
-### 5. Message Role Discipline
-- **system**: Instructions, tool schemas, plan templates
-- **user**: Tasks, tool results, context
-- **assistant**: Plans, tool calls (JSON only)
-
-Never mix roles - breaks model context understanding.
-
-## File Organization
-
-```
-agents/
-  orchestrator.py      # Main loop coordinator
-  reasoning.py         # Plan creation/update logic
-  action.py            # Tool execution wrapper
-  logger.py            # Trajectory tree + HTML export
-  tools/ToolRegistry.py  # Tool registration
-
-storage/
-  longterm_memory.py   # Main API (add, search, get)
-  DatabaseManagement.py  # SQLite + FTS5 ops
-  EmbeddingManagement.py # FAISS + embeddings
-
-templates/
-  index.html           # Chat UI
-  config.html          # Provider selection
-
-static/                # JS/CSS of the chat and config pages (no inline scripts: see the CSP in app.py)
-
-viewer/                # Trace viewer (index.html, embed.html for iframes)
-traces/                # Traces written by the tests; examples/ holds real runs
-
-test/
-  test_simple_scenario.py  # Integration tests
-  utils.py             # Mock tools (ReadFile, EditFile, RunProg)
-```
+1. **No state on the orchestrator**: per-question data goes in `Run`.
+2. **Typed errors**: raise `errors.py` classes for what the user can act upon; do not swallow
+   exceptions silently (log them), do not return error strings instead of raising.
+3. **User language**: `user_lang` goes into the core prompt; JSON keys are never translated.
+4. **Dependencies**: `web -> agent -> llm, tools, tracing, memory -> errors, json_parsing`.
+5. **Tests**: every bug fix comes with a test that fails without it.
 
 ## Common Pitfalls
 
-1. **Forgetting to normalize embeddings** - Always use `normalize=True` in `encode()` for cosine similarity
-2. **Not persisting FAISS index** - Call `embeddings.persist()` after adds
-3. **Tool signature mismatches** - LLM sees `signature`, must match `run(**kwargs)` params exactly
-4. **Ignoring turn limits** - Plans that don't finish in 6 turns fail silently (no FINAL emitted)
-5. **Tree-sitter language codes** - Use exact keys from `SUPPORTED_CODE_EXT` (e.g., `"c_sharp"` not `"csharp"`)
-
-## When Adding Features
-
-1. **New provider**: Add to LiteLLM models, test system message handling in `safe_ask()`
-2. **New tool**: Define schema in `signature`, implement `run()`, add to registry in `app.py`
-3. **New language**: Add to `SUPPORTED_CODE_EXT`, ensure tree-sitter-languages supports it
-4. **New search mode**: Extend `search()` hybrid fusion logic in `longterm_memory.py`
-
-## References
-
-- **LiteLLM docs**: https://docs.litellm.ai/ (unified API for providers)
-- **Tree-sitter**: https://tree-sitter.github.io/ (code parsing)
-- **FAISS**: https://github.com/facebookresearch/faiss (vector search)
-- **Design principles**: See `README.md` sections on "Why Are Reasoning Agents Challenging" and "Design Principles"
-
-## Quick Start for New Contributors
-
-1. Set API key: `echo MISTRAL_API_KEY=your_key > .env`
-2. Run server: `python app.py`
-3. Test agent: Visit UI, submit "Calculate 5 + 3" (requires Calculator tool)
-4. Inspect trace: run `pytest`, then open http://localhost:12000/viewer/?trace=/traces/fake_file_editing.json
-5. Read code flow: `app.py` → `orchestrator.py` → `reasoning.py` + `action.py`
+1. **Tool signature mismatches**: the LLM sees `signature`, it must match `run(**kwargs)`.
+2. **Prompt braces**: templates go through `.format()`; double the literal braces.
+3. **Normalized embeddings**: use `normalize=True` in `encode()` for cosine similarity.
+4. **Tree-sitter language codes**: use the keys of `SUPPORTED_CODE_EXT` (`"c_sharp"`, not `"csharp"`).
+5. **apps/souvenir/** is work in progress with known bugs (see its README); `gmail_memory_assistant.py`
+   is excluded from the lint.

@@ -151,7 +151,7 @@ Les modifications sont rétrocompatibles :
 
 ## Fichiers Modifiés
 
-- `agents/tools/longterm_memory.py` : Logique principale
+- `src/opengeneralai/memory/longterm_memory.py` : Logique principale
 - Tests créés :
   - `test_weighted_class_embedding.py` : Test basique
   - `test_advanced_weighted_embedding.py` : Test démonstratif avancé

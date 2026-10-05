@@ -90,3 +90,44 @@ class RunProg(Tool):
         if not valid:
             return ToolResult(False, "", meta={"error": output})
         return ToolResult(True, output, meta={"cmd": cmd})
+
+# ---------- Simulated "python loader.py" for the loader scenario ----------
+def simulate_loader(source: str, compile_only: bool = False) -> Tuple[bool, str]:
+    """What Python would do with loader.py, decided from its code (never executed).
+
+    The scenario: print('time:' + time.time()) fails until the module time is imported and
+    the float converted with str(). The code is read with ast, not searched for substrings:
+    "from time import time" contains "import time" but binds the function, so time.time()
+    then fails (a substring check once validated that wrong fix, see blog article 02-b).
+    compile_only simulates "python -m py_compile", which compiles without running.
+    """
+    import ast
+
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as e:
+        return False, f"SyntaxError: {e}"
+    if compile_only:
+        return True, ""
+
+    nodes = list(ast.walk(tree))
+    imports_module = any(isinstance(n, ast.Import) and any(a.name == "time" and a.asname is None for a in n.names)
+                         for n in nodes)
+    imports_function = any(isinstance(n, ast.ImportFrom) and n.module == "time"
+                           and any((a.asname or a.name) == "time" for a in n.names) for n in nodes)
+
+    def is_time_call(n):
+        return (isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute) and n.func.attr == "time"
+                and isinstance(n.func.value, ast.Name) and n.func.value.id == "time")
+
+    calls = [n for n in nodes if is_time_call(n)]
+    wrapped = [n for n in nodes if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "str" and any(is_time_call(a) for a in n.args)]
+
+    if not imports_module and not imports_function:
+        return False, "NameError: name 'time' is not defined"
+    if imports_function and not imports_module and calls:
+        return False, "AttributeError: 'builtin_function_or_method' object has no attribute 'time'"
+    if calls and len(wrapped) < len(calls):
+        return False, "TypeError: can only concatenate str (not 'float') to str"
+    return True, f"time:{time.time()}"

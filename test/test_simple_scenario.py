@@ -32,12 +32,7 @@ def test_file_editing():
             # look for loader.py in params:
             if "loader.py" in params:
                 try:
-                    content = fs.read("loader.py")
-                    if "import time" in content and "str(" in content:
-                        return True, f"time:{time.time()}"
-                    if "import time" in content:
-                        return False, "TypeError: can only concatenate str (not 'float') to str"
-                    return False, "NameError: name 'time' is not defined"
+                    return utils.simulate_loader(fs.read("loader.py"), compile_only="py_compile" in params)
                 except FileNotFoundError as e:
                     return False, f"File not found: {e}"
         return False, "Invalid command"
@@ -69,7 +64,7 @@ def test_file_editing():
     for step in result["plan_steps"]:
         assert step["status"] == "done"
     # the file should also be modified correctly:
-    assert validation_lambda("python loader.py")[0] == True
+    assert validation_lambda("python loader.py")[0] is True
 
 def parse_sed_expr(expr: str):
     r"""Parse l'expression à l'intérieur des quotes."""
@@ -229,12 +224,8 @@ def test_file_editing_only_bash():
             # look for loader.py in params:
             if "loader.py" in params:
                 try:
-                    content = fs.read("loader.py")
-                    if "import time" in content and "str(" in content:
-                        return True, f"time:{time.time()}"
-                    if "import time" in content:
-                        return False, "python: TypeError: can only concatenate str (not 'float') to str"
-                    return False, "python: NameError: name 'time' is not defined"
+                    ok, output = utils.simulate_loader(fs.read("loader.py"), compile_only="py_compile" in params)
+                    return ok, output if ok else f"python: {output}"
                 except FileNotFoundError as e:
                     return False, f"python: File not found: {e}"
             if "-c" in params:
@@ -267,7 +258,7 @@ def test_file_editing_only_bash():
     for step in result["plan_steps"]:
         assert step["status"] == "done"
     # the file should also be modified correctly:
-    assert validation_lambda("python loader.py")[0] == True
+    assert validation_lambda("python loader.py")[0] is True
 
 
 def test_search_context_add_method():

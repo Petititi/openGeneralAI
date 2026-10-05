@@ -9,10 +9,6 @@ class OpenGeneralAIError(Exception):
     """Base class of the errors the user can act upon."""
 
 
-class ConfigError(OpenGeneralAIError):
-    """Missing or invalid configuration."""
-
-
 class LLMError(OpenGeneralAIError):
     """The call to the LLM failed."""
 

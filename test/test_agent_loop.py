@@ -6,7 +6,6 @@ the trace it writes in traces/ can be opened with the viewer (see viewer/README.
 """
 
 import json
-import time
 from pathlib import Path
 
 from unittest.mock import Mock
@@ -26,12 +25,7 @@ def make_tools(fs):
     def run_python(cmd):
         if cmd.split() != ["python", "loader.py"]:
             return False, "Invalid command"
-        content = fs.read("loader.py")
-        if "import time" in content and "str(" in content:
-            return True, f"time:{time.time()}"
-        if "import time" in content:
-            return False, "TypeError: can only concatenate str (not 'float') to str"
-        return False, "NameError: name 'time' is not defined"
+        return utils.simulate_loader(fs.read("loader.py"))
 
     tools = ToolRegistry()
     tools.register(utils.ReadFile(fs))

@@ -12,40 +12,51 @@ This repository is the companion code of the blog series [Building LLM Coding Ag
 | 01-b Plug a real LLM | `01-b-real-LLM` |
 | 02-a Reasoning tools | `02-a-reasoning-tools` |
 | 02-b Debugging tools | `02-b-debugging-tools` |
+| 02-c Hardening and restructuring | `02-c-hardening` |
 
 ```bash
 git checkout -b my-branch tags/02-a-reasoning-tools
 ```
 
-`master` is ahead of the published articles (long-term memory, Souvenir, Gmail import).
+`master` is ahead of the published articles (long-term memory, Souvenir and Gmail import in `apps/souvenir/`).
 
 > **Security note**: from commit `f6c2664` (September 2025) until the fix of October 2026, `app.py` served every file of the project folder over HTTP, including `.env` and its API keys. If you ran one of these versions on a machine reachable from a network, revoke your API keys. The tags above are not affected.
 
-## Current Implementation (Minimal Example)
+## What is in the repository
 
-A lightweight Flask server with Bootstrap UI:
+- `src/opengeneralai/`: the agent, an installable package
+  - `agent/`: the plan → act → check loop (`Orchestrator.run(question)`)
+  - `llm/`: access to the LLMs through LiteLLM (`LLMClient`)
+  - `tools/`: tool interface and the memory search tool
+  - `tracing/`: trace of each run, as a tree saved in JSON
+  - `memory/`: long-term memory of code (tree-sitter, SQLite FTS5, FAISS)
+  - `web/`: Flask app (chat page, configuration page, trace viewer)
+- `apps/souvenir/`: personal memory assistant and Gmail import (work in progress)
+- `viewer/` and `traces/`: trace viewer and example traces
+- `docs/ARCHITECTURE.md`: how the pieces fit together
 
-- Homepage: Submit queries and view dynamic responses.
+## Quick Start
 
-- Configuration: Select verified providers/models via dropdown.
+```bash
+pip install -r requirements.txt    # everything; "pip install -e ." for the core only
+python app.py                      # http://localhost:12000/
+```
 
-- API Endpoints: /ask (query handling), /api/config (persists settings to config.json).
-
-Note: This intentionally minimal example lacks full agent loops or real tools. It serves as a foundation for integrating models and tooled execution.
-
-## Quick Start (Flask Example)
-
-Install: pip install -r requirements.txt
-
-Launch: PORT=12000 python app.py
-
-Access:
-
-- Home: http://localhost:12000/
-
+- Home: http://localhost:12000/ (redirects to the configuration page until an API key is set)
 - Config: http://localhost:12000/config
-
 - Trace viewer: http://localhost:12000/viewer/?trace=/traces/examples/2025-09-10_file_editing_tools.json (see [viewer/README.md](viewer/README.md))
+
+From Python:
+
+```python
+from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.llm.client import LiteLLMClient
+from opengeneralai.tools.registry import ToolRegistry
+
+result = Orchestrator(LiteLLMClient("mistral/mistral-small-latest"), ToolRegistry()).run("Explain what a Python decorator is")
+print(result.done, [step.descr for step in result.plan.steps], result.cost)
+result.trace.save("traces/my_run.json")
+```
 
 Environment variables:
 
