@@ -4,12 +4,13 @@ An LLM call first decides whether the question is about code and how to search f
 symbols it names are looked up first, then the reformulated queries.
 """
 
-import json
 import logging
 import re
 from typing import Any, Callable, Dict, List
 
+from opengeneralai.agent import prompts
 from opengeneralai.errors import LLMError
+from opengeneralai.json_parsing import parse_llm_json
 from opengeneralai.memory.longterm_memory import RESERVED_KEYWORD_CODE, LongTermMemory
 
 logger = logging.getLogger(__name__)
@@ -80,33 +81,11 @@ class MemoryContext:
         3. What search mode to use (search_type)
         4. What code symbols to look up (symbols)
         """
-        prompt = f"""Analyze this user query for code context retrieval.
+        messages = [{"role": "system", "content": prompts.MEMORY_QUERY_ANALYZER},
+                    {"role": "user", "content": prompts.MEMORY_QUERY_ANALYSIS.format(query=query)}]
 
-User Query: {query}
-
-You must respond with ONLY valid JSON (no markdown, no explanation). Determine:
-1. should_search: Is this query asking about code? (true for any code-related question like "how does X work", "find Y", "show me Z", "what is class/function W", "implement feature", "fix bug in X")
-2. search_queries: Reformulate the query to be more effective for semantic search. Include conceptual variations (e.g., "authentication implementation" from "how to add login").
-3. search_type: "semantic" for conceptual questions, "keyword" for exact names, "hybrid" for both
-4. symbols: List of specific code symbols (classes, functions, methods) mentioned or implied - extract CamelCase and snake_case identifiers
-
-JSON schema:
-{{"should_search": bool, "search_queries": [str], "search_type": "semantic"|"keyword"|"hybrid", "symbols": [str], "reasoning": str}}"""
-        
-        messages = [{"role": "system", "content": "You are a precise query analyzer. Always respond with valid JSON only."}, 
-                   {"role": "user", "content": prompt}]
-        
         try:
-            response = ask(messages).strip()
-            # Clean potential markdown code blocks
-            if response.startswith("```"):
-                parts = response.split("```")
-                response = parts[1] if len(parts) > 1 else response
-                if response.startswith("json"):
-                    response = response[4:]
-                response = response.strip()
-            
-            analysis = json.loads(response)
+            analysis = parse_llm_json(ask(messages))
             return {
                 "should_search": analysis.get("should_search", True),
                 "search_queries": analysis.get("search_queries", [query]),

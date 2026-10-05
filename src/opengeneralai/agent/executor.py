@@ -1,107 +1,80 @@
-import json5
-from typing import Callable, List, Optional, Tuple
-import json
+"""Actions: the LLM picks one tool call per turn, the executor runs it."""
 
-from opengeneralai.tools import registry as tools_module
-from opengeneralai.tracing.logger import TrajectoryLogger, _digest_messages
+from __future__ import annotations
 
-from opengeneralai.errors import ToolCallError as AgentError
+import logging
+from typing import Any
 
-class ActionAgent:
-    def __init__(self, logger: TrajectoryLogger, tools: tools_module.ToolRegistry, ask_llm: Callable[[List[dict]], str],
-                 ask_llm_from_tool: Optional[Callable[[List[dict]], str]] = None):
+from opengeneralai.agent import prompts
+from opengeneralai.agent.run import Run
+from opengeneralai.errors import ToolCallError
+from opengeneralai.json_parsing import JSONParseError, parse_llm_json
+from opengeneralai.tools.registry import ToolRegistry
+from opengeneralai.tracing.logger import _digest_messages
+
+logger = logging.getLogger(__name__)
+
+
+def parse_action(raw: str) -> tuple[str, dict[str, Any]]:
+    """Tool name and arguments of an action like {"tool_name": "...", "arguments": {...}}."""
+    text = raw.strip()
+    if text.startswith("ACTION:"):
+        text = text[len("ACTION:"):]
+    try:
+        data = parse_llm_json(text)
+    except JSONParseError as e:
+        raise ToolCallError(f"the action is not valid JSON ({e})") from e
+    tool_name = str(data.get("tool_name", "")).strip()
+    arguments = data.get("arguments", {})
+    if not tool_name:
+        raise ToolCallError('the action has no "tool_name"')
+    if not isinstance(arguments, dict):
+        raise ToolCallError('"arguments" must be a JSON object', tool_name)
+    return tool_name, arguments
+
+
+class Executor:
+    def __init__(self, tools: ToolRegistry):
         self.tools = tools
-        self.logger = logger
-        self.ask_llm = ask_llm
-        # Given to the tools that call the LLM themselves (Tool.needs_llm)
-        self.ask_llm_from_tool = ask_llm_from_tool or ask_llm
+        self.prompt = prompts.ACTION.format(tool_signatures=tools.signatures())
 
-        self.core_prompt = """Tool discipline:
-* Use only explicitly named tools.
-* One tool ACTION per turn (no text); make it idempotent when possible.
+    def act(self, run: Run, messages: list[dict]) -> list[dict]:
+        """Ask for one action and run it.
 
-Only output this JSON:
+        Returns the messages to add to the conversation: the action as the LLM wrote it, then
+        its result (or why it could not run), so that the LLM sees both at the next turn.
+        """
+        messages = messages + [{"role": "system", "content": self.prompt}]
+        run.trace.add_node(phase="act/run", turn=run.turn, tags={"digest": _digest_messages(messages)})
+        raw = run.ask(messages)
+        action = {"role": "assistant", "content": raw}
 
-{
-"tool_name": "...",
-"arguments": { ... }
-}
-
-TOOLS:
-"""
-        self.core_prompt += self.tools.signatures()
-
-    def get_tool_message(self) -> dict:
-        return {"role": "system", "content": self.core_prompt}
-
-    def execute_action(self, messages: List[dict], turn: int = 0):
-        """Execute a tool action using the provided LLM callback function."""
-        messages_to_send = messages.copy()
-        tool_msg = self.get_tool_message()
-        messages_to_send.append(tool_msg)
-        
-        # Create trace node for action execution
-        self.logger.add_node(
-            phase="act/run",
-            turn=turn,
-            tags={"digest": _digest_messages(messages_to_send)}
-        )
-        
-        raw_response = self.ask_llm(messages_to_send)
-        result_str = ""
         try:
-            result, _ = self.execute_tool(raw_response)
-            result_str = json.dumps(result)
-        except AgentError as e:
-            result_str = str(e)
-        except Exception as e:
-            result_str = str(e)
-                
-        # Add result to trace for next iteration
-        self.logger.get_current_interaction().append({"role": "user", "content": result_str})
-    
-    def safe_json_parsing(self, text: str) -> Tuple[str, dict]:
-        try:
-            response_json = json5.loads(text)
-        except ValueError:
-            try:
-                # second try: handle escaped unicode characters
-                fixed_text = text.encode("utf-8").decode("unicode_escape")
-                response_json = json5.loads(fixed_text)
-            except ValueError as exc:
-                raise AgentError(str(exc), "not valid JSON") from exc
-        
-        if not isinstance(response_json, dict):
-            raise AgentError("Parsed response is not a dict", "not valid JSON")
-        tool_name = response_json.get("tool_name", "")
-        arguments = response_json.get("arguments", {})
-        return tool_name, arguments
-
-    def execute_tool(self, raw_response: str) -> Tuple[str, str]:
-        node_id = self.logger.current_node().id
-        if raw_response.startswith("```json"):
-            raw_response = raw_response[7:-3]
-        if raw_response.startswith("```"):
-            raw_response = raw_response[3:-3]
-        if raw_response.startswith("ACTION:"):
-            raw_response = raw_response[7:]
-        # parse the raw_response to extract the tool_name and arguments
-        tool_name, arguments = self.safe_json_parsing(raw_response)
-
-        if tool_name not in self.tools.names():
-            self.logger.set_tool(tool_name=tool_name, tool_input=raw_response, error=f"Tool '{tool_name}' is not recognized.")
-            raise AgentError(f"Tool '{tool_name}' is not recognized.", tool_name)
+            tool_name, arguments = parse_action(raw)
+            if tool_name not in self.tools.names():
+                raise ToolCallError(f"unknown tool '{tool_name}', use one of: {', '.join(self.tools.names())}",
+                                    tool_name)
+        except ToolCallError as e:
+            run.trace.set_tool(tool_name=e.tool_name or "?", tool_input=raw, error=str(e))
+            return [action, {"role": "user", "content": prompts.INVALID_ACTION.format(error=e)}]
 
         tool = self.tools.get(tool_name)
         call_args = dict(arguments)
-        if getattr(tool, "needs_llm", False):
-            call_args["ask_llm"] = self.ask_llm_from_tool
-        result = tool.run(**call_args)
+        if tool.needs_llm:
+            call_args["ask_llm"] = run.ask_from_tool
+        try:
+            result = tool.run(**call_args)
+        except Exception as e:  # a tool crash is reported to the agent, which can try something else
+            logger.exception("Tool %s crashed", tool_name)
+            error = f"{type(e).__name__}: {e}"
+            run.trace.set_tool(tool_name=tool_name, tool_input=raw, error=error)
+            return [action, {"role": "user", "content": prompts.TOOL_FAILED.format(tool_name=tool_name, error=error)}]
+
         if not result.ok:
-            if self.logger and node_id is not None:
-                self.logger.set_tool(tool_name=tool_name, tool_input=raw_response, error=f"Tool '{tool_name}'({arguments}) execution failed: {result.meta.get('error', 'Unknown error')}")
-            raise AgentError(f"Tool '{tool_name}'({arguments}) execution failed: {result.meta.get('error', 'Unknown error')}", tool_name)
-        params = ",".join(str(v) for v in result.meta.values())
-        if self.logger and node_id is not None:
-            self.logger.set_tool(tool_name=tool_name, tool_input=raw_response, tool_output=result)
-        return f"Tool used: '{tool_name}'({params})\nContent:\n```\n{result.content}\n```", tool_name
+            error = result.meta.get("error", "unknown error")
+            run.trace.set_tool(tool_name=tool_name, tool_input=raw, tool_output=result, error=error)
+            return [action, {"role": "user", "content": prompts.TOOL_FAILED.format(tool_name=tool_name, error=error)}]
+
+        run.trace.set_tool(tool_name=tool_name, tool_input=raw, tool_output=result)
+        return [action, {"role": "user", "content": prompts.TOOL_SUCCEEDED.format(tool_name=tool_name,
+                                                                                   output=result.content)}]

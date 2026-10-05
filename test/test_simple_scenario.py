@@ -59,7 +59,7 @@ def test_file_editing():
 
     orchestrator = Orchestrator(LiteLLMClient(cfg.model), tools_registry, user_lang=cfg.user_lang)
     run = orchestrator.run("Script `loader.py` doesn't start. Fix the mistake.")
-    result = run.plan
+    result = run.plan.to_dict()
 
     run.trace.save(TRACES_DIR / "file_editing_tools.json")
 
@@ -257,7 +257,7 @@ def test_file_editing_only_bash():
 
     orchestrator = Orchestrator(LiteLLMClient(cfg.model), tools_registry, user_lang=cfg.user_lang)
     run = orchestrator.run("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
-    result = run.plan
+    result = run.plan.to_dict()
 
     run.trace.save(TRACES_DIR / "file_editing_bash.json")
 
@@ -350,7 +350,7 @@ def test_search_context_add_method():
         "Add a method 'get_summary' to the LongTermMemory class "
         "that returns a summary of the memory statistics (documents, chunks, classes, functions)."
     )
-    result = run.plan
+    result = run.plan.to_dict()
 
     # 7) Sauvegarder la trace pour debug
     run.trace.save(TRACES_DIR / "search_context.json")

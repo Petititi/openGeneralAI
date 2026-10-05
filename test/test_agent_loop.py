@@ -67,7 +67,7 @@ def test_plan_act_check_loop_fixes_the_script(fake_llm):
 
     assert fs.read("loader.py") == FIXED_LOADER
     assert result.done
-    assert [step["status"] for step in result.plan["plan_steps"]] == ["done", "done", "done"]
+    assert [step.status for step in result.plan.steps] == ["done", "done", "done"]
     assert len(llm.calls) == 7, "one LLM call per plan update and per action"
     assert result.turns == 4
     assert result.usage.total_tokens > 0 and result.cost > 0
@@ -117,3 +117,71 @@ def test_orchestrator_keeps_no_state_between_questions(fake_llm):
     assert root.tags["QUESTION"] == "Question two"
     assert first.usage == second.usage, "same-size questions: each result counts its own call only"
     assert not any(n.phase == "context" for n in second.trace.nodes.values()), "no memory, no context node"
+
+
+PLAN_2_STEPS = json.dumps({"plan_steps": [
+    {"descr": "Read loader.py", "status": "todo", "next_step_criteria": "content known"},
+    {"descr": "Run loader.py", "status": "todo", "next_step_criteria": "prints the time"},
+]})
+READ = json.dumps({"tool_name": "read_file", "arguments": {"filepath": "loader.py"}})
+
+
+def test_history_keeps_the_actions_and_plain_results(fake_llm):
+    llm = fake_llm([PLAN_2_STEPS, READ, json.dumps({"status": "DONE"})])
+    orchestrator = Orchestrator(llm, make_tools(utils.InMemoryFS({"loader.py": BROKEN_LOADER})))
+
+    result = orchestrator.run("Fix loader.py")
+
+    update_prompt = llm.calls[2]
+    assert {"role": "assistant", "content": READ} in update_prompt, "the LLM sees the action it asked for"
+    tool_result = update_prompt[update_prompt.index({"role": "assistant", "content": READ}) + 1]
+    assert tool_result["role"] == "user"
+    assert tool_result["content"].startswith("Tool 'read_file' succeeded:\n```\n" + BROKEN_LOADER)
+    assert result.done
+
+
+def test_new_plan_is_written_from_the_existing_plan(fake_llm):
+    new_plan = json.dumps({"plan_steps": [{"descr": "Read loader.py again", "status": "done"}]})
+    llm = fake_llm([PLAN_2_STEPS, READ, json.dumps({"status": "NEW_PLAN"}), new_plan])
+
+    result = Orchestrator(llm, make_tools(utils.InMemoryFS({"loader.py": BROKEN_LOADER}))).run("Fix loader.py")
+
+    recover_prompt = llm.calls[3][-1]["content"]
+    assert "EXISTING PLAN:" in recover_prompt
+    assert '"descr": "Read loader.py"' in recover_prompt and '"status": "error"' in recover_prompt
+    recover_nodes = [n for n in result.trace.nodes.values() if n.phase == "plan/recover"]
+    assert len(recover_nodes) == 1 and recover_nodes[0].tags["reason"] == "NEW_PLAN"
+    assert result.done
+
+
+def test_invalid_answers_are_retried_then_reported(fake_llm):
+    llm = fake_llm(["I think the plan is to read the file", PLAN_2_STEPS, READ,
+                    "no idea", "still no idea", "not a plan", "not a plan either"])
+
+    result = Orchestrator(llm, make_tools(utils.InMemoryFS({"loader.py": BROKEN_LOADER}))).run("Fix loader.py")
+
+    assert llm.calls[1][-1]["content"].startswith("Your previous answer could not be used")
+    assert not result.done and result.error and "not valid JSON" in result.error
+    done_node = result.trace.current_node()
+    assert done_node.phase == "done" and done_node.error == result.error
+
+
+def test_unknown_tool_is_reported_to_the_agent(fake_llm):
+    wrong = json.dumps({"tool_name": "rm_rf", "arguments": {}})
+    llm = fake_llm([PLAN_2_STEPS, wrong, json.dumps({"status": "NEXT_TASK"}), READ, json.dumps({"status": "DONE"})])
+
+    result = Orchestrator(llm, make_tools(utils.InMemoryFS({"loader.py": BROKEN_LOADER}))).run("Fix loader.py")
+
+    assert llm.calls[2][-2]["content"].startswith("Invalid action: unknown tool 'rm_rf'")
+    assert result.done
+
+
+def test_history_is_bounded(fake_llm):
+    llm = fake_llm([PLAN_2_STEPS, READ, json.dumps({"status": "NEXT_TASK"}), READ, json.dumps({"status": "DONE"})])
+    orchestrator = Orchestrator(llm, make_tools(utils.InMemoryFS({"loader.py": BROKEN_LOADER})), history_size=2)
+
+    orchestrator.run("Fix loader.py")
+
+    last_prompt = llm.calls[4]
+    assert last_prompt[1] == {"role": "user", "content": "Fix loader.py"}, "the question is always kept"
+    assert len(last_prompt) == 1 + 1 + 2 + 1, "core prompt, question, 2 history messages, planning prompt"

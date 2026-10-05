@@ -1,29 +1,18 @@
-"""
-Prompts Module - Centralized prompt templates for the application.
+"""Every prompt of the agent, in one place.
 
-This module consolidates all hardcoded prompts used across the codebase.
-This makes iteration, A/B testing, and localization easier.
-
-Responsibility: Pure prompt template definitions.
-No LLM, storage, or business logic concerns.
+Templates are filled with str.format(): literal braces are doubled ({{ }}).
 """
 
-from typing import Dict, Any, Optional
+# JSON schema of a plan, shown to the LLM (valid JSON: the LLM copies what it sees)
+PLAN_SCHEMA = """{{
+  "plan_steps": [
+    {{"descr": "short description", "status": "todo", "next_step_criteria": "what proves this step is done"}}
+  ]
+}}"""
 
 
-# ===================
-# Orchestrator Prompts
-# ===================
-
-def get_orchestrator_core_prompt(user_lang: str = "English") -> str:
-    """Get the core system prompt for the orchestrator.
-    
-    Args:
-        user_lang: The user's preferred language for responses
-        
-    Returns:
-        The core prompt string
-    """
+def core_prompt(user_lang: str) -> str:
+    """System prompt of every LLM call of the agent loop."""
     return f"""You are a rigorous, reliable coding assistant.
 
 Safety:
@@ -43,118 +32,69 @@ Readability:
 """
 
 
-# ===================
-# Reasoning Agent Prompts
-# ===================
+MEMORY_CONTEXT = """Relevant context from the codebase (use this if relevant to the user's question):
 
-REASONING_AGENT_CORE_PROMPT = """You are a planning agent:
-* Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a criteria needed to go to the next step.
+{context}"""
+
+
+# --- Planning ----------------------------------------------------------------------------------
+
+CREATE_PLAN = """You are a planning agent:
+* Produce a brief, checkable PLAN (no raw chain-of-thought) where each step has a small description, a status ("todo" or "done") and a criteria needed to go to the next step.
 * **Identify context needs**: What classes, functions, or concepts are needed?
 * Keep outputs precise and minimal; follow formats exactly.
 * Use the status "done" only when proof exists and ensure the last step is a validation of success.
 
-For the output, use only this JSON schemas:
-PLAN:
-```json
-{{
-  "plan_steps": [
-    {{
-      "descr": "short description",
-      "status": "todo",  // "todo", "current", "done"
-      "next_step_criteria": "what to check to go to the next step"
-    }}
-  ]
-}}
-```
-or FINAL: if the task is already done.
+For the output, use only this JSON schema:
+""" + PLAN_SCHEMA + "\n"
+
+CONTINUE_PLAN = """You are a planning agent:
+* From the previous interactions choose whether to proceed to the NEXT_TASK or build a NEW_PLAN.
+* No elaboration.
+
+CURRENT → {task_description}
+NEXT_STEP_CRITERIA → {next_step_criteria}
+
+NEXT_TASK → {next_task_description}
+NEW_PLAN → Current and next tasks are not working; need a new plan.
+
+OUTPUT SCHEMA:
+{{"status": "NEXT_TASK" or "NEW_PLAN"}}
 """
 
-REASONING_AGENT_CREATE_PLAN_PROMPT = """You are a planning agent:
-* Produce a brief, checkable PLAN (no raw chain-of-thought) where each steps have a small description, a status and a criteria needed to go to the next step.
+LAST_STEP = """You are a planning agent:
+* From the previous interactions, evaluate if we succeeded, according to next step criteria.
+* Use either "NEW_PLAN" or "DONE" to indicate the status
+* No elaboration.
+
+CUR_TASK → {task_description}
+NEXT_STEP_CRITERIA → {next_step_criteria}
+
+NEW_PLAN → Need to adjust plan according to previous interactions.
+
+OUTPUT SCHEMA:
+{{"status": "DONE" or "NEW_PLAN"}}
+"""
+
+NEW_PLAN = """You are a planning agent:
+* The existing plan below did not work: its failed steps have the status "error".
+* From the previous interactions, produce a new brief, checkable PLAN; keep the steps already done.
 * Use the status "done" only when proof of success exists, use "todo" otherwise.
+* Ensure the last step is a validation of success.
 
-For the output, use only this JSON schemas:
-PLAN:
-```json
-{{
-  "plan_steps": [
-    {{
-      "descr": "short description",
-      "status": "todo",  // "todo", "current", "done"
-      "next_step_criteria": "what to check to go to the next step"
-    }}
-  ]
-}}
-```
-or FINAL: if the task is already done.
-"""
-
-REASONING_AGENT_CONTINUE_PLAN_PROMPT = """You are a planning agent:
-* Continue the plan execution.
-* Mark the current step as done and propose the next step.
-* Use only status "done" when proof exists.
-
-For the output, use only this JSON:
-```json
-{{
-  "status": "NEXT_TASK",  // "NEXT_TASK" if continue, "DONE" if all done, "NEW_PLAN" if need to restart
-  "current_step_result": "what you did to complete this step (be brief)"
-}}
-```
-
-Current task: {task_description}
-Next task: {next_task_description}
-Success criteria for current task: {next_step_criteria}
-"""
-
-REASONING_AGENT_LAST_PLAN_PROMPT = """You are a planning agent:
-* You are at the last step of the plan.
-* Mark it as done and return DONE when all tasks are completed.
-
-For the output, use only this JSON:
-```json
-{{
-  "status": "DONE",  // "NEXT_TASK" if continue, "DONE" if all done
-  "current_step_result": "what you did to complete this step (be brief)"
-}}
-```
-
-Current task: {task_description}
-Success criteria for current task: {next_step_criteria}
-"""
-
-REASONING_AGENT_UPDATE_PLAN_PROMPT = """Operating principles:
-* Don't re-plan unless necessary.
-* If a step fails, fix the plan locally, don't restart from scratch.
-* If you must re-plan, output NEW_PLAN.
-
-For the output, use only this JSON:
-```json
-{{
-  "status": "NEXT_TASK",  // "NEXT_TASK" if continue, "DONE" if all done, "NEW_PLAN" if need to restart
-  "current_step_result": "what you did to complete this step (be brief)"
-}}
-```
-
-Existing plan:
+EXISTING PLAN:
 {existing_plan}
-"""
+
+For the output, use only this JSON schema:
+""" + PLAN_SCHEMA + "\n"
+
+INVALID_ANSWER = """Your previous answer could not be used: {error}
+Answer again with the JSON only, following the schema."""
 
 
-# ===================
-# Action Agent Prompts
-# ===================
+# --- Actions -----------------------------------------------------------------------------------
 
-def get_action_agent_core_prompt(tool_signatures: str) -> str:
-    """Get the core system prompt for the action agent.
-    
-    Args:
-        tool_signatures: The tool signatures string from ToolRegistry
-        
-    Returns:
-        The action agent core prompt
-    """
-    return f"""Tool discipline:
+ACTION = """Tool discipline:
 * Use only explicitly named tools.
 * One tool ACTION per turn (no text); make it idempotent when possible.
 
@@ -166,106 +106,31 @@ Only output this JSON:
 }}
 
 TOOLS:
-{tool_signatures}
-"""
+{tool_signatures}"""
+
+TOOL_SUCCEEDED = """Tool '{tool_name}' succeeded:
+```
+{output}
+```"""
+
+TOOL_FAILED = "Tool '{tool_name}' failed: {error}"
+
+INVALID_ACTION = "Invalid action: {error}"
 
 
-# ===================
-# Memory Tool Prompts
-# ===================
+# --- Memory ------------------------------------------------------------------------------------
 
-MEMORY_STRATEGY_PROMPT = """You are a query analyzer for a code search system. Analyze the user's query and determine the SINGLE best search strategy.
+MEMORY_QUERY_ANALYZER = "You are a precise query analyzer. Always respond with valid JSON only."
 
-User Query: {query}
-
-Respond with ONLY valid JSON (no markdown, no explanation). Use this schema:
-{{
-    "strategy": "semantic" | "keyword" | "hybrid" | "symbol" | "none",
-    "search_terms": ["term1", "term2"],
-    "filters": {{
-        "file_types": ["python", "js"],
-        "path_filter": "optional path constraint"
-    }}
-}}
-
-Query Type: {type_filter}
-"""
-
-
-MEMORY_CONTEXT_SYSTEM_PROMPT = """Relevant context from the codebase (use this if relevant to the user's question):
-
-{context}
-"""
-
-
-# ===================
-# Query Analysis Prompts
-# ===================
-
-QUERY_ANALYSIS_PROMPT = """Analyze this user query for code context retrieval.
+MEMORY_QUERY_ANALYSIS = """Analyze this user query for code context retrieval.
 
 User Query: {query}
 
 You must respond with ONLY valid JSON (no markdown, no explanation). Determine:
-1. should_search: Is this query asking about code? (true for any code-related question like "how does X work", "find function Y", etc.)
-2. search_queries: Array of search queries to use (1-3 max)
-3. search_type: "semantic" for conceptual questions, "keyword" for exact matches, "hybrid" for both
-4. symbols: Array of specific symbols (function/class names) to search for
+1. should_search: Is this query asking about code? (true for any code-related question like "how does X work", "find Y", "show me Z", "what is class/function W", "implement feature", "fix bug in X")
+2. search_queries: Reformulate the query to be more effective for semantic search. Include conceptual variations (e.g., "authentication implementation" from "how to add login").
+3. search_type: "semantic" for conceptual questions, "keyword" for exact names, "hybrid" for both
+4. symbols: List of specific code symbols (classes, functions, methods) mentioned or implied - extract CamelCase and snake_case identifiers
 
-Respond in this JSON format:
-{{
-    "should_search": true/false,
-    "search_queries": ["query1", "query2"],
-    "search_type": "semantic|keyword|hybrid",
-    "symbols": ["FunctionName", "ClassName"]
-}}
-"""
-
-
-# ===================
-# Tool Result Formatting
-# ===================
-
-TOOL_RESULT_FORMAT = """[tool] {tool_name}
-[result] {result}
-"""
-
-TOOL_ERROR_FORMAT = """[tool] {tool_name}
-[error] {error}
-"""
-
-
-# ===================
-# Prompts class for easy access
-# ===================
-
-class Prompts:
-    """Centralized access to all prompts."""
-    
-    # Orchestrator
-    @staticmethod
-    def orchestrator_core_prompt(user_lang: str = "English") -> str:
-        return get_orchestrator_core_prompt(user_lang)
-    
-    # Reasoning Agent
-    REASONING_CORE = REASONING_AGENT_CORE_PROMPT
-    REASONING_CREATE = REASONING_AGENT_CREATE_PLAN_PROMPT
-    REASONING_CONTINUE = REASONING_AGENT_CONTINUE_PLAN_PROMPT
-    REASONING_LAST = REASONING_AGENT_LAST_PLAN_PROMPT
-    REASONING_UPDATE = REASONING_AGENT_UPDATE_PLAN_PROMPT
-    
-    # Action Agent
-    @staticmethod
-    def action_core(tool_signatures: str) -> str:
-        return get_action_agent_core_prompt(tool_signatures)
-    
-    # Memory
-    MEMORY_STRATEGY = MEMORY_STRATEGY_PROMPT
-    MEMORY_CONTEXT = MEMORY_CONTEXT_SYSTEM_PROMPT
-    
-    # Query Analysis
-    QUERY_ANALYSIS = QUERY_ANALYSIS_PROMPT
-    
-    # Formatting
-    TOOL_RESULT = TOOL_RESULT_FORMAT
-    TOOL_ERROR = TOOL_ERROR_FORMAT
+JSON schema:
+{{"should_search": bool, "search_queries": [str], "search_type": "semantic"|"keyword"|"hybrid", "symbols": [str], "reasoning": str}}"""

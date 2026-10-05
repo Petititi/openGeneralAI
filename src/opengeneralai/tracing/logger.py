@@ -41,28 +41,7 @@ class LogNode:
 
 
 class TrajectoryLogger:
-    def get_current_interaction(self) -> List[dict]:
-        """
-        Returns a list containing the prompt messages and the raw response from the current node.
-        Equivalent to clean_message_history(scratchpad[-1]) for the current node.
-        """
-        node = self.current_node()
-        result = []
-        if node.prompt_messages:
-            result.extend(copy.deepcopy(node.prompt_messages))
-        if node.raw_response is not None:
-            result.append({"role": "assistant", "content": node.raw_response})
-        if node.tool_name:
-            if node.tool_output and node.tool_output.meta:
-                params = ",".join(node.tool_output.meta.values())
-                result.append({"role": "user", "content": f"Tool success: '{node.tool_name}'({params})\nContent:\n```\n{node.tool_output.content}\n```"})
-            elif node.error:
-                result.append({"role": "user", "content": node.error})
-            else:
-                assert False, "Logger node has tool_name but no tool_output or error"
-        return result
-    
-    """Logger structuré en arbre de décision pour tracer chaque chemin de l'agent."""
+    """Trace of one run, as a tree of nodes: one node per step of the agent loop."""
     def __init__(self, run_id: Optional[str] = None):
         self.run_id = run_id or str(uuid.uuid4())
         self.nodes: Dict[str, LogNode] = {}

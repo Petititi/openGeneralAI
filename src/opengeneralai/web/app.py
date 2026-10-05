@@ -8,7 +8,8 @@ import litellm
 from opengeneralai.llm import catalog as llm_interactions
 from opengeneralai.config import AppConfig
 from opengeneralai.agent.context import MemoryContext
-from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.agent.orchestrator import Orchestrator, RunResult
+from opengeneralai.agent.plan import StepStatus
 from opengeneralai.llm.client import LiteLLMClient
 from opengeneralai.tools import registry as tools_module
 from opengeneralai.tools import memory_search as memory_tools_module
@@ -144,22 +145,21 @@ def ask():
     except Exception as e:
         return jsonify({"ok": False, "answer": str(e)}), 400
 
-    return jsonify({"ok": True, "answer": format_answer(result.plan, result.cost)})
+    return jsonify({"ok": True, "answer": format_answer(result)})
 
 
-def format_answer(plan: dict, cost: float) -> str:
-    """Render the final plan returned by the orchestrator as plain text for the chat UI."""
+def format_answer(result: RunResult) -> str:
+    """Render the result of a run as plain text for the chat UI."""
     lines = [f"[{cfg.model}]"]
-    steps = plan.get("plan_steps", []) if isinstance(plan, dict) else []
-    for step in steps:
-        if isinstance(step, dict):
-            mark = "✅" if str(step.get("status", "")).lower() == "done" else "⬜"
-            lines.append(f"{mark} {step.get('descr', '')}")
-        else:
-            lines.append(f"• {step}")
-    if not steps:
+    for step in result.plan.steps:
+        lines.append(f"{'✅' if step.status == StepStatus.DONE else '⬜'} {step.descr}")
+    if not result.plan.steps:
         lines.append("No plan was produced.")
-    lines.append(f"cost: ${cost:.4f}")
+    if result.error:
+        lines.append(f"Stopped: {result.error}")
+    elif not result.done:
+        lines.append(f"Stopped after {result.turns} turns without finishing.")
+    lines.append(f"cost: ${result.cost:.4f}")
     return "\n".join(lines)
 
 

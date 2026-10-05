@@ -16,7 +16,6 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 # Import constants for magic numbers
-from opengeneralai.constants import CodeParserConfig
 
 # Tree-sitter imports with graceful fallback
 from tree_sitter_language_pack import get_parser
@@ -367,7 +366,7 @@ def extract_code_chunks(source: bytes, language: str) -> Tuple[List[Tuple[int, i
         return chunks, imports, {}
 
     # Limit chunk size (~1500 tokens equivalent) by character count
-    MAX_CHARS = CodeParserConfig.MAX_CHARS
+    MAX_CHARS = 6000  # maximum characters per chunk
     final = []
     for s, e, t, meta in chunks:
         if len(t) <= MAX_CHARS:

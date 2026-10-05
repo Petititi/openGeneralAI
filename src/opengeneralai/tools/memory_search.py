@@ -1,16 +1,12 @@
-from opengeneralai.tools.registry import Tool, ToolResult
-from opengeneralai.memory.longterm_memory import LongTermMemory, RESERVED_KEYWORD_CODE
-from typing import Callable, List, Dict, Any
-import json
 import re
+from typing import Any, Callable, Dict, List
 
+from opengeneralai.errors import LLMError
+from opengeneralai.json_parsing import parse_llm_json
+from opengeneralai.memory.longterm_memory import RESERVED_KEYWORD_CODE, LongTermMemory
+from opengeneralai.tools.registry import Tool, ToolResult
 
-class SearchContext(Tool):
-    name = "generic_search"
-    signature = "(query: str, type: str = 'any|class|function') -> content retrieved from context"
-    
-    # Search strategy definitions
-    STRATEGY_PROMPT = """You are a query analyzer for a code search system. Analyze the user's query and determine the SINGLE best search strategy.
+SEARCH_STRATEGY = """You are a query analyzer for a code search system. Analyze the user's query and determine the SINGLE best search strategy.
 
 Available strategies:
 1. CODE_DISCOVERY: Find code implementing specific functionality or algorithms
@@ -19,7 +15,7 @@ Available strategies:
 
 2. SYMBOL_INSPECTION: Look up specific symbols (classes, functions, methods)
    - Use when: exact names or CamelCase/snake_case identifiers are mentioned
-   - Examples: "SearchContext class", "run method", "process_user_message function"
+   - Examples: "SearchContext class", "run method", "Orchestrator class"
 
 3. FILE_ANALYSIS: Analyze file structure, imports, or dependencies
    - Use when: asking about file organization, modules, imports
@@ -34,7 +30,11 @@ Type filter: {type_filter}
 
 Respond with ONLY a JSON object:
 {{"strategy": "CODE_DISCOVERY|SYMBOL_INSPECTION|FILE_ANALYSIS|CATALOG_BROWSE", "reasoning": "brief explanation"}}"""
-    
+
+
+class SearchContext(Tool):
+    name = "generic_search"
+    signature = "(query: str, type: str = 'any|class|function') -> content retrieved from context"
     needs_llm = True
 
     def __init__(self, ltm: LongTermMemory):
@@ -49,24 +49,15 @@ Respond with ONLY a JSON object:
             },
             {
                 "role": "user",
-                "content": self.STRATEGY_PROMPT.format(query=query, type_filter=type_filter)
+                "content": SEARCH_STRATEGY.format(query=query, type_filter=type_filter)
             }
         ]
         
         try:
-            response = ask_llm(messages)
-            # Clean potential markdown code blocks
-            response = response.strip()
-            if response.startswith("```"):
-                response = response.split("```")[1]
-                if response.startswith("json"):
-                    response = response[4:]
-                response = response.strip()
-            
-            analysis = json.loads(response)
+            analysis = parse_llm_json(ask_llm(messages))
             return analysis
-        except Exception as e:
-            # Fallback to CODE_DISCOVERY on error
+        except (ValueError, LLMError) as e:
+            # Invalid JSON or failed LLM call: fall back to CODE_DISCOVERY
             return {"strategy": "CODE_DISCOVERY", "reasoning": f"Analysis failed: {e}"}
     
     def _search_code_discovery(self, query: str, type_filter: str) -> List[Dict[str, Any]]:
