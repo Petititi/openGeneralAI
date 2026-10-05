@@ -7,7 +7,7 @@ import sys
 import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from agents.logger import TrajectoryLogger
+from opengeneralai.tracing.logger import TrajectoryLogger
 
 def test_logger_refactor():
     """Test that the refactored logger automatically creates correct parent-child relationships."""

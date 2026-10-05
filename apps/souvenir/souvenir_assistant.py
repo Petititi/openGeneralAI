@@ -25,11 +25,11 @@ import json
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-import configurator
+from opengeneralai.config import AppConfig
 import litellm
-from storage.longterm_memory import LongTermMemory
-from storage.DatabaseManagement import DatabaseManager
-from storage.llm_extractor import LLMExtractor  # Shared LLM extractor
+from opengeneralai.memory.longterm_memory import LongTermMemory
+from opengeneralai.memory.database import DatabaseManager
+from opengeneralai.memory.llm_extractor import LLMExtractor  # Shared LLM extractor
 from typing import Optional, List, Dict, Any, Callable
 import re
 import json
@@ -615,7 +615,7 @@ class SouvenirAssistant:
         root_folder = Path(__file__).parent
         config_path = root_folder / "config.json"
         env_path = root_folder / ".env"
-        self.cfg = configurator.AppConfig(config_path, env_path)
+        self.cfg = AppConfig(config_path, env_path)
         
         # Use config for db_path if not provided
         if db_path is None:

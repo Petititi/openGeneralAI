@@ -5,19 +5,21 @@ from pathlib import Path
 
 import litellm
 
-import llm_interactions
-import configurator
-from agents.orchestrator import Orchestrator
-import agents.tools.ToolRegistry as tools_module
-import agents.tools.memory_tool as memory_tools_module
-from storage.longterm_memory import LongTermMemory
+from opengeneralai.llm import catalog as llm_interactions
+from opengeneralai.config import AppConfig
+from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.tools import registry as tools_module
+from opengeneralai.tools import memory_search as memory_tools_module
+from opengeneralai.memory.longterm_memory import LongTermMemory
 
 # --- LiteLLM debug output: it logs full requests, so it is opt-in (LITELLM_DEBUG=1)
 if os.environ.get("LITELLM_DEBUG"):
     litellm._turn_on_debug()
 
 # --- Various global config:
-ROOT_FOLDER = Path(__file__).parent
+# Root of the repository (src/opengeneralai/web/app.py -> repository root): config.json, .env,
+# viewer/ and traces/ live there
+ROOT_FOLDER = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT_FOLDER / "config.json"
 ENV_PATH = ROOT_FOLDER / ".env"
 VIEWER_FOLDER = ROOT_FOLDER / "viewer"
@@ -46,7 +48,7 @@ if ALLOWED_ORIGINS:
     CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
 # --- Configuration creation
-cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
 ltm = LongTermMemory(
     db_path=cfg.db_path,
@@ -177,9 +179,12 @@ def trace_files(filename):
     return send_from_directory(TRACES_FOLDER, filename)
 
 
-if __name__ == "__main__":
-
+def main():
     port = int(os.environ.get("PORT", 12000))
     # Listen on localhost only; set HOST=0.0.0.0 to expose the server on your network
     host = os.environ.get("HOST", "127.0.0.1")
     app.run(host=host, port=port, debug=False)
+
+
+if __name__ == "__main__":
+    main()

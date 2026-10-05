@@ -14,7 +14,7 @@ if project_root not in sys.path:
 # Check if embeddings are available
 EMBEDDINGS_AVAILABLE = False
 try:
-    from storage.EmbeddingManagement import EmbeddingManager
+    from opengeneralai.memory.embeddings import EmbeddingManager
     EMBEDDINGS_AVAILABLE = True
 except ImportError:
     pass
@@ -74,8 +74,8 @@ def fake_llm(monkeypatch):
     """Replace the LLM used by the orchestrator: fake_llm([reply1, reply2, ...]) returns the FakeLLM."""
     def install(replies):
         fake = FakeLLM(replies)
-        monkeypatch.setattr("agents.orchestrator.litellm.completion", fake.completion)
-        monkeypatch.setattr("agents.orchestrator.cost_per_token",
+        monkeypatch.setattr("opengeneralai.agent.orchestrator.litellm.completion", fake.completion)
+        monkeypatch.setattr("opengeneralai.agent.orchestrator.cost_per_token",
                             lambda model, prompt_tokens, completion_tokens: (prompt_tokens * 1e-6, completion_tokens * 2e-6))
         return fake
     return install

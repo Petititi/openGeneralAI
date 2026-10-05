@@ -6,19 +6,19 @@ from typing import Dict, List, Tuple, Any, Optional
 import litellm
 import time
 
-from agents.logger import TrajectoryLogger
-import configurator
-import agents.tools.ToolRegistry as tools_module
-import agents.action as action
-import agents.reasoning as reasoning
-from storage.longterm_memory import LongTermMemory
-from constants import OrchestratorConfig
+from opengeneralai.tracing.logger import TrajectoryLogger
+from opengeneralai.config import AppConfig
+from opengeneralai.tools import registry as tools_module
+from opengeneralai.agent import executor as action
+from opengeneralai.agent import planner as reasoning
+from opengeneralai.memory.longterm_memory import LongTermMemory
+from opengeneralai.constants import OrchestratorConfig
 
 # Configure module-level logger
 logger = logging.getLogger(__name__)
 
 class Orchestrator:
-    def __init__(self, cfg: configurator.AppConfig, tools: tools_module.ToolRegistry, 
+    def __init__(self, cfg: AppConfig, tools: tools_module.ToolRegistry, 
                  ltm: Optional[LongTermMemory] = None, max_turn: int = OrchestratorConfig.DEFAULT_MAX_TURN,
                  max_context_tokens: int = OrchestratorConfig.DEFAULT_CONTEXT_MAX_TOKENS):
         self.last_trace: Optional[TrajectoryLogger] = None
@@ -219,7 +219,7 @@ JSON schema:
 
     def _extract_symbols_from_query(self, query: str) -> List[str]:
         """Extract code symbols from query using regex patterns."""
-        from storage.longterm_memory import RESERVED_KEYWORD_CODE
+        from opengeneralai.memory.longterm_memory import RESERVED_KEYWORD_CODE
         
         # Extract CamelCase identifiers (e.g., MyClass, Orchestrator)
         camel = re.findall(r'\b[A-Z][a-zA-Z0-9_]*\b', query)
@@ -240,7 +240,7 @@ JSON schema:
         
         Returns class, function, method and related code.
         """
-        from storage.longterm_memory import RESERVED_KEYWORD_CODE
+        from opengeneralai.memory.longterm_memory import RESERVED_KEYWORD_CODE
         
         if not symbol or symbol in RESERVED_KEYWORD_CODE:
             return []

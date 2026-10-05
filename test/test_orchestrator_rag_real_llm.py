@@ -30,12 +30,12 @@ pytestmark = [pytest.mark.llm, pytest.mark.skipif(not HAS_LLM_KEY, reason="No LL
 @pytest.fixture
 def config():
     """Create a real configuration"""
-    import configurator
+    from opengeneralai.config import AppConfig
     
     CONFIG_PATH = os.getcwd() + "/config.json"
     ENV_PATH = os.getcwd() + "/.env"
     
-    cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+    cfg = AppConfig(CONFIG_PATH, ENV_PATH)
     
     # Skip if not configured
     if cfg.need_configuration:
@@ -47,7 +47,7 @@ def config():
 @pytest.fixture
 def mock_tools():
     """Create a mock tool registry"""
-    from agents.tools.ToolRegistry import ToolRegistry
+    from opengeneralai.tools.registry import ToolRegistry
     
     tools = ToolRegistry()
     mock_tool = Mock()
@@ -150,9 +150,9 @@ class TestRealLLMQueryAnalysis:
     
     def test_analyze_code_question_real_llm(self, config, mock_tools, mock_ltm):
         """Test LLM analysis of a code-related question"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -189,9 +189,9 @@ class TestRealLLMQueryAnalysis:
     
     def test_analyze_non_code_question_real_llm(self, config, mock_tools, mock_ltm):
         """Test LLM analysis of a non-code question"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -212,9 +212,9 @@ class TestRealLLMQueryAnalysis:
     
     def test_analyze_implementation_question_real_llm(self, config, mock_tools, mock_ltm):
         """Test LLM analysis of implementation questions"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -239,9 +239,9 @@ class TestRealSymbolSearch:
     
     def test_search_existing_class(self, config, mock_tools, mock_ltm):
         """Test searching for a class"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -257,9 +257,9 @@ class TestRealSymbolSearch:
     
     def test_search_function(self, config, mock_tools, mock_ltm):
         """Test searching for a function"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -278,9 +278,9 @@ class TestRealContextRetrieval:
     
     def test_get_relevant_context_class_query(self, config, mock_tools, mock_ltm):
         """Test retrieving context for a class-related query"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -300,9 +300,9 @@ class TestRealContextRetrieval:
     
     def test_get_relevant_context_no_ltm(self, config, mock_tools):
         """Test context retrieval when no LTM is available"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -322,9 +322,9 @@ class TestRealIntegration:
     
     def test_full_rag_pipeline(self, config, mock_tools, mock_ltm):
         """Test the complete RAG pipeline"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,
@@ -350,9 +350,9 @@ class TestRealIntegration:
     
     def test_memory_context_injection(self, config, mock_tools, mock_ltm):
         """Test that memory context is properly injected into messages"""
-        from agents.orchestrator import Orchestrator
+        from opengeneralai.agent.orchestrator import Orchestrator
         
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=config,
                 tools=mock_tools,

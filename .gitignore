@@ -15,3 +15,6 @@ mails.pickle
 # Python packaging
 *.egg-info/
 build/
+
+# Memory index of the web app (see db_path in config.json)
+/data/

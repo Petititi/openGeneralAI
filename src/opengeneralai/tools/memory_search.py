@@ -1,5 +1,5 @@
-from agents.tools.ToolRegistry import Tool, ToolResult
-from storage.longterm_memory import LongTermMemory, RESERVED_KEYWORD_CODE
+from opengeneralai.tools.registry import Tool, ToolResult
+from opengeneralai.memory.longterm_memory import LongTermMemory, RESERVED_KEYWORD_CODE
 from typing import Callable, List, Dict, Any
 import json
 import re

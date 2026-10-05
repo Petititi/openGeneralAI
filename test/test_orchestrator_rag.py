@@ -16,8 +16,8 @@ import json
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from agents.orchestrator import Orchestrator
-from storage.longterm_memory import LongTermMemory
+from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.memory.longterm_memory import LongTermMemory
 
 
 # Sample test code for indexing
@@ -139,7 +139,7 @@ def mock_tools():
 @pytest.fixture
 def orchestrator_with_mock_ltm(mock_config, mock_tools, mock_ltm):
     """Create an Orchestrator with mocked LTM"""
-    with patch('agents.orchestrator.TrajectoryLogger'):
+    with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
         orch = Orchestrator(
             cfg=mock_config,
             tools=mock_tools,
@@ -331,7 +331,7 @@ class TestGetRelevantContext:
     
     def test_get_relevant_context_no_ltm(self, mock_config, mock_tools):
         """Test context retrieval when no LTM is available"""
-        with patch('agents.orchestrator.TrajectoryLogger'):
+        with patch('opengeneralai.agent.orchestrator.TrajectoryLogger'):
             orch = Orchestrator(
                 cfg=mock_config,
                 tools=mock_tools,

@@ -1,5 +1,5 @@
 import time
-from agents.tools.ToolRegistry import Tool, ToolResult
+from opengeneralai.tools.registry import Tool, ToolResult
 
 import difflib
 from typing import Dict, Optional, Tuple, Callable

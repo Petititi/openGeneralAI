@@ -9,7 +9,7 @@ import pytest
 # Ajouter le répertoire parent au path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from storage.longterm_memory import LongTermMemory
+from opengeneralai.memory.longterm_memory import LongTermMemory
 
 # Import EMBEDDINGS_AVAILABLE from conftest
 try:
@@ -142,7 +142,7 @@ def test_list_content(persistant_ltm):
     assert 'start_line' in methods[0]
     assert 'end_line' in methods[0]
 
-    file_to_check = str(Path("./storage/longterm_memory.py").resolve())
+    file_to_check = str((Path(__file__).parent.parent / "src/opengeneralai/memory/longterm_memory.py").resolve())
     imports = persistant_ltm.get_imports_by_file(file_to_check)
     
     assert isinstance(imports, list)

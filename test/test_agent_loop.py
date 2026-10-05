@@ -11,8 +11,8 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import utils
-from agents.orchestrator import Orchestrator
-from agents.tools.ToolRegistry import ToolRegistry
+from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.tools.registry import ToolRegistry
 
 TRACES_DIR = Path(__file__).parent.parent / "traces"
 

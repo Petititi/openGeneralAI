@@ -16,7 +16,7 @@
       "name": "Run gmail",
       "type": "debugpy",
       "request": "launch",
-      "module": "gmail_memory_assistant",
+      "program": "${workspaceFolder}/apps/souvenir/gmail_memory_assistant.py",
       "justMyCode": false
     },
     {
@@ -33,7 +33,7 @@
       "name": "memory: index code",
       "type": "python",
       "request": "launch",
-      "module": "storage.longterm_memory",
+      "module": "opengeneralai.memory.longterm_memory",
       "args": [
         "index",
         "C:/Research/LLM/openGeneralAI"
@@ -44,7 +44,7 @@
       "name": "memory: verify integrity",
       "type": "debugpy",
       "request": "launch",
-      "module": "storage.longterm_memory",
+      "module": "opengeneralai.memory.longterm_memory",
       "args": [
         "integrity",
       ],
@@ -54,7 +54,7 @@
       "name": "memory: query content",
       "type": "debugpy",
       "request": "launch",
-      "module": "storage.longterm_memory",
+      "module": "opengeneralai.memory.longterm_memory",
       "args": [
         "search",
         "Which class is responsible to make system calls?",

@@ -33,29 +33,24 @@ souvenir = [
 ]
 dev = ["pytest", "ruff"]
 
-[tool.setuptools]
-py-modules = [
-    "app",
-    "configurator",
-    "constants",
-    "gmail_memory_assistant",
-    "llm_interactions",
-    "prompts",
-    "souvenir_assistant",
-]
-packages = ["agents", "agents.tools", "storage", "utils"]
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"opengeneralai.web" = ["templates/*.html", "static/css/*.css", "static/js/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["test"]
+pythonpath = ["src", "test"]
 markers = [
     "llm: calls the configured LLM for real (API key needed, costs money); run with --run-llm",
 ]
 
 [tool.ruff]
 target-version = "py310"
-# gmail_memory_assistant.py is being rewritten (branch gmail, March 2026): it still uses
-# names that no longer exist around lines 900-1050. Lint it again once that work is done.
-extend-exclude = ["gmail_memory_assistant.py"]
+# apps/souvenir/gmail_memory_assistant.py is being rewritten (branch gmail, March 2026): it still
+# uses names that no longer exist around lines 900-1050. Lint it again once that work is done.
+extend-exclude = ["apps/souvenir/gmail_memory_assistant.py"]
 
 [tool.ruff.lint]
 # Errors only, for now: syntax errors and undefined names (NameError at runtime)

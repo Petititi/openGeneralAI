@@ -4,12 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from agents.orchestrator import Orchestrator
-import configurator
+from opengeneralai.agent.orchestrator import Orchestrator
+from opengeneralai.config import AppConfig
 import utils
-from agents.tools.ToolRegistry import ToolRegistry
-from agents.tools.memory_tool import SearchContext
-from storage.longterm_memory import LongTermMemory
+from opengeneralai.tools.registry import ToolRegistry
+from opengeneralai.tools.memory_search import SearchContext
+from opengeneralai.memory.longterm_memory import LongTermMemory
 import re
 
 # Traces of the runs, to open with the viewer (see viewer/README.md)
@@ -53,7 +53,7 @@ def test_file_editing():
     ENV_PATH = os.getcwd() + "/.env"
 
     # --- Configuration creation
-    cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+    cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
     orchestrator = Orchestrator(cfg, tools_registry)
     result, cost = orchestrator.process_user_message("Script `loader.py` doesn't start. Fix the mistake.")
@@ -250,7 +250,7 @@ def test_file_editing_only_bash():
     ENV_PATH = os.getcwd() + "/.env"
 
     # --- Configuration creation
-    cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+    cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
     orchestrator = Orchestrator(cfg, tools_registry)
     result, cost = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
@@ -331,7 +331,7 @@ def test_search_context_add_method():
     # 5) Configuration et orchestrator
     CONFIG_PATH = os.getcwd() + "/config.json"
     ENV_PATH = os.getcwd() + "/.env"
-    cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+    cfg = AppConfig(CONFIG_PATH, ENV_PATH)
 
     orchestrator = Orchestrator(cfg, tools_registry)
 

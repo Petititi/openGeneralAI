@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 # Import constants for magic numbers
-from constants import CodeParserConfig
+from opengeneralai.constants import CodeParserConfig
 
 # Tree-sitter imports with graceful fallback
 from tree_sitter_language_pack import get_parser

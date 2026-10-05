@@ -9,7 +9,7 @@ from dotenv import load_dotenv
 from dotenv import set_key as _set_key  # from python-dotenv
 from dotenv import unset_key as _unset_key  # from python-dotenv
 
-import llm_interactions
+from opengeneralai.llm import catalog as llm_interactions
 
 
 logger = logging.getLogger(__name__)
@@ -63,12 +63,12 @@ class AppConfig:
     @property
     def db_path(self) -> str:
         """Configured database path (or default path if missing)."""
-        return self._cfg.get("db_path", "storage/memory.sqlite")
+        return self._cfg.get("db_path", "data/memory.sqlite")
     
     @property
     def faiss_index_path(self) -> str:
         """Configured FAISS index path (or default path if missing)."""
-        return self._cfg.get("faiss_index_path", "storage/faiss.index")
+        return self._cfg.get("faiss_index_path", "data/faiss.index")
     
     @property
     def souvenir_db_path(self) -> str:
@@ -117,8 +117,8 @@ class AppConfig:
             "provider": default_provider,
             "model": default_model,
             "user_lang": "English",
-            "db_path": "storage/memory.sqlite",
-            "faiss_index_path": "storage/faiss.index",
+            "db_path": "data/memory.sqlite",
+            "faiss_index_path": "data/faiss.index",
             "souvenir_db_path": "souvenir_memory.sqlite",
             "enable_semantic_search": True
         }

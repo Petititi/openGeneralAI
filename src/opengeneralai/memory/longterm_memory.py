@@ -20,11 +20,11 @@ from .code_parser import (
     is_text_file,
 )
 
-from .DatabaseManagement import DatabaseManager
+from .database import DatabaseManager
 
 # Try to import EmbeddingManager, but make it optional
 try:
-    from .EmbeddingManagement import EmbeddingManager
+    from .embeddings import EmbeddingManager
     EMBEDDING_AVAILABLE = True
 except ImportError:
     EMBEDDING_AVAILABLE = False

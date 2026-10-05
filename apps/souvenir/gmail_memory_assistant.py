@@ -30,7 +30,7 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent))
 
-import configurator
+from opengeneralai.config import AppConfig
 from souvenir_assistant import SouvenirAssistant
 
 
@@ -58,7 +58,7 @@ class GmailMemoryAssistant:
         self.user_email = None
         
         # --- Configuration creation
-        self.cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
+        self.cfg = AppConfig(CONFIG_PATH, ENV_PATH)
         self.TOKEN_FILE = self.cfg._cfg["TOKEN_FILE"]
         self.MAILS_FILE = self.cfg._cfg["MAILS_FILE"]
         self.DEBUG = self.cfg._cfg["DEBUG"] == "True"

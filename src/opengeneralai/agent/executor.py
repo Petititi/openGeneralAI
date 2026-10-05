@@ -1,10 +1,10 @@
 import json5
-import configurator
+from opengeneralai.config import AppConfig
 from typing import Tuple, Callable, List
 import json
 
-import agents.tools.ToolRegistry as tools_module
-from agents.logger import TrajectoryLogger, _digest_messages
+from opengeneralai.tools import registry as tools_module
+from opengeneralai.tracing.logger import TrajectoryLogger, _digest_messages
 
 class AgentError(Exception):
     def __init__(self, message, tool_name):
@@ -14,7 +14,7 @@ class AgentError(Exception):
         self.tool_name = tool_name
 
 class ActionAgent:
-    def __init__(self, cfg: configurator.AppConfig, logger: TrajectoryLogger, tools: tools_module.ToolRegistry, ask_llm: Callable[[List[dict]], str]):
+    def __init__(self, cfg: AppConfig, logger: TrajectoryLogger, tools: tools_module.ToolRegistry, ask_llm: Callable[[List[dict]], str]):
         self.cfg = cfg
         self.tools = tools
         self.logger = logger
