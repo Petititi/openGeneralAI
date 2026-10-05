@@ -23,8 +23,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 # Check for API key availability
 HAS_LLM_KEY = bool(os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY") or os.getenv("AZURE_API_KEY") or os.getenv("MISTRAL_API_KEY"))
 
-# Only run these tests if we have an API key
-pytestmark = pytest.mark.skipif(not HAS_LLM_KEY, reason="No LLM API key available")
+# Real LLM calls: only with --run-llm (see conftest.py), and only if an API key is available
+pytestmark = [pytest.mark.llm, pytest.mark.skipif(not HAS_LLM_KEY, reason="No LLM API key available")]
 
 
 @pytest.fixture

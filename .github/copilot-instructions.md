@@ -107,21 +107,21 @@ See `test/utils.py` for minimal examples: `ReadFile`, `EditFile`, `RunProg`.
 **Tree-based execution traces** via `TrajectoryLogger`:
 
 - Each `add_node()` creates a decision point with: `phase`, `turn`, `prompt_messages`, `raw_response`, `plan_snapshot`, `tool_name/input/output`
-- Context variable `_current_node_id` maintains tree traversal state
-- Export to HTML: `orchestrator.last_trace.to_html()` → interactive Cytoscape graph
+- Each trace keeps its own current node (`current_node_id`): the next `add_node()` becomes its child
+- Export to JSON: `orchestrator.last_trace.save("traces/my_run.json")`
 
 **Debug workflow**:
-1. Run orchestrator, save trace: `orchestrator.last_trace`
-2. Write HTML: `open("debug.html", "w").write(trace.to_html())`
+1. Run orchestrator, save trace: `orchestrator.last_trace.save("traces/my_run.json")`
+2. Open it with the viewer: http://localhost:12000/viewer/?trace=/traces/my_run.json (see `viewer/README.md`)
 3. Inspect tree in browser - nodes show full prompts, plans, tool calls
-4. Template: `templates/template_logger.html` (Cytoscape + custom rendering)
+4. Viewer: `viewer/` (static page, Cytoscape + custom rendering); `traces/examples/` holds real runs
 
-**Test pattern** (see `test/test_simple_scenario.py`):
+**Test pattern** (see `test/test_agent_loop.py`, scripted LLM with the `fake_llm` fixture):
 ```python
+llm = fake_llm([plan_json, action_json, '{"status": "DONE"}'])  # one reply per LLM call
 orchestrator = Orchestrator(cfg, tools_registry)
 result, cost = orchestrator.process_user_message("Task...")
-with open("templates/dbg.html", "w") as f:
-    f.write(orchestrator.last_trace.to_html())
+orchestrator.last_trace.save(TRACES_DIR / "my_scenario.json")
 assert all(step["status"] == "done" for step in result["plan_steps"])
 ```
 
@@ -153,7 +153,10 @@ python longterm_memory.py list-classes  # See all indexed classes
 
 ### Running Tests
 ```bash
-python -m pytest test/test_simple_scenario.py -v
+pip install -e ".[dev]"
+ruff check .
+pytest                # deterministic tests only (CI runs the same)
+pytest --run-llm      # also the tests marked `llm`, which call the configured LLM for real
 ```
 
 ## Critical Conventions
@@ -201,7 +204,11 @@ storage/
 templates/
   index.html           # Chat UI
   config.html          # Provider selection
-  template_logger.html # Debug visualization
+
+static/                # JS/CSS of the chat and config pages (no inline scripts: see the CSP in app.py)
+
+viewer/                # Trace viewer (index.html, embed.html for iframes)
+traces/                # Traces written by the tests; examples/ holds real runs
 
 test/
   test_simple_scenario.py  # Integration tests
@@ -235,5 +242,5 @@ test/
 1. Set API key: `echo MISTRAL_API_KEY=your_key > .env`
 2. Run server: `python app.py`
 3. Test agent: Visit UI, submit "Calculate 5 + 3" (requires Calculator tool)
-4. Inspect trace: Check `templates/dbg.html` after test run
+4. Inspect trace: run `pytest`, then open http://localhost:12000/viewer/?trace=/traces/fake_file_editing.json
 5. Read code flow: `app.py` → `orchestrator.py` → `reasoning.py` + `action.py`

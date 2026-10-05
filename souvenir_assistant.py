@@ -1429,7 +1429,7 @@ Memories:
                 self.ltm.db_manager.insert_link(
                     source_doc_id=entity_id,
                     target_doc_id=linked_memory_id,
-                    description=memory_context if 'memory_context' in locals() else None
+                    description=None  # no memory context is available in this method
                 )
             
             # Create chunks for entity data

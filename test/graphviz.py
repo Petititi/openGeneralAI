@@ -1,4 +1,4 @@
-import html, math
+import html, json, math
 
 def write_trace_dot_advanced(trace: dict, path: str = "trace.dot", title: str = "Agent trajectory") -> str:
     nodes = trace["nodes"]

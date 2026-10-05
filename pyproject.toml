@@ -1,0 +1,62 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "opengeneralai"
+version = "0.2.0"
+description = "Companion code of the blog series 'Building LLM Coding Agents': a plan/act/check coding agent"
+readme = "README.md"
+requires-python = ">=3.10"
+# Core: web app, agent loop and code memory (keyword search)
+dependencies = [
+    "Flask",
+    "Flask-Cors",
+    "litellm",
+    "python-dotenv",
+    "json5",
+    "numpy",
+    "tree_sitter",
+    "tree-sitter-language-pack",
+]
+
+[project.optional-dependencies]
+# Semantic search in the memory (downloads an embedding model on first use)
+embeddings = ["faiss-cpu", "sentence-transformers"]
+# Souvenir assistant and Gmail import
+souvenir = [
+    "email-reply-parser",
+    "google-auth",
+    "google-api-python-client",
+    "google-auth-oauthlib",
+    "google-auth-httplib2",
+]
+dev = ["pytest", "ruff"]
+
+[tool.setuptools]
+py-modules = [
+    "app",
+    "configurator",
+    "constants",
+    "gmail_memory_assistant",
+    "llm_interactions",
+    "prompts",
+    "souvenir_assistant",
+]
+packages = ["agents", "agents.tools", "storage", "utils"]
+
+[tool.pytest.ini_options]
+testpaths = ["test"]
+markers = [
+    "llm: calls the configured LLM for real (API key needed, costs money); run with --run-llm",
+]
+
+[tool.ruff]
+target-version = "py310"
+# gmail_memory_assistant.py is being rewritten (branch gmail, March 2026): it still uses
+# names that no longer exist around lines 900-1050. Lint it again once that work is done.
+extend-exclude = ["gmail_memory_assistant.py"]
+
+[tool.ruff.lint]
+# Errors only, for now: syntax errors and undefined names (NameError at runtime)
+select = ["E9", "F63", "F7", "F82"]

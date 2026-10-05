@@ -45,13 +45,24 @@ Access:
 
 - Config: http://localhost:12000/config
 
-- Trace viewer (written by the tests): http://localhost:12000/templates/dbg.html
+- Trace viewer: http://localhost:12000/viewer/?trace=/traces/examples/2025-09-10_file_editing_tools.json (see [viewer/README.md](viewer/README.md))
 
 Environment variables:
 
 - `HOST` (default `127.0.0.1`): the server only listens on localhost. Use `HOST=0.0.0.0` only on a trusted network: anyone who can reach the server can spend your API credits and change your API keys.
 - `ALLOWED_ORIGINS` (default: none): comma-separated origins allowed to call the API from another front-end (CORS).
 - `LITELLM_DEBUG=1`: print the full LiteLLM requests (prompts included) for debugging.
+
+## Tests
+
+```bash
+pip install -e ".[dev]"
+ruff check .
+pytest              # deterministic tests: the agent loop runs against a scripted LLM (test/conftest.py)
+pytest --run-llm    # also the scenarios that call the configured LLM for real (API key, costs)
+```
+
+The scenario tests write their traces in `traces/`; open them with the trace viewer.
 
 ## Roadmap Highlights
 

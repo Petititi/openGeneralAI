@@ -1,14 +1,6 @@
-Flask
-Flask-Cors
-litellm
-python-dotenv
-json5
-faiss-cpu
-sentence-transformers
-tree_sitter
-tree-sitter-language-pack
-google-auth
-google-api-python-client
-google-auth-oauthlib
-google-auth-httplib2
-email-reply-parser
+# Installs this project with all its features: web app, agent loop, memory with semantic search,
+# Souvenir and Gmail import. The dependencies are listed in pyproject.toml; to install less:
+#   pip install -e .                  core (web app, agent loop, keyword memory search)
+#   pip install -e ".[embeddings]"    + semantic search
+#   pip install -e ".[dev]"           + pytest and ruff
+-e .[embeddings,souvenir]

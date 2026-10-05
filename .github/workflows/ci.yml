@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      # Core and dev dependencies only: the tests that need embeddings or a real LLM are skipped
+      - run: pip install -e ".[dev]"
+      - run: ruff check .
+      - run: pytest
+      - name: Keep the traces written by the tests (open them with viewer/)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: traces
+          path: traces/*.json
+          if-no-files-found: ignore
