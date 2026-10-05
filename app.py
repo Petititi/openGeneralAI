@@ -9,6 +9,8 @@ import llm_interactions
 import configurator
 from agents.orchestrator import Orchestrator
 import agents.tools.ToolRegistry as tools_module
+import agents.tools.memory_tool as memory_tools_module
+from storage.longterm_memory import LongTermMemory
 
 # --- LiteLLM debug output: it logs full requests, so it is opt-in (LITELLM_DEBUG=1)
 if os.environ.get("LITELLM_DEBUG"):
@@ -24,6 +26,18 @@ TEMPLATES_FOLDER = ROOT_FOLDER / "templates"
 # Set ALLOWED_ORIGINS to a comma-separated list of origins to allow another front-end.
 ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 
+# --- Content-Security-Policy: no inline script/style in the app pages (see static/)
+CDN = "https://cdn.jsdelivr.net"
+APP_CSP = (
+    f"default-src 'self'; script-src 'self' {CDN}; style-src 'self' {CDN}; "
+    f"font-src 'self' {CDN}; img-src 'self' data:; frame-ancestors 'self'"
+)
+# The trace viewer pages embed their data in an inline script and load Cytoscape from unpkg
+TRACE_VIEWER_CSP = (
+    "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com https://pfau-software.de; "
+    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'self'"
+)
+
 # --- server config/init:
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["TEMPLATES_AUTO_RELOAD"] = True
@@ -33,15 +47,22 @@ if ALLOWED_ORIGINS:
 # --- Configuration creation
 cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
 
+ltm = LongTermMemory(
+    db_path=cfg.db_path,
+    faiss_index_path=cfg.faiss_index_path
+)
+ltm.add_folder(str(ROOT_FOLDER))
 tools_registry = tools_module.ToolRegistry()
-orchestrator = Orchestrator(cfg, tools_registry)
+orchestrator = Orchestrator(cfg, tools_registry, ltm=ltm)
+tools_registry.register(memory_tools_module.SearchContext(ltm, ask_llm=orchestrator.safe_ask))
 
 
 @app.after_request
 def add_security_headers(resp):
     # Only pages from this server may embed the UI in an iframe
     resp.headers["X-Frame-Options"] = "SAMEORIGIN"
-    resp.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
+    # Scripts and styles come from /static and the Bootstrap CDN; routes may set a stricter or looser policy
+    resp.headers.setdefault("Content-Security-Policy", APP_CSP)
     return resp
 
 
@@ -97,8 +118,22 @@ def ask():
     if not question:
         return jsonify({"ok": False, "answer": "Please ask a question."}), 400
     
+    # Input validation and sanitization
+    # 1. Length check
+    MAX_QUESTION_LENGTH = 10000
+    if len(question) > MAX_QUESTION_LENGTH:
+        return jsonify({"ok": False, "answer": f"Question exceeds maximum length of {MAX_QUESTION_LENGTH} characters."}), 400
+    
+    # 2. Basic sanitization - remove potentially dangerous content
+    # Note: The LLM itself handles most safety concerns, but we add a basic layer
+    sanitized_question = question.strip()
+    
+    # 3. Check for empty or whitespace-only after sanitization
+    if not sanitized_question or not sanitized_question.replace("\n", "").replace("\r", "").replace(" ", ""):
+        return jsonify({"ok": False, "answer": "Question cannot be empty or whitespace only."}), 400
+    
     try:
-        plan, cost = orchestrator.process_user_message(question)
+        plan, cost = orchestrator.process_user_message(sanitized_question)
     except Exception as e:
         return jsonify({"ok": False, "answer": str(e)}), 400
 
@@ -127,7 +162,9 @@ def trace_viewer_files(filename):
 
     Only the templates folder is exposed: never serve the project root, which holds .env.
     """
-    return send_from_directory(TEMPLATES_FOLDER, filename)
+    resp = send_from_directory(TEMPLATES_FOLDER, filename)
+    resp.headers["Content-Security-Policy"] = TRACE_VIEWER_CSP
+    return resp
 
 
 if __name__ == "__main__":

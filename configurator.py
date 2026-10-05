@@ -59,6 +59,27 @@ class AppConfig:
     def user_lang(self) -> str:
         """Configured user language (or default user language if missing)."""
         return self._cfg.get("user_lang", "English")
+    
+    @property
+    def db_path(self) -> str:
+        """Configured database path (or default path if missing)."""
+        return self._cfg.get("db_path", "storage/memory.sqlite")
+    
+    @property
+    def faiss_index_path(self) -> str:
+        """Configured FAISS index path (or default path if missing)."""
+        return self._cfg.get("faiss_index_path", "storage/faiss.index")
+    
+    @property
+    def souvenir_db_path(self) -> str:
+        """Configured souvenir database path (or default path if missing)."""
+        return self._cfg.get("souvenir_db_path", "souvenir_memory.sqlite")
+    
+    @property
+    def enable_semantic_search(self) -> bool:
+        """Whether to enable semantic search in souvenir assistant."""
+        return self._cfg.get("enable_semantic_search", True)
+    
     @property
     def provider(self) -> str:
         """Configured provider name (or default provider if missing)."""
@@ -92,7 +113,15 @@ class AppConfig:
         default_provider = "mistral" if "mistral" in providers else (providers[0] if providers else "mistral")
         model_list = provider_to_models.get(default_provider, [])
         default_model = model_list[0] if model_list else "mistral/devstral-small-2505"
-        return {"provider": default_provider, "model": default_model, "user_lang": "English"}
+        return {
+            "provider": default_provider,
+            "model": default_model,
+            "user_lang": "English",
+            "db_path": "storage/memory.sqlite",
+            "faiss_index_path": "storage/faiss.index",
+            "souvenir_db_path": "souvenir_memory.sqlite",
+            "enable_semantic_search": True
+        }
 
     def reload_config(self) -> Dict[str, str]:
         """
@@ -123,11 +152,13 @@ class AppConfig:
                 if allowed_models:
                     logger.warning("Model %r is not allowed for provider %r — defaulting to first allowed model.",
                                    model, provider)
-                    return {"provider": provider, "model": allowed_models[0]}
+                    # Preserve other config settings
+                    return {**self._cfg, "provider": provider, "model": allowed_models[0]}
                 logger.warning("No allowed models for provider %r — using global default config.", provider)
                 return self.default_config()
 
-            return {"provider": provider, "model": model}
+            # Preserve all config settings
+            return self._cfg
         except Exception as exc:
             logger.exception("Failed to load/validate config (%s). Falling back to default.", exc)
             return self.default_config()

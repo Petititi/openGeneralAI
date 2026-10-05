@@ -13,12 +13,54 @@
       "justMyCode": false
     },
     {
+      "name": "Run gmail",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "gmail_memory_assistant",
+      "justMyCode": false
+    },
+    {
       "name": "Python: Debug dernier test pytest",
       "type": "python",
       "request": "launch",
       "module": "pytest",
-      "args": ["--last-failed"],
+      "args": [
+        "--last-failed"
+      ],
       "console": "integratedTerminal"
-    }
+    },
+    {
+      "name": "memory: index code",
+      "type": "python",
+      "request": "launch",
+      "module": "storage.longterm_memory",
+      "args": [
+        "index",
+        "C:/Research/LLM/openGeneralAI"
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "memory: verify integrity",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "storage.longterm_memory",
+      "args": [
+        "integrity",
+      ],
+      "console": "integratedTerminal"
+    },
+    {
+      "name": "memory: query content",
+      "type": "debugpy",
+      "request": "launch",
+      "module": "storage.longterm_memory",
+      "args": [
+        "search",
+        "Which class is responsible to make system calls?",
+        "--mode", "semantic",
+      ],
+      "console": "integratedTerminal"
+    },
   ]
 }
