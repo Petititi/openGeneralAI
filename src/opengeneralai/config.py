@@ -48,6 +48,7 @@ class AppConfig:
         load_dotenv(str(self.ENV_PATH))
 
         # Private storage of the loaded configuration
+        self._cfg: Dict = {}
         self.reload_config()
 
         logger.debug("AppConfig initialized with config %s and env %s", self._cfg, self.ENV_PATH)
@@ -125,43 +126,38 @@ class AppConfig:
 
     def reload_config(self) -> Dict[str, str]:
         """
-        Load the JSON config from disk and validate provider/model.
-        Returns a validated config dictionary; on any problem returns a default config.
+        Load config.json (created with the defaults when missing) and check the provider/model
+        pair against the catalog: an unknown provider is replaced by the default one, an unknown
+        model by the first model of its provider. The other settings are kept.
         """
-        try:
-            if not self.CONFIG_PATH.exists():
-                logger.info("Config file %s not found — creating default config.", self.CONFIG_PATH)
-                default = self.default_config()
-                self.save_config(default)
-                return default
-
-            with self.CONFIG_PATH.open("r", encoding="utf-8") as f:
-                self._cfg = json.load(f)
-
-            provider = (self._cfg.get("provider") or "").strip()
-            model = (self._cfg.get("model") or "").strip()
-
-            providers, provider_to_models = llm_interactions.get_providers_and_models()
-
-            if provider not in providers:
-                logger.warning("Provider %r not in available providers %s — using defaults.", provider, providers)
-                return self.default_config()
-
-            allowed_models = provider_to_models.get(provider, [])
-            if model not in allowed_models:
-                if allowed_models:
-                    logger.warning("Model %r is not allowed for provider %r — defaulting to first allowed model.",
-                                   model, provider)
-                    # Preserve other config settings
-                    return {**self._cfg, "provider": provider, "model": allowed_models[0]}
-                logger.warning("No allowed models for provider %r — using global default config.", provider)
-                return self.default_config()
-
-            # Preserve all config settings
+        if not self.CONFIG_PATH.exists():
+            logger.info("Config file %s not found: creating it with the defaults.", self.CONFIG_PATH)
+            self._cfg = self.default_config()
+            self.save_config()
             return self._cfg
-        except Exception as exc:
-            logger.exception("Failed to load/validate config (%s). Falling back to default.", exc)
-            return self.default_config()
+
+        try:
+            with self.CONFIG_PATH.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            logger.exception("Cannot read %s: using the defaults.", self.CONFIG_PATH)
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        defaults = self.default_config()
+        self._cfg = {**defaults, **data}
+
+        provider = (self._cfg.get("provider") or "").strip()
+        model = (self._cfg.get("model") or "").strip()
+        providers, provider_to_models = llm_interactions.get_providers_and_models()
+        allowed_models = provider_to_models.get(provider, [])
+        if provider not in providers or not allowed_models:
+            logger.warning("Provider %r is not available: using %r.", provider, defaults["provider"])
+            self._cfg["provider"], self._cfg["model"] = defaults["provider"], defaults["model"]
+        elif model not in allowed_models:
+            logger.warning("Model %r is not available for %r: using %r.", model, provider, allowed_models[0])
+            self._cfg["model"] = allowed_models[0]
+        return self._cfg
 
     def save_config(self) -> None:
         """
@@ -219,8 +215,6 @@ class AppConfig:
             saved_var = self.save_api_key(provider, api_key)
             if saved_var is None:
                 return {"ok": False, "error": "Model OK, but can't store the API key."}
-            if saved_var is None:
-                return {"ok": False, "error": "API key removed."}
 
         return {"ok": True, "config": self._cfg}
 
