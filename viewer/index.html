@@ -3,7 +3,7 @@
 
 <head>
     <meta charset="utf-8" />
-    <title>Trajectory – <<run_id>></title>
+    <title>Trajectory</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <link rel="stylesheet" href="styles.css" />
 </head>
@@ -11,7 +11,7 @@
 <body>
     <div id="app">
         <header>
-            <div class="title">Trajectory <span class="muted">#<<run_id>></span></div>
+            <div class="title">Trajectory <span class="muted">#<span id="run-id">–</span></span></div>
             <div class="meta small">nodes: <span id="count-nodes">–</span> • edges: <span id="count-edges">–</span>
             </div>
             <div class="spacer"></div>
@@ -42,16 +42,13 @@
         </aside>
     </div>
 
-    <!-- Données Python -->
-    <script>const LOG = <<data_json>>;</script>
+    <!-- External libraries (same files as on npm, pinned with Subresource Integrity) -->
+    <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.27.0/dist/cytoscape.min.js" integrity="sha384-VwuW2IohsVXuvpS+IKNUfOPkksgt5GfwwGzWyWKXF8uUtyG9THxXcVgD63eulBFQ" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dagre@0.8.5/dist/dagre.min.js" integrity="sha384-2IH3T69EIKYC4c+RXZifZRvaH5SRUdacJW7j6HtE5rQbvLhKKdawxq6vpIzJ7j9M" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/cytoscape-dagre@2.5.0/cytoscape-dagre.js" integrity="sha384-u69h9ebXeSjlg6q/rb1zKTRAGu/h8deCl0409xpS/QJctMKnc4M9Fzkm01VOQdeF" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@andypf/json-viewer@2.8.0/dist/iife/index.js" integrity="sha384-6iQKtZx+CiR0gKJ2NVw9qcL553FLcIlOGF2N8V7Wzi/LwZb4KAzbnHuWZBpj8ofn" crossorigin="anonymous"></script>
 
-    <!-- Librairies externes -->
-    <script src="https://unpkg.com/cytoscape@3.27.0/dist/cytoscape.min.js"></script>
-    <script src="https://unpkg.com/dagre@0.8.5/dist/dagre.min.js"></script>
-    <script src="https://unpkg.com/cytoscape-dagre@2.5.0/cytoscape-dagre.js"></script>
-    <script src="https://pfau-software.de/json-viewer/dist/iife/index.js"></script>
-
-    <!-- Modules -->
+    <!-- The trace is loaded from the JSON file given in ?trace= (see js/load.js) -->
     <script type="module" src="js/main.js"></script>
 </body>
 

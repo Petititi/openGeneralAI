@@ -2,6 +2,19 @@ import { buildElements } from './data.js';
 import { initGraph } from './graph.js';
 import { setupFilters } from './filters.js';
 import { setupDetails } from './details.js';
+import { loadTrace, showLoadError } from './load.js';
+
+let LOG;
+try {
+    LOG = await loadTrace();
+} catch (err) {
+    showLoadError(err);
+    throw err;
+}
+
+const runId = String(LOG.run_id || '').slice(0, 8);
+document.getElementById('run-id').textContent = runId;
+document.title = `Trajectory – ${runId}`;
 
 const elements = buildElements(LOG);
 const cy = initGraph(elements);
@@ -52,7 +65,7 @@ document.getElementById('btn-export').onclick = () => {
     const blob = new Blob([JSON.stringify(LOG, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
-    a.href = url; a.download = `trajectory_{self.run_id}.json`; a.click();
+    a.href = url; a.download = `trajectory_${LOG.run_id}.json`; a.click();
     setTimeout(() => URL.revokeObjectURL(url), 5000);
 };
 

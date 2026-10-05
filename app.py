@@ -1,5 +1,5 @@
 import os
-from flask import Flask, render_template, request, jsonify, redirect, url_for, send_from_directory
+from flask import Flask, abort, render_template, request, jsonify, redirect, url_for, send_from_directory
 from flask_cors import CORS
 from pathlib import Path
 
@@ -20,7 +20,8 @@ if os.environ.get("LITELLM_DEBUG"):
 ROOT_FOLDER = Path(__file__).parent
 CONFIG_PATH = ROOT_FOLDER / "config.json"
 ENV_PATH = ROOT_FOLDER / ".env"
-TEMPLATES_FOLDER = ROOT_FOLDER / "templates"
+VIEWER_FOLDER = ROOT_FOLDER / "viewer"
+TRACES_FOLDER = ROOT_FOLDER / "traces"
 
 # --- Cross-origin access: the UI is served by this app, so no CORS is needed by default.
 # Set ALLOWED_ORIGINS to a comma-separated list of origins to allow another front-end.
@@ -32,10 +33,10 @@ APP_CSP = (
     f"default-src 'self'; script-src 'self' {CDN}; style-src 'self' {CDN}; "
     f"font-src 'self' {CDN}; img-src 'self' data:; frame-ancestors 'self'"
 )
-# The trace viewer pages embed their data in an inline script and load Cytoscape from unpkg
+# The trace viewer loads Cytoscape from the CDN; its JSON viewer injects <style> elements
 TRACE_VIEWER_CSP = (
-    "default-src 'self'; script-src 'self' 'unsafe-inline' https://unpkg.com https://pfau-software.de; "
-    "style-src 'self' 'unsafe-inline'; img-src 'self' data:; frame-ancestors 'self'"
+    f"default-src 'self'; script-src 'self' {CDN}; style-src 'self' 'unsafe-inline'; "
+    "img-src 'self' data:; connect-src 'self'; frame-ancestors 'self'"
 )
 
 # --- server config/init:
@@ -156,15 +157,24 @@ def format_answer(plan: dict, cost: float) -> str:
     return "\n".join(lines)
 
 
-@app.get("/templates/<path:filename>")
-def trace_viewer_files(filename):
-    """Serve the trace viewer pages (templates/dbg*.html) and their JS/CSS for local debugging.
+@app.get("/viewer/")
+@app.get("/viewer/<path:filename>")
+def trace_viewer(filename="index.html"):
+    """Serve the trace viewer: /viewer/?trace=/traces/<name>.json (see viewer/README.md).
 
-    Only the templates folder is exposed: never serve the project root, which holds .env.
+    Only the viewer and traces folders are exposed: never serve the project root, which holds .env.
     """
-    resp = send_from_directory(TEMPLATES_FOLDER, filename)
+    resp = send_from_directory(VIEWER_FOLDER, filename)
     resp.headers["Content-Security-Policy"] = TRACE_VIEWER_CSP
     return resp
+
+
+@app.get("/traces/<path:filename>")
+def trace_files(filename):
+    """Serve the traces written by the tests (JSON files only)."""
+    if not filename.endswith(".json"):
+        abort(404)
+    return send_from_directory(TRACES_FOLDER, filename)
 
 
 if __name__ == "__main__":

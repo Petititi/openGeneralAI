@@ -7,3 +7,11 @@ __pycache__/*
 gmail_token.pickle
 mails.pickle
 *faiss.index
+
+# Traces written by the tests (curated examples are versioned)
+/traces/*
+!/traces/examples/
+
+# Python packaging
+*.egg-info/
+build/

@@ -199,3 +199,10 @@ pre.code {
     cursor: ew-resize;
     background: transparent;
 }
+
+.load-error {
+    position: fixed;
+    top: 60px;
+    left: 12px;
+    color: var(--error);
+}

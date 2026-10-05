@@ -50,5 +50,18 @@ def test_logger_refactor():
     
     print("\n✅ All tests passed! The refactored logger works correctly.")
 
+def test_each_trace_starts_its_own_tree():
+    """A new trace must not hang its nodes under the last node of a previous trace."""
+    first = TrajectoryLogger()
+    first.add_node(phase="start", turn=0)
+    first.add_node(phase="plan/create", turn=1)
+
+    second = TrajectoryLogger()
+    root = second.add_node(phase="start", turn=0)
+    assert second.root_id == root
+    assert second.nodes[root].parent_id is None
+    assert first.current_node().phase == "plan/create"
+
+
 if __name__ == "__main__":
     test_logger_refactor()

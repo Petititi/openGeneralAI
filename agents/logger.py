@@ -3,8 +3,7 @@ from dataclasses import dataclass, asdict, field
 from typing import Any, Dict, List, Optional, Tuple, Literal
 import time, uuid, json, hashlib
 import copy
-
-from anyio import Path
+from pathlib import Path
 
 Phase = Literal["start", "plan/create", "plan/update", "plan/recover", "act/run", "done"]
 
@@ -40,10 +39,6 @@ class LogNode:
     tags: Dict[str, Any] = field(default_factory=dict)
 
 
-import contextvars
-
-_current_node_id: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("current_node_id", default=None)
-
 class TrajectoryLogger:
     def get_current_interaction(self) -> List[dict]:
         """
@@ -72,6 +67,9 @@ class TrajectoryLogger:
         self.nodes: Dict[str, LogNode] = {}
         self.children: Dict[str, List[str]] = {}
         self.root_id: Optional[str] = None
+        # Last node added: the next node becomes its child. Kept per trace, so that a new
+        # trace never hangs its nodes under the last node of a previous one.
+        self.current_node_id: Optional[str] = None
 
     # --- création & mise à jour ------------------------------------------------
     def _new_id(self) -> str:
@@ -86,7 +84,7 @@ class TrajectoryLogger:
         token_usage: Optional[List[int]] = None,
     ) -> str:
         node_id = self._new_id()
-        parent_id = _current_node_id.get()
+        parent_id = self.current_node_id
         node = LogNode(
             id=node_id,
             parent_id=parent_id,
@@ -101,13 +99,13 @@ class TrajectoryLogger:
             self.children.setdefault(parent_id, []).append(node_id)
         else:
             self.root_id = node_id
-        _current_node_id.set(node_id)
+        self.current_node_id = node_id
         return node_id
 
     def current_node(self) -> LogNode:
-        node_id = _current_node_id.get()
+        node_id = self.current_node_id
         if node_id is None:
-            raise Exception("No current node set in context")
+            raise Exception("No current node: call add_node() first")
         return self.nodes[node_id]
 
     def set_questions(self, prompt_messages: List[Dict[str, Any]]):
@@ -145,21 +143,22 @@ class TrajectoryLogger:
             "children": self.children,
         }
 
-    def to_html(self) -> str:
-        """Retourne une page HTML autonome avec le graphe interactif de la trajectoire."""
-        log_dict = self.to_dict()
-
-        # JSON sûr (gère les objets non-sérialisables)
+    def to_json(self) -> str:
+        """Serialize the trace; objects that are not JSON (e.g. tool results) are written as text."""
         def _default(o):
             try:
                 return str(o)
             except Exception:
                 return "<non-serializable>"
-        data_json = json.dumps(log_dict, ensure_ascii=False, default=_default)
+        return json.dumps(self.to_dict(), ensure_ascii=False, indent=1, default=_default)
 
-        # Page HTML (Cytoscape + Dagre depuis CDN)
-        template_file = Path(__file__).parent.parent / "templates/template_logger.html"
-        file = open(template_file, "r", encoding="utf-8")
-        template = file.read()
-        file.close()
-        return template.replace("<<run_id>>", self.run_id[:8]).replace("<<data_json>>", data_json)
+    def save(self, path: Path | str) -> Path:
+        """Write the trace as JSON, e.g. traces/my_run.json.
+
+        Open it with the viewer: http://localhost:12000/viewer/?trace=/traces/my_run.json
+        (see viewer/README.md).
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(self.to_json() + "\n", encoding="utf-8")
+        return path

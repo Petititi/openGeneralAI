@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="fr">
+
+<head>
+    <meta charset="utf-8" />
+    <title>Trajectory</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="stylesheet" href="embed.css" />
+</head>
+
+<body>
+    <div id="app">
+        <button id="resetBtn" class="cy-overlay-btn">Toggle zoom</button>
+        <div id="cy"></div>
+    </div>
+
+    <!-- External libraries (same files as on npm, pinned with Subresource Integrity) -->
+    <script src="https://cdn.jsdelivr.net/npm/cytoscape@3.27.0/dist/cytoscape.min.js" integrity="sha384-VwuW2IohsVXuvpS+IKNUfOPkksgt5GfwwGzWyWKXF8uUtyG9THxXcVgD63eulBFQ" crossorigin="anonymous"></script>
+
+    <!-- The trace is loaded from the JSON file given in ?trace= (see js/load.js) -->
+    <script type="module" src="js/embedded.js"></script>
+</body>
+
+</html>

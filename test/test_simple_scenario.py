@@ -1,12 +1,22 @@
 import os
 import time
+from pathlib import Path
+
 import pytest
 
 from agents.orchestrator import Orchestrator
 import configurator
 import utils
 from agents.tools.ToolRegistry import ToolRegistry
+from agents.tools.memory_tool import SearchContext
+from storage.longterm_memory import LongTermMemory
 import re
+
+# Traces of the runs, to open with the viewer (see viewer/README.md)
+TRACES_DIR = Path(__file__).parent.parent / "traces"
+
+# These scenarios call the configured LLM for real (API key needed): run them with --run-llm
+pytestmark = pytest.mark.llm
 
 def test_file_editing():
 
@@ -48,8 +58,7 @@ def test_file_editing():
     orchestrator = Orchestrator(cfg, tools_registry)
     result, cost = orchestrator.process_user_message("Script `loader.py` doesn't start. Fix the mistake.")
 
-    with open("templates/dbg.html", "w", encoding="utf-8") as f:
-        f.write(orchestrator.last_trace.to_html())
+    orchestrator.last_trace.save(TRACES_DIR / "file_editing_tools.json")
 
     assert result is not None
     assert "plan_steps" in result
@@ -246,8 +255,7 @@ def test_file_editing_only_bash():
     orchestrator = Orchestrator(cfg, tools_registry)
     result, cost = orchestrator.process_user_message("Le script `loader.py` ne se lance pas. Corrige l'erreur.")
 
-    with open("templates/dbg_bash.html", "w", encoding="utf-8") as f:
-        f.write(orchestrator.last_trace.to_html())
+    orchestrator.last_trace.save(TRACES_DIR / "file_editing_bash.json")
 
     assert result is not None
     assert "plan_steps" in result
@@ -339,8 +347,7 @@ def test_search_context_add_method():
     )
 
     # 7) Sauvegarder la trace pour debug
-    with open("templates/dbg_search_context.html", "w", encoding="utf-8") as f:
-        f.write(orchestrator.last_trace.to_html())
+    orchestrator.last_trace.save(TRACES_DIR / "search_context.json")
 
     # 8) Assertions
     assert result is not None
