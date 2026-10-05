@@ -210,17 +210,17 @@ PLAN:
         if status == AgentStatus.NEXT_TASK:
             # Mark the current step as done
             current_step = plan['plan_steps'][self.get_current_step_idx(plan)]
-            current_step["status"] = AgentStatus.DONE
+            current_step["status"] = StepStatus.DONE
         elif status == AgentStatus.NEW_PLAN:
             current_step = self.get_current_step_idx(plan)
-            plan['plan_steps'][current_step]["status"] = AgentStatus.ERROR
+            plan['plan_steps'][current_step]["status"] = StepStatus.ERROR
             if current_step>0:
-                plan['plan_steps'][current_step-1]["status"] = AgentStatus.ERROR
+                plan['plan_steps'][current_step-1]["status"] = StepStatus.ERROR
             raise ValueError("Need a 'NEW_PLAN'.")
         elif status == AgentStatus.DONE:
             # Mark all step as done
             for step in plan['plan_steps']:
-                step["status"] = AgentStatus.DONE
+                step["status"] = StepStatus.DONE
         else:
             raise ValueError("Expecting either 'DONE', 'NEXT_TASK', or 'NEW_PLAN' from the reasoning agent.")
 
