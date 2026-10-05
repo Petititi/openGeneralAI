@@ -1698,10 +1698,12 @@ class LongTermMemory:
                 continue
             doc_id_in_souvenirs.add(doc_id)
             # get doc details from dbd:
-            if category and doc.get("category") != category:
-                continue
             details = self.db.get_document_details(doc_id)
+            if not details:
+                continue
             doc_info, chunks = details.get("document", {}), details.get("chunks", [])
+            if category and doc_info.get("category") != category:
+                continue
             participants = set()
             for c in chunks:
                 if c.get("chunk_type") == "email_participants":

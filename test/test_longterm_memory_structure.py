@@ -17,27 +17,21 @@ try:
 except ImportError:
     EMBEDDINGS_AVAILABLE = False
 
-@pytest.fixture
-def persistant_ltm():
-    """Fixture pour créer une instance temporaire de LongTermMemory"""
-    ROOT_FOLDER = Path(__file__).parent
-    db_path = ROOT_FOLDER / "datas/test_memory.sqlite"
-    faiss_index_path = ROOT_FOLDER / "datas/test_faiss.index"
+@pytest.fixture(scope="session")
+def persistant_ltm(tmp_path_factory):
+    """LongTermMemory with the code of this repository, indexed once per test session.
 
-    CREATE_DBD = not Path(db_path).exists()
-    
-    # Check if embeddings are available
-    enable_embeddings = EMBEDDINGS_AVAILABLE
-    
+    The database is built from the sources instead of being versioned: a committed .sqlite
+    goes stale (or empty) and the tests then fail for the wrong reason.
+    """
+    folder = tmp_path_factory.mktemp("ltm")
     ltm = LongTermMemory(
-        db_path=str(db_path),
-        faiss_index_path=str(faiss_index_path),
-        enable_embeddings=enable_embeddings
+        db_path=str(folder / "test_memory.sqlite"),
+        faiss_index_path=str(folder / "test_faiss.index"),
+        enable_embeddings=EMBEDDINGS_AVAILABLE
     )
+    ltm.add_folder(str(Path(__file__).parent.parent))
 
-    if CREATE_DBD:
-        ltm.add_folder(str(Path(__file__).parent.parent))
-    
     yield ltm
     
     # Cleanup
@@ -214,3 +208,20 @@ def test_search_calculator_class(persistant_ltm):
         assert 'score' in r
     # Vérifier que Calculator est dans les résultats
     assert any("Calculator" in r['content'] for r in results)
+
+
+def test_search_souvenirs_filters_by_category(temp_ltm):
+    """search_souvenirs(category=...) keeps only the souvenirs of that category."""
+    for doc_id, content, category in [("s-entity", "Alice works on the zeppelin project", "entity"),
+                                      ("s-general", "The zeppelin flew over the city", "general")]:
+        temp_ltm.db.insert_document(doc_id=doc_id, source_path=f"souvenir:{doc_id}", description=content,
+                                    title=None, media_type="text", language=None, sha256=doc_id,
+                                    size_bytes=len(content), category=category, extra={"title": doc_id})
+        temp_ltm.add_memory_chunk(document_id=doc_id, ord=0, start_line=1, end_line=1, content=content,
+                                  chunk_type="souvenir", chunk_name=doc_id)
+
+    everything = {s["document_id"] for s in temp_ltm.search_souvenirs("zeppelin", limit=10)}
+    entities = {s["document_id"] for s in temp_ltm.search_souvenirs("zeppelin", category="entity", limit=10)}
+
+    assert everything == {"s-entity", "s-general"}
+    assert entities == {"s-entity"}

@@ -614,7 +614,7 @@ class DatabaseManager:
         with self._lock:
             cur = self.conn.cursor()
             cur.execute("""
-            SELECT id, source_path, media_type, language, size_bytes, created_at, extra
+            SELECT id, source_path, media_type, language, size_bytes, created_at, extra, category
             FROM documents WHERE id=?
         """, (document_id,))
             d = cur.fetchone()
@@ -638,6 +638,7 @@ class DatabaseManager:
                     "id": d[0], "source_path": d[1], "media_type": d[2],
                     "language": d[3], "size_bytes": d[4], "created_at": d[5],
                     "extra": json.loads(d[6] or "{}"),
+                    "category": d[7],
                     "file_exists": file_exists
                 },
                 "chunks": chunks
