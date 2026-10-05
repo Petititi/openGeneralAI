@@ -94,15 +94,26 @@ def ask():
         return jsonify({"ok": False, "answer": "Please ask a question."}), 400
     
     try:
-        llm_response = orchestrator.process_user_message(question)
+        plan = orchestrator.process_user_message(question)
     except Exception as e:
         return jsonify({"ok": False, "answer": str(e)}), 400
 
-    answer = (
-        f"[{cfg.model}] : {llm_response.choices[0].message['content']}\n"
-        f"tokens: {llm_response.usage['prompt_tokens']}=>{llm_response.usage['completion_tokens']} (total: {llm_response.usage['total_tokens']})"
-    )
-    return jsonify({"ok": True, "answer": answer})
+    return jsonify({"ok": True, "answer": format_answer(plan)})
+
+
+def format_answer(plan: dict) -> str:
+    """Render the final plan returned by the orchestrator as plain text for the chat UI."""
+    lines = [f"[{cfg.model}]"]
+    steps = plan.get("plan_steps", []) if isinstance(plan, dict) else []
+    for step in steps:
+        if isinstance(step, dict):
+            mark = "✅" if str(step.get("status", "")).lower() == "done" else "⬜"
+            lines.append(f"{mark} {step.get('descr', '')}")
+        else:
+            lines.append(f"• {step}")
+    if not steps:
+        lines.append("No plan was produced.")
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
