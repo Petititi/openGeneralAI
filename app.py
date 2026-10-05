@@ -10,17 +10,25 @@ import configurator
 from agents.orchestrator import Orchestrator
 import agents.tools.ToolRegistry as tools_module
 
-# --- LiteLLM debug output
-litellm._turn_on_debug()
+# --- LiteLLM debug output: it logs full requests, so it is opt-in (LITELLM_DEBUG=1)
+if os.environ.get("LITELLM_DEBUG"):
+    litellm._turn_on_debug()
 
 # --- Various global config:
-CONFIG_PATH = Path(__file__).parent / "config.json"
-ENV_PATH = Path(__file__).parent / ".env"
+ROOT_FOLDER = Path(__file__).parent
+CONFIG_PATH = ROOT_FOLDER / "config.json"
+ENV_PATH = ROOT_FOLDER / ".env"
+TEMPLATES_FOLDER = ROOT_FOLDER / "templates"
+
+# --- Cross-origin access: the UI is served by this app, so no CORS is needed by default.
+# Set ALLOWED_ORIGINS to a comma-separated list of origins to allow another front-end.
+ALLOWED_ORIGINS = [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "").split(",") if o.strip()]
 
 # --- server config/init:
 app = Flask(__name__, static_folder="static", template_folder="templates")
 app.config["TEMPLATES_AUTO_RELOAD"] = True
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
+if ALLOWED_ORIGINS:
+    CORS(app, resources={r"/*": {"origins": ALLOWED_ORIGINS}})
 
 # --- Configuration creation
 cfg = configurator.AppConfig(CONFIG_PATH, ENV_PATH)
@@ -31,13 +39,9 @@ orchestrator = Orchestrator(cfg, tools_registry)
 
 @app.after_request
 def add_security_headers(resp):
-    # Allow embedding in iframes and enable broad CORS for this demo app
-    resp.headers["Access-Control-Allow-Origin"] = "*"
-    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-    resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization"
-    # Allow embedding in iframes (note: consider tightening for production)
-    resp.headers["X-Frame-Options"] = "ALLOWALL"
-    resp.headers["Content-Security-Policy"] = "frame-ancestors *"
+    # Only pages from this server may embed the UI in an iframe
+    resp.headers["X-Frame-Options"] = "SAMEORIGIN"
+    resp.headers["Content-Security-Policy"] = "frame-ancestors 'self'"
     return resp
 
 
@@ -94,22 +98,41 @@ def ask():
         return jsonify({"ok": False, "answer": "Please ask a question."}), 400
     
     try:
-        llm_response = orchestrator.process_user_message(question)
+        plan, cost = orchestrator.process_user_message(question)
     except Exception as e:
         return jsonify({"ok": False, "answer": str(e)}), 400
 
-    answer = (
-        f"[{cfg.model}] : {llm_response.choices[0].message['content']}\n"
-        f"tokens: {llm_response.usage['prompt_tokens']}=>{llm_response.usage['completion_tokens']} (total: {llm_response.usage['total_tokens']})"
-    )
-    return jsonify({"ok": True, "answer": answer})
+    return jsonify({"ok": True, "answer": format_answer(plan, cost)})
 
-@app.route("/<path:filename>")
-def static_files(filename):
-    return send_from_directory(".", filename)
+
+def format_answer(plan: dict, cost: float) -> str:
+    """Render the final plan returned by the orchestrator as plain text for the chat UI."""
+    lines = [f"[{cfg.model}]"]
+    steps = plan.get("plan_steps", []) if isinstance(plan, dict) else []
+    for step in steps:
+        if isinstance(step, dict):
+            mark = "✅" if str(step.get("status", "")).lower() == "done" else "⬜"
+            lines.append(f"{mark} {step.get('descr', '')}")
+        else:
+            lines.append(f"• {step}")
+    if not steps:
+        lines.append("No plan was produced.")
+    lines.append(f"cost: ${cost:.4f}")
+    return "\n".join(lines)
+
+
+@app.get("/templates/<path:filename>")
+def trace_viewer_files(filename):
+    """Serve the trace viewer pages (templates/dbg*.html) and their JS/CSS for local debugging.
+
+    Only the templates folder is exposed: never serve the project root, which holds .env.
+    """
+    return send_from_directory(TEMPLATES_FOLDER, filename)
+
 
 if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 12000))
-    # Bind to all interfaces so the provided URL can reach it
-    app.run(host="0.0.0.0", port=port, debug=False)
+    # Listen on localhost only; set HOST=0.0.0.0 to expose the server on your network
+    host = os.environ.get("HOST", "127.0.0.1")
+    app.run(host=host, port=port, debug=False)

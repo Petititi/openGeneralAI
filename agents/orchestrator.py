@@ -110,6 +110,8 @@ Readability:
         """
         self.cur_trace = TrajectoryLogger()
         self.last_trace = None
+        # token counters (and the returned cost) are per interaction
+        self.token_count, self.in_token, self.out_token = 0, 0, 0
 
         reasoning_agent = reasoning.ReasoningAgent(self.cfg, logger=self.cur_trace, ask_llm=self.safe_ask)
         action_agent = action.ActionAgent(self.cfg, logger=self.cur_trace, tools=self.tools, ask_llm=self.safe_ask)

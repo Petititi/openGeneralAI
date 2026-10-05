@@ -59,6 +59,7 @@
       let providers = [];
       let modelsByProvider = {};
       let cachedConfig = null;
+      let has_key = {};
 
       async function loadConfig() {
         const res = await fetch('/api/config');
@@ -72,7 +73,7 @@
         const providerSel = document.getElementById('provider');
         const modelSel = document.getElementById('model');
 
-        providerSel.innerHTML = providers.map(p => `<option value="${p}">${p}</option>`).join('');
+        fillOptions(providerSel, providers);
         providerSel.value = data.config.provider;
         updateModels();
         update_api_field(data.config.provider)
@@ -89,7 +90,8 @@
           resetKey.removeAttribute('hidden');
           field_api.classList.add('opacity-75');
           field_api.classList.add('text-muted');
-          field_api.value = 'Clé API existante...';
+          field_api.value = '';
+          field_api.placeholder = 'Clé API existante...';
         }
         else
         {
@@ -97,8 +99,14 @@
           resetKey.setAttribute('hidden','hidden');
           field_api.classList.remove('opacity-75');
           field_api.classList.remove('text-muted');
-          field_api.value = 'Entrez votre clé API...';
+          field_api.value = '';
+          field_api.placeholder = 'Entrez votre clé API...';
         }
+      }
+
+      // Build <option> elements as text, never as HTML
+      function fillOptions(select, values) {
+        select.replaceChildren(...values.map(v => new Option(v, v)));
       }
 
       function updateModels() {
@@ -110,7 +118,7 @@
         const list = modelsByProvider[provider] || [];
         const q = (modelFilter.value || '').toLowerCase();
         const filtered = q ? list.filter(m => m.toLowerCase().includes(q)) : list;
-        modelSel.innerHTML = filtered.map(m => `<option value="${m}">${m}</option>`).join('');
+        fillOptions(modelSel, filtered);
         modelCount.textContent = `${filtered.length} / ${list.length}`;
       }
 

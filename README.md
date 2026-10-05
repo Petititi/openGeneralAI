@@ -26,6 +26,14 @@ Access:
 
 - Config: http://localhost:12000/config
 
+- Trace viewer (written by the tests): http://localhost:12000/templates/dbg.html
+
+Environment variables:
+
+- `HOST` (default `127.0.0.1`): the server only listens on localhost. Use `HOST=0.0.0.0` only on a trusted network: anyone who can reach the server can spend your API credits and change your API keys.
+- `ALLOWED_ORIGINS` (default: none): comma-separated origins allowed to call the API from another front-end (CORS).
+- `LITELLM_DEBUG=1`: print the full LiteLLM requests (prompts included) for debugging.
+
 ## Roadmap Highlights
 
     Integrate Major Providers: OpenAI, Anthropic, Mistral, and others.

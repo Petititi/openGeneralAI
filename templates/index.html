@@ -106,27 +106,23 @@
         return data.answer;
       }
 
+      // Question and answer are inserted as text (never as HTML): the answer comes from the LLM
+      function addMessage(boxClass, textClass, text) {
+        const card = document.createElement('div');
+        card.className = `card ${boxClass}`;
+        const body = document.createElement('div');
+        body.className = 'card-body';
+        const content = document.createElement('div');
+        content.className = textClass;
+        content.textContent = text;
+        body.appendChild(content);
+        card.appendChild(body);
+        conversation.appendChild(card);
+      }
+
       function addToConversation(question, answer) {
-        // Add question
-        const questionElement = document.createElement('div');
-        questionElement.className = 'card question-box';
-        questionElement.innerHTML = `
-          <div class="card-body">
-            <div class="question">${question}</div>
-          </div>
-        `;
-        conversation.appendChild(questionElement);
-        
-        // Add answer
-        const answerElement = document.createElement('div');
-        answerElement.className = 'card answer-box';
-        answerElement.innerHTML = `
-          <div class="card-body">
-            <div class="answer">${answer}</div>
-          </div>
-        `;
-        conversation.appendChild(answerElement);
-        
+        addMessage('question-box', 'question', question);
+        addMessage('answer-box', 'answer', answer);
         // Scroll to bottom
         conversation.scrollTop = conversation.scrollHeight;
       }

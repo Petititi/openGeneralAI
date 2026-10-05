@@ -3,7 +3,6 @@ import time
 
 from agents.orchestrator import Orchestrator
 import configurator
-import graphviz
 import utils
 from agents.tools.ToolRegistry import ToolRegistry
 
