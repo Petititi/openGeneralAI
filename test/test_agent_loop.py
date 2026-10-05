@@ -179,3 +179,8 @@ def test_history_is_bounded(fake_llm):
     last_prompt = llm.calls[4]
     assert last_prompt[1] == {"role": "user", "content": "Fix loader.py"}, "the question is always kept"
     assert len(last_prompt) == 1 + 1 + 2 + 1, "core prompt, question, 2 history messages, planning prompt"
+
+
+def test_no_turn_means_not_done(fake_llm):
+    result = Orchestrator(fake_llm([]), ToolRegistry(), max_turns=0).run("Anything")
+    assert not result.done and result.turns == 0 and result.plan.steps == []

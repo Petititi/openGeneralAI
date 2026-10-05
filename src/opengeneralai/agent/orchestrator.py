@@ -94,8 +94,8 @@ class Orchestrator:
             logger.warning("Run stopped: %s", e)
             error = str(e)
 
+        done = error is None and plan is not None and plan.is_done
         plan = plan or Plan()
-        done = error is None and plan.is_done
         cost = run.cost
         trace.add_node(phase="done", turn=run.turn, tags={"cost": cost})
         trace.set_response(
