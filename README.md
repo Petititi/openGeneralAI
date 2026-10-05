@@ -2,6 +2,25 @@
 
 This repository provides a clear, open-source, and pragmatic foundation for building advanced reasoning agents across multiple model providers (OpenAI, Anthropic, Mistral, OpenHands, etc.). Our goal is to deliver simple yet robust examples, proven best practices, and reusable components—including planning, tool execution, memory management, and evaluation—to help teams transition from proof-of-concept (POC) to production-grade agents.
 
+## Blog series and tags
+
+This repository is the companion code of the blog series [Building LLM Coding Agents](https://charlie-soft.com/llm-agent/). Each article has a git tag with the code it describes:
+
+| Article | Tag |
+| --- | --- |
+| 01-a Initialize the project | `01-initialize-project` |
+| 01-b Plug a real LLM | `01-b-real-LLM` |
+| 02-a Reasoning tools | `02-a-reasoning-tools` |
+| 02-b Debugging tools | `02-b-debugging-tools` |
+
+```bash
+git checkout -b my-branch tags/02-a-reasoning-tools
+```
+
+`master` is ahead of the published articles (long-term memory, Souvenir, Gmail import).
+
+> **Security note**: from commit `f6c2664` (September 2025) until the fix of October 2026, `app.py` served every file of the project folder over HTTP, including `.env` and its API keys. If you ran one of these versions on a machine reachable from a network, revoke your API keys. The tags above are not affected.
+
 ## Current Implementation (Minimal Example)
 
 A lightweight Flask server with Bootstrap UI:
